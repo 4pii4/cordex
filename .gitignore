@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+
+# Build, coverage, and package artifacts
+dist/
+build/
+coverage/
+*.tsbuildinfo
+*.tgz
+
+# Local Cordex state and environment
+.cordex/
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local agent and task files
+.agents/
+PROMPT.md
+skills-lock.json
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

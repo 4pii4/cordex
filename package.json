@@ -1,0 +1,70 @@
+{
+  "name": "cordex",
+  "version": "0.1.0",
+  "description": "Control OpenAI Codex from Discord with persistent projects, sessions, approvals, and live output",
+  "keywords": [
+    "openai",
+    "codex",
+    "discord",
+    "bot",
+    "cli",
+    "developer-tools",
+    "automation"
+  ],
+  "license": "GPL-3.0-only",
+  "private": false,
+  "type": "module",
+  "bin": {
+    "cordex": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "src",
+    "test",
+    "README.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "LICENSE",
+    "SECURITY.md",
+    "THIRD_PARTY_NOTICES.md",
+    "tsconfig.json",
+    "tsconfig.test.json"
+  ],
+  "scripts": {
+    "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc -p tsconfig.json",
+    "typecheck:test": "tsc -p tsconfig.test.json",
+    "dev": "tsx src/cli.ts start",
+    "start": "node dist/cli.js start",
+    "test": "node --import tsx --test test/*.test.ts",
+    "test:live": "cross-env CORDEX_LIVE_TEST=1 CORDEX_INPUT_TEST=1 CORDEX_WORKTREE_TEST=1 CORDEX_SCHEDULER_TEST=1 node --import tsx --test test/live-codex*.test.ts",
+    "test:live-all": "npm run test:live && npm run test:live-review && npm run test:live-approval && npm run test:live-login && npm run test:live-account && npm run test:live-mcp-config && npm run test:live-subagent && npm run test:live-action-buttons",
+    "test:live-scheduler": "cross-env CORDEX_SCHEDULER_TEST=1 node --import tsx --test test/live-codex-scheduler.test.ts",
+    "test:live-approval": "cross-env CORDEX_APPROVAL_TEST=1 node --import tsx --test test/live-codex-approval.test.ts",
+    "test:live-account": "cross-env CORDEX_ACCOUNT_TEST=1 node --import tsx --test test/live-codex-account.test.ts",
+    "test:live-action-buttons": "cross-env CORDEX_ACTION_BUTTONS_TEST=1 node --import tsx --test test/live-codex-action-buttons.test.ts",
+    "test:live-input": "cross-env CORDEX_INPUT_TEST=1 node --import tsx --test test/live-codex-input.test.ts",
+    "test:live-login": "cross-env CORDEX_LOGIN_TEST=1 node --import tsx --test test/live-codex-login.test.ts",
+    "test:live-mcp-config": "cross-env CORDEX_MCP_CONFIG_TEST=1 node --import tsx --test test/live-codex-mcp-config.test.ts",
+    "test:live-review": "cross-env CORDEX_REVIEW_TEST=1 node --import tsx --test test/live-codex-review.test.ts",
+    "test:live-subagent": "cross-env CORDEX_SUBAGENT_TEST=1 node --import tsx --test test/live-codex-subagent.test.ts",
+    "check": "npm run build && npm run typecheck:test && npm test",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run check"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "discord.js": "^14.26.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "cross-env": "^10.1.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
