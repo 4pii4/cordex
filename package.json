@@ -1,5 +1,5 @@
 {
-  "name": "cordex",
+  "name": "@4pii4/cordex",
   "version": "0.1.0",
   "description": "Control OpenAI Codex from Discord with persistent projects, sessions, approvals, and live output",
   "keywords": [
@@ -19,16 +19,12 @@
   },
   "files": [
     "dist",
-    "src",
-    "test",
     "README.md",
     "CHANGELOG.md",
     "CONTRIBUTING.md",
     "LICENSE",
     "SECURITY.md",
-    "THIRD_PARTY_NOTICES.md",
-    "tsconfig.json",
-    "tsconfig.test.json"
+    "THIRD_PARTY_NOTICES.md"
   ],
   "scripts": {
     "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true })\"",

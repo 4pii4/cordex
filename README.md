@@ -74,10 +74,24 @@ Codex CLI update can therefore require a corresponding Cordex update.
 Treat the bot token like a password. Never commit it, paste it into a Discord
 channel, or expose it in logs.
 
-## Install from source
+## Install
 
-Cordex is currently installed from source; no npm registry release is advertised
-yet. From a local checkout of this repository:
+Install the published CLI globally:
+
+```bash
+npm install -g @4pii4/cordex
+cordex --version
+```
+
+Or run it without a global install:
+
+```bash
+npx -y @4pii4/cordex@latest --version
+npx -y @4pii4/cordex@latest init
+npx -y @4pii4/cordex@latest start
+```
+
+For local source development from a checkout of this repository:
 
 ```bash
 npm ci
