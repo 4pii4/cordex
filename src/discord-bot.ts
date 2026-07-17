@@ -230,6 +230,7 @@ export class CordexDiscordBot {
   private readonly approvals = new Map<string, PendingApproval>()
   private readonly pendingActionButtons = new Map<string, PendingActionButtons>()
   private readonly pendingUserInputs = new Map<string, PendingUserInput>()
+  private readonly codexEventQueue = new KeyedSerialQueue()
   private readonly resumeQueue = new KeyedSerialQueue()
   private readonly mcpConfigQueue = new KeyedSerialQueue()
   private readonly projectMutationQueue = new KeyedSerialQueue()
@@ -286,13 +287,15 @@ export class CordexDiscordBot {
     })
     this.codex.on('notification', (notification: ServerNotification) => {
       this.logVerbose('notification', notification)
-      void this.handleNotification(notification).catch((error: unknown) => {
+      void this.enqueueNotification(notification).catch((error: unknown) => {
         console.error(`Failed to handle Codex notification: ${errorText(error)}`)
       })
     })
     this.codex.on('serverRequest', (request: ServerRequest) => {
       this.logVerbose('server request', request)
-      void this.handleServerRequest(request)
+      void this.enqueueServerRequest(request).catch((error: unknown) => {
+        console.error(`Failed to handle Codex server request: ${errorText(error)}`)
+      })
     })
     this.codex.on('protocolError', (error: Error) => console.error(error.message))
     this.codex.on('stderr', (chunk: string) => {
@@ -2776,6 +2779,24 @@ export class CordexDiscordBot {
   private findRun(params: JsonObject): ActiveRun | undefined {
     const threadId = text(params.threadId) || text(params.conversationId)
     return threadId ? this.runs.get(threadId) : undefined
+  }
+
+  private codexEventKey(params: JsonObject): string {
+    return text(params.threadId) || text(params.conversationId) || 'global'
+  }
+
+  private async enqueueNotification(notification: ServerNotification): Promise<void> {
+    await this.codexEventQueue.run(
+      this.codexEventKey(notification.params),
+      () => this.handleNotification(notification),
+    )
+  }
+
+  private async enqueueServerRequest(request: ServerRequest): Promise<void> {
+    await this.codexEventQueue.run(
+      this.codexEventKey(request.params),
+      () => this.handleServerRequest(request),
+    )
   }
 
   private async handleNotification(notification: ServerNotification): Promise<void> {
