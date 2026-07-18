@@ -367,6 +367,10 @@ export function buildSlashCommands() {
       )
       .setDMPermission(false),
     new SlashCommandBuilder()
+      .setName('delete-worktree')
+      .setDescription('Delete a clean worktree after it has been merged')
+      .setDMPermission(false),
+    new SlashCommandBuilder()
       .setName('queue')
       .setDescription('Queue a prompt after current turn')
       .addStringOption((option) =>

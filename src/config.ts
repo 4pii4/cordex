@@ -14,6 +14,7 @@ import type {
   CordexState,
   QueuedPrompt,
   ReasoningEffort,
+  SessionLifecycleIntent,
   VerbosityLevel,
 } from './types.js'
 
@@ -308,6 +309,9 @@ function parseSessions(value: unknown): CordexState['sessions'] {
 
     const session = { ...raw } as CordexState['sessions'][string]
     if (raw.archived !== true) delete session.archived
+    const lifecycleIntent = parseSessionLifecycleIntent(raw.lifecycleIntent)
+    if (lifecycleIntent) session.lifecycleIntent = lifecycleIntent
+    else delete session.lifecycleIntent
     if (!isContextTokenCount(raw.contextTokens)) {
       delete session.contextTokens
       delete session.contextWindow
@@ -321,6 +325,21 @@ function parseSessions(value: unknown): CordexState['sessions'] {
     sessions[id] = session
   }
   return sessions
+}
+
+function parseSessionLifecycleIntent(value: unknown): SessionLifecycleIntent | undefined {
+  if (
+    !isRecord(value) ||
+    (value.kind !== 'archive' &&
+      value.kind !== 'resume' &&
+      value.kind !== 'remove-worktree') ||
+    typeof value.requestedAt !== 'string' ||
+    !Number.isFinite(Date.parse(value.requestedAt))
+  ) return undefined
+  return {
+    kind: value.kind,
+    requestedAt: value.requestedAt,
+  }
 }
 
 function parseQueues(value: unknown): CordexState['queues'] {

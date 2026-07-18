@@ -32,3 +32,30 @@ test('keyed serial queue releases after failure', async () => {
   }))
   assert.equal(await queue.run('thread', async () => 'recovered'), 'recovered')
 })
+
+test('keyed serial queue drain waits for all keys and work appended during draining', async () => {
+  const queue = new KeyedSerialQueue()
+  const order: string[] = []
+  let releaseFirst: () => void = () => undefined
+  const firstGate = new Promise<void>((resolve) => {
+    releaseFirst = resolve
+  })
+  const first = queue.run('first', async () => {
+    order.push('first-start')
+    await firstGate
+    order.push('first-end')
+  })
+  const second = queue.run('second', async () => {
+    order.push('second')
+  })
+  const draining = queue.drain().then(() => order.push('drained'))
+  const appended = queue.run('first', async () => {
+    order.push('appended')
+  })
+  await new Promise<void>((resolve) => setImmediate(resolve))
+  assert.equal(order.includes('drained'), false)
+  releaseFirst()
+  await Promise.all([first, second, appended, draining])
+  assert.equal(order.at(-1), 'drained')
+  assert.deepEqual(order, ['first-start', 'second', 'first-end', 'appended', 'drained'])
+})

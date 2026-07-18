@@ -46,6 +46,7 @@ test('Discord command registry includes core and ported controls', () => {
     'toggle-worktrees',
     'worktrees',
     'merge-worktree',
+    'delete-worktree',
     'queue',
     'clear-queue',
     'run-shell-command',

@@ -99,12 +99,26 @@ import {
 } from './projects.js'
 import { runShellCommand } from './shell.js'
 import { KeyedSerialQueue } from './serial.js'
+import {
+  isMcpToolApproval,
+  mcpElicitationPersistModes,
+  mcpToolApprovalDisplayParams,
+  parseMcpElicitationForm,
+  parseMcpElicitationNumberInput,
+  validateMcpElicitationContent,
+  validateMcpElicitationFieldValue,
+  validateMcpElicitationUrl,
+  type McpElicitationField,
+  type McpElicitationForm,
+} from './mcp-elicitation.js'
 import { normalizeThreadTitle } from './thread-title.js'
 import { filterScheduledTasks, scheduledTaskDeliveryId, TaskScheduler } from './scheduler.js'
 import {
   activeWorktreeSessions,
   createWorktree,
+  inspectMergedWorktreeRemoval,
   mergeWorktree,
+  removeMergedWorktree,
   removeWorktree,
   runGit,
   type CreatedWorktree,
@@ -142,6 +156,7 @@ type ResumeThreadChoice = CodexThreadSummary & { archived?: boolean }
 
 const actionButtonTtlMs = 24 * 60 * 60_000
 const defaultMcpElicitationTimeoutMinutes = 10
+const maxMcpToolApprovalDisclosureChunks = 8
 const pendingContextUsageTtlMs = 5 * 60_000
 const maxPendingContextUsage = 100
 const queuedSourceRetryMaxDelayMs = 60_000
@@ -172,6 +187,12 @@ function truncate(value: string, limit: number): string {
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function pathIsWithinOrEqual(parent: string, candidate: string): boolean {
+  const relative = path.relative(path.resolve(parent), path.resolve(candidate))
+  return relative === '' ||
+    (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
 }
 
 function escapeInlineMarkdown(value: string): string {
@@ -277,10 +298,29 @@ type PendingUserInput = {
   timeout?: NodeJS.Timeout
 }
 
+type PendingMcpElicitation = {
+  request: ServerRequest
+  channel: ThreadChannel
+  mode: 'form' | 'url'
+  form?: McpElicitationForm
+  url?: string
+  content: Record<string, JsonValue>
+  fieldMessages: DiscordMessage[]
+  actionMessage: DiscordMessage
+  timeout: NodeJS.Timeout
+  toolApproval: boolean
+}
+
 type PendingRequestControl = {
-  kind: 'approval' | 'userInput' | 'actionButtons'
+  kind: 'approval' | 'userInput' | 'actionButtons' | 'mcpElicitation'
   key: string
   threadId?: string
+}
+
+class CordexStoppingError extends Error {
+  constructor() {
+    super('Cordex is stopping')
+  }
 }
 
 export class CordexDiscordBot {
@@ -297,6 +337,7 @@ export class CordexDiscordBot {
   private readonly approvals = new Map<string, PendingApproval>()
   private readonly pendingActionButtons = new Map<string, PendingActionButtons>()
   private readonly pendingUserInputs = new Map<string, PendingUserInput>()
+  private readonly pendingMcpElicitations = new Map<string, PendingMcpElicitation>()
   private readonly pendingRequestControls = new Map<string, PendingRequestControl>()
   private readonly pendingTurnStarts = new Set<string>()
   private readonly abortRequestedThreads = new Set<string>()
@@ -337,8 +378,12 @@ export class CordexDiscordBot {
   private readonly queuedSourceRetryAttempts = new Map<string, number>()
   private readonly deletedDiscordThreads = new Set<string>()
   private readonly unlinkedCodexSessionChannels = new Set<string>()
+  private readonly pendingDiscordIngress = new Set<Promise<void>>()
   private readonly pendingCodexNotifications = new Set<Promise<void>>()
+  private readonly pendingCodexServerRequests = new Set<Promise<void>>()
+  private readonly pendingCodexLifecycle = new Set<Promise<void>>()
   private readonly pendingCodexDeletionCleanups = new Set<Promise<void>>()
+  private readonly pendingBackgroundWork = new Set<Promise<void>>()
   private readonly archivingDiscordThreads = new Set<string>()
   private readonly deletedThreadInterruptedTurns = new Map<string, Set<string>>()
   private readonly restartAffectedChannels = new Set<string>()
@@ -352,7 +397,12 @@ export class CordexDiscordBot {
   private latestCodexResetGeneration = -1
   private ingressReady: Promise<void> = Promise.resolve()
   private releaseIngressReady: (() => void) | undefined
+  private resolveShutdownRequested: () => void = () => undefined
+  private readonly shutdownRequested = new Promise<void>((resolve) => {
+    this.resolveShutdownRequested = resolve
+  })
   private stopping = false
+  private stopPromise: Promise<void> | undefined
   private modelCache: { expiresAt: number; models: CodexModel[] } | undefined
   private skillCacheGeneration = 0
   private readonly skillCache = new Map<
@@ -381,179 +431,192 @@ export class CordexDiscordBot {
       partials: [Partials.Channel, Partials.Message],
     })
     this.client.on(Events.MessageCreate, (message) => {
-      void this.discordIngressQueue.run(message.channel.id, async () => {
-        await this.waitForIngressReady()
-        await this.handleMessage(message)
-      })
-        .catch((error: unknown) => {
-          console.error(`Failed to handle Discord message: ${errorText(error)}`)
-        })
+      this.acceptDiscordIngress('Discord message', () =>
+        this.discordIngressQueue.run(message.channel.id, async () => {
+          await this.waitForIngressReady()
+          await this.handleMessage(message)
+        }))
     })
     this.client.on(Events.MessageUpdate, (_oldMessage, message) => {
-      void this.discordIngressQueue.run(
-        message.channel.id,
-        async () => {
-          await this.waitForIngressReady()
-          let resolved: DiscordMessage
-          if (message.partial) {
-            try {
-              resolved = await (message as unknown as PartialMessage).fetch()
-            } catch (error) {
-              if (isUnknownDiscordMessageError(error)) {
-                await this.handleQueuedMessageDelete(message.id)
-                return
+      this.acceptDiscordIngress('Discord message update', () =>
+        this.discordIngressQueue.run(
+          message.channel.id,
+          async () => {
+            await this.waitForIngressReady()
+            let resolved: DiscordMessage
+            if (message.partial) {
+              try {
+                resolved = await (message as unknown as PartialMessage).fetch()
+              } catch (error) {
+                if (isUnknownDiscordMessageError(error)) {
+                  await this.handleQueuedMessageDelete(message.id)
+                  return
+                }
+                throw error
               }
-              throw error
+            } else {
+              resolved = message
             }
-          } else {
-            resolved = message
-          }
-          if (resolved.editedTimestamp === null) return
-          await this.handleQueuedMessageUpdate(resolved)
-        },
-      ).catch((error: unknown) => {
-        console.error(`Failed to handle Discord message update: ${errorText(error)}`)
-      })
+            if (resolved.editedTimestamp === null) return
+            await this.handleQueuedMessageUpdate(resolved)
+          },
+        ))
     })
     this.client.on(Events.MessageDelete, (message) => {
-      void this.discordIngressQueue.run(
-        message.channel.id,
-        async () => {
-          await this.waitForIngressReady()
-          await this.handleQueuedMessageDelete(message.id)
-        },
-      ).catch((error: unknown) => {
-        console.error(`Failed to handle Discord message deletion: ${errorText(error)}`)
-      })
+      this.acceptDiscordIngress('Discord message deletion', () =>
+        this.discordIngressQueue.run(
+          message.channel.id,
+          async () => {
+            await this.waitForIngressReady()
+            await this.handleQueuedMessageDelete(message.id)
+          },
+        ))
     })
     this.client.on(Events.ChannelDelete, (channel) => {
-      void this.discordIngressQueue.run(channel.id, () => this.handleChannelDelete(channel.id))
-        .catch((error: unknown) => {
-          console.error(`Failed to handle Discord channel deletion: ${errorText(error)}`)
-        })
+      this.acceptDiscordIngress('Discord channel deletion', () =>
+        this.discordIngressQueue.run(channel.id, () => this.handleChannelDelete(channel.id)))
     })
     this.client.on(Events.ThreadDelete, (thread) => {
-      this.clearQueuedSourceBlock(thread.id)
-      this.unlinkedCodexSessionChannels.delete(thread.id)
-      this.expectedDiscordTitles.delete(thread.id)
-      this.recentDiscordTitleEchoes.delete(thread.id)
-      this.pendingDiscordTitles.delete(thread.id)
-      this.pendingDiscordTitleVerifications.delete(thread.id)
-      const session = this.state.sessions[thread.id]
-      if (session) {
-        this.clearTitleVerificationState(session.codexThreadId, [thread.id])
-        this.expectedCodexTitles.delete(session.codexThreadId)
-        this.pendingCodexTitles.delete(session.codexThreadId)
-        this.recentCodexTitleEchoes.delete(session.codexThreadId)
-      }
-      const firstDeletion = !this.deletedDiscordThreads.has(thread.id)
-      this.deletedDiscordThreads.add(thread.id)
-      const interruption = firstDeletion
-        ? this.interruptDeletedThreadTurn(thread.id)
-        : Promise.resolve()
-      void this.discordIngressQueue.run(
-        thread.id,
-        () => this.handleThreadDelete(thread.id, interruption),
-      )
-        .catch((error: unknown) => {
-          console.error(`Failed to handle Discord thread deletion: ${errorText(error)}`)
-        })
+      this.acceptDiscordIngress('Discord thread deletion', async () => {
+        this.clearQueuedSourceBlock(thread.id)
+        this.unlinkedCodexSessionChannels.delete(thread.id)
+        this.expectedDiscordTitles.delete(thread.id)
+        this.recentDiscordTitleEchoes.delete(thread.id)
+        this.pendingDiscordTitles.delete(thread.id)
+        this.pendingDiscordTitleVerifications.delete(thread.id)
+        const session = this.state.sessions[thread.id]
+        if (session) {
+          this.clearTitleVerificationState(session.codexThreadId, [thread.id])
+          this.expectedCodexTitles.delete(session.codexThreadId)
+          this.pendingCodexTitles.delete(session.codexThreadId)
+          this.recentCodexTitleEchoes.delete(session.codexThreadId)
+        }
+        const firstDeletion = !this.deletedDiscordThreads.has(thread.id)
+        this.deletedDiscordThreads.add(thread.id)
+        const interruption = firstDeletion
+          ? this.interruptDeletedThreadTurn(thread.id)
+          : Promise.resolve()
+        await this.discordIngressQueue.run(
+          thread.id,
+          () => this.handleThreadDelete(thread.id, interruption),
+        )
+      })
     })
     this.client.on(Events.ThreadUpdate, (oldThread, newThread) => {
       if (oldThread.name === newThread.name) return
-      void this.discordIngressQueue.run(
-        newThread.id,
-        () => this.handleDiscordThreadTitleUpdate(newThread, oldThread.name),
-      ).catch((error: unknown) => {
-        console.error(`Failed to synchronize Discord thread title: ${errorText(error)}`)
-      })
+      this.acceptDiscordIngress('Discord thread title synchronization', () =>
+        this.discordIngressQueue.run(
+          newThread.id,
+          () => this.handleDiscordThreadTitleUpdate(newThread, oldThread.name),
+        ))
     })
     this.client.on(Events.InteractionCreate, (interaction) => {
-      if (interaction.isAutocomplete()) void this.handleAutocomplete(interaction)
+      if (interaction.isAutocomplete()) {
+        this.acceptDiscordIngress('Discord autocomplete', () => this.handleAutocomplete(interaction))
+      }
       else if (interaction.isChatInputCommand()) {
         if (interaction.commandName === 'abort') {
-          void this.handlePriorityCommand(interaction).catch((error: unknown) => {
-            console.error(`Failed to handle Discord abort command: ${errorText(error)}`)
-          })
+          this.acceptDiscordIngress(
+            'Discord abort command',
+            () => this.handlePriorityCommand(interaction),
+          )
         }
         else {
-          void this.handleQueuedCommand(interaction)
-            .catch((error: unknown) => {
-              console.error(`Failed to handle Discord command: ${errorText(error)}`)
-            })
+          this.acceptDiscordIngress('Discord command', () => this.handleQueuedCommand(interaction))
         }
       }
       else if (interaction.isButton()) {
-        void this.handleButton(interaction).catch((error: unknown) => {
-          console.error(`Failed to handle Discord button: ${errorText(error)}`)
-        })
+        this.acceptDiscordIngress('Discord button', () => this.handleButton(interaction))
       }
       else if (interaction.isStringSelectMenu()) {
         if (interaction.customId.startsWith('fork-subagent:')) {
-          void this.handleForkSubagentSelect(interaction).catch((error: unknown) => {
-            console.error(`Failed to handle Discord selection: ${errorText(error)}`)
-          })
+          this.acceptDiscordIngress(
+            'Discord selection',
+            () => this.handleForkSubagentSelect(interaction),
+          )
+        } else if (interaction.customId.startsWith('mcp-elicit-select:')) {
+          this.acceptDiscordIngress(
+            'MCP elicitation selection',
+            () => this.handleMcpElicitationSelect(interaction),
+          )
         } else {
-          void this.handleUserInputSelect(interaction).catch((error: unknown) => {
-            console.error(`Failed to handle Discord selection: ${errorText(error)}`)
-          })
+          this.acceptDiscordIngress('Discord selection', () => this.handleUserInputSelect(interaction))
         }
       }
       else if (interaction.isModalSubmit()) {
-        void this.handleUserInputModal(interaction).catch((error: unknown) => {
-          console.error(`Failed to handle Discord modal: ${errorText(error)}`)
-        })
+        if (interaction.customId.startsWith('mcp-elicit-modal:')) {
+          this.acceptDiscordIngress(
+            'MCP elicitation modal',
+            () => this.handleMcpElicitationModal(interaction),
+          )
+        } else {
+          this.acceptDiscordIngress('Discord modal', () => this.handleUserInputModal(interaction))
+        }
       }
     })
     this.codex.on('notification', (notification: ServerNotification) => {
       this.logVerbose('notification', notification)
       const generation = this.codexGeneration
-      const handling = this.enqueueNotification(notification, generation)
-        .catch((error: unknown) => {
-          console.error(`Failed to handle Codex notification: ${errorText(error)}`)
-        })
-      this.pendingCodexNotifications.add(handling)
-      void handling.finally(() => this.pendingCodexNotifications.delete(handling))
+      this.trackPendingWork(
+        this.pendingCodexNotifications,
+        this.enqueueNotification(notification, generation),
+        'Codex notification',
+      )
     })
     this.codex.on('serverRequest', (request: ServerRequest) => {
       this.logVerbose('server request', request)
       const generation = this.codexGeneration
-      void this.enqueueServerRequest(request, generation).catch((error: unknown) => {
-        console.error(`Failed to handle Codex server request: ${errorText(error)}`)
-      })
+      this.trackPendingWork(
+        this.pendingCodexServerRequests,
+        this.enqueueServerRequest(request, generation),
+        'Codex server request',
+      )
     })
     this.codex.on('protocolError', (error: Error) => console.error(error.message))
     this.codex.on('childFailure', () => {
+      if (this.stopping) return
       this.codexGeneration += 1
       this.beginCodexRecovery(this.codexLifecycleGeneration())
     })
     this.codex.on('restarting', (event: CodexAppServerRestartEvent) => {
+      if (this.stopping) return
       const generation = event.generation ?? this.codexLifecycleGeneration()
       this.beginCodexRecovery(generation)
       const reset = this.onCodexRestarting(event, generation)
       this.latestCodexReset = reset
       this.latestCodexResetGeneration = generation
-      void reset.catch((error: unknown) => {
-        console.error(`Failed to reset Cordex state after app-server exit: ${errorText(error)}`)
-      })
+      this.trackPendingWork(
+        this.pendingCodexLifecycle,
+        reset,
+        'Cordex state reset after app-server exit',
+      )
     })
     this.codex.on('ready', (event: CodexAppServerReadyEvent) => {
       if (!event.restartAttempt) return
       const generation = event.generation ?? this.codexLifecycleGeneration()
+      if (this.stopping) {
+        this.finishCodexRecovery(generation)
+        return
+      }
       this.beginCodexRecovery(generation)
       const reset = this.latestCodexReset
-      void this.codexLifecycleQueue.run('app-server', async () => {
+      const recovery = this.codexLifecycleQueue.run('app-server', async () => {
         await reset
         if (generation !== this.codexLifecycleGeneration()) return
         await this.onCodexRecovered(generation)
-      })
-        .catch((error: unknown) => {
-          console.error(`Failed to recover Cordex sessions after app-server restart: ${errorText(error)}`)
-        })
-        .finally(() => this.finishCodexRecovery(generation))
+      }).finally(() => this.finishCodexRecovery(generation))
+      this.trackPendingWork(
+        this.pendingCodexLifecycle,
+        recovery,
+        'Cordex session recovery after app-server restart',
+      )
     })
     this.codex.on('failed', (error: Error) => {
       const generation = this.codexLifecycleGeneration()
+      if (this.stopping) {
+        this.finishCodexRecovery(generation)
+        return
+      }
       this.beginCodexRecovery(generation)
       const reset = this.latestCodexResetGeneration === generation
         ? this.latestCodexReset
@@ -565,21 +628,101 @@ export class CordexDiscordBot {
           }, generation, false)
       this.latestCodexReset = reset
       this.latestCodexResetGeneration = generation
-      void this.codexLifecycleQueue.run('app-server', async () => {
+      const failure = this.codexLifecycleQueue.run('app-server', async () => {
         await reset
         if (generation !== this.codexLifecycleGeneration()) return
         await this.onCodexRecoveryFailed(error)
-      })
-        .catch((recoveryError: unknown) => {
-          console.error(`Failed to report terminal app-server failure: ${errorText(recoveryError)}`)
-        })
-        .finally(() => this.finishCodexRecovery(generation))
+      }).finally(() => this.finishCodexRecovery(generation))
+      this.trackPendingWork(
+        this.pendingCodexLifecycle,
+        failure,
+        'terminal app-server failure report',
+      )
     })
     this.codex.on('stderr', (chunk: string) => {
       if (this.options.verbose || /\b(error|panic|fatal)\b/i.test(chunk)) {
         console.error(`[codex stderr] ${chunk.trim()}`)
       }
     })
+  }
+
+  private trackPendingWork(
+    pending: Set<Promise<void>>,
+    work: Promise<void>,
+    label: string,
+  ): void {
+    const handling = work.catch((error: unknown) => {
+      if (error instanceof CordexStoppingError) return
+      console.error(`Failed to handle ${label}: ${errorText(error)}`)
+    })
+    pending.add(handling)
+    void handling.finally(() => pending.delete(handling)).catch(() => undefined)
+  }
+
+  private trackBackgroundWork(work: Promise<void>, label: string): void {
+    this.trackPendingWork(this.pendingBackgroundWork, work, label)
+  }
+
+  private acceptDiscordIngress(label: string, task: () => Promise<void>): void {
+    if (this.stopping) return
+    let work: Promise<void>
+    try {
+      work = task()
+    } catch (error) {
+      work = Promise.reject(error)
+    }
+    this.trackPendingWork(this.pendingDiscordIngress, work, label)
+  }
+
+  private assertNotStopping(): void {
+    if (this.stopping) throw new CordexStoppingError()
+  }
+
+  private async drainPendingWork(pending: Set<Promise<void>>): Promise<void> {
+    while (pending.size > 0) await Promise.all([...pending])
+  }
+
+  private async drainKeyedQueues(): Promise<void> {
+    await Promise.all([
+      this.codexEventQueue.drain(),
+      this.codexLifecycleQueue.drain(),
+      this.discordIngressQueue.drain(),
+      this.promptQueue.drain(),
+      this.attachmentCacheQueue.drain(),
+      this.discordOutboxStateQueue.drain(),
+      this.discordOutboxDeliveryQueue.drain(),
+      this.resumeQueue.drain(),
+      this.titleQueue.drain(),
+      this.mcpConfigQueue.drain(),
+      this.projectMutationQueue.drain(),
+    ])
+  }
+
+  private pendingShutdownWork(): number {
+    return this.pendingDiscordIngress.size +
+      this.pendingCodexNotifications.size +
+      this.pendingCodexServerRequests.size +
+      this.pendingCodexLifecycle.size +
+      this.pendingCodexDeletionCleanups.size +
+      this.pendingBackgroundWork.size
+  }
+
+  private async drainShutdownWork(): Promise<void> {
+    do {
+      await this.drainPendingWork(this.pendingDiscordIngress)
+      await this.drainKeyedQueues()
+      await Promise.all([
+        this.drainPendingWork(this.pendingCodexNotifications),
+        this.drainPendingWork(this.pendingCodexServerRequests),
+        this.drainPendingWork(this.pendingCodexLifecycle),
+        this.drainPendingWork(this.pendingCodexDeletionCleanups),
+        this.drainPendingWork(this.pendingBackgroundWork),
+      ])
+      // Codex handlers can append persistence and delivery work after the first
+      // queue pass, and queue work can synchronously emit another tracked event.
+      await this.drainKeyedQueues()
+      await Promise.resolve()
+    } while (this.pendingShutdownWork() > 0)
   }
 
   private logVerbose(label: string, value: unknown): void {
@@ -626,7 +769,15 @@ export class CordexDiscordBot {
   }
 
   private async waitForCodexRecovery(): Promise<void> {
-    while (this.codexRecoveryPromise) await this.codexRecoveryPromise
+    while (this.codexRecoveryPromise) {
+      const recovery = this.codexRecoveryPromise
+      await Promise.race([
+        recovery,
+        this.shutdownRequested.then(() => {
+          throw new CordexStoppingError()
+        }),
+      ])
+    }
   }
 
   private beginIngressBarrier(): void {
@@ -644,14 +795,12 @@ export class CordexDiscordBot {
 
   private async waitForIngressReady(): Promise<void> {
     await this.ingressReady
-    if (this.stopping) throw new Error('Cordex is stopping')
   }
 
   // State mutations wait for both startup and Codex restart recovery.
   private async waitForMutationIngressReady(): Promise<void> {
     await this.waitForIngressReady()
     await this.waitForCodexRecovery()
-    if (this.stopping) throw new Error('Cordex is stopping')
   }
 
   private async pruneAttachmentCache(): Promise<void> {
@@ -725,6 +874,10 @@ export class CordexDiscordBot {
   }
 
   private async onCodexRecovered(generation = this.codexLifecycleGeneration()): Promise<void> {
+    await this.reconcileSessionLifecycleIntents()
+    if (generation !== this.codexLifecycleGeneration()) return
+    await this.reconcileWorktreeRemovalIntents()
+    if (generation !== this.codexLifecycleGeneration()) return
     await this.recoverDiscordOutbox()
     if (generation !== this.codexLifecycleGeneration()) return
     await this.resumeActiveGoalSessions(generation)
@@ -767,30 +920,406 @@ export class CordexDiscordBot {
     }))
   }
 
+  private async persistSessionLifecycleIntent(
+    session: SessionState,
+    kind: 'archive' | 'resume',
+  ): Promise<void> {
+    const existing = session.lifecycleIntent
+    if (existing && existing.kind !== kind) {
+      throw new Error(`Session ${existing.kind} operation is still pending`)
+    }
+    if (existing) return
+    const previous = structuredClone(session)
+    const now = new Date().toISOString()
+    if (!existing) session.lifecycleIntent = { kind, requestedAt: now }
+    session.archived = true
+    session.updatedAt = now
+    try {
+      await saveState(this.state)
+    } catch (error) {
+      this.restoreSessionState(session, previous)
+      throw error
+    }
+  }
+
+  private async clearSessionLifecycleIntent(
+    session: SessionState,
+    kind: 'archive' | 'resume',
+  ): Promise<void> {
+    if (session.lifecycleIntent?.kind !== kind) return
+    const previous = structuredClone(session)
+    delete session.lifecycleIntent
+    session.updatedAt = new Date().toISOString()
+    try {
+      await saveState(this.state)
+    } catch (error) {
+      this.restoreSessionState(session, previous)
+      throw error
+    }
+  }
+
+  private async convergeDiscordLifecycleState(
+    session: SessionState,
+    kind: 'archive' | 'resume',
+    archived: boolean,
+    reason: string,
+    knownChannel?: ThreadChannel,
+  ): Promise<boolean> {
+    let channel = knownChannel
+    if (!channel) {
+      try {
+        const fetched = await this.client.channels.fetch(session.discordThreadId, { force: true })
+        if (fetched?.isThread()) channel = fetched
+        else {
+          await this.clearSessionLifecycleIntent(session, kind)
+          return false
+        }
+      } catch (error) {
+        if (!isUnknownDiscordChannelError(error)) throw error
+        await this.clearSessionLifecycleIntent(session, kind)
+        return false
+      }
+    }
+    if (channel.archived !== archived) {
+      try {
+        await channel.setArchived(archived, reason)
+      } catch (error) {
+        if (!isUnknownDiscordChannelError(error)) throw error
+        await this.clearSessionLifecycleIntent(session, kind)
+        return false
+      }
+    }
+    await this.clearSessionLifecycleIntent(session, kind)
+    return true
+  }
+
+  private async finalizeArchivedSession(session: SessionState): Promise<void> {
+    const previous = structuredClone(session)
+    session.archived = true
+    session.updatedAt = new Date().toISOString()
+    try {
+      await saveState(this.state)
+    } catch (error) {
+      this.restoreSessionState(session, previous)
+      throw error
+    }
+    this.loadedThreads.delete(session.codexThreadId)
+    this.preserveArchivedUntilResume.delete(session.codexThreadId)
+    this.clearTitleVerificationState(session.codexThreadId, [session.discordThreadId])
+  }
+
+  private async persistedResumeConfiguration(session: SessionState): Promise<{
+    model?: string
+    effort?: ReasoningEffort
+    fastMode?: boolean
+    yoloMode: boolean
+    options: Parameters<CodexAppServer['resumeThread']>[0]
+  }> {
+    const model = session.model ||
+      this.state.channelModels[session.parentChannelId] ||
+      this.config.defaultModel
+    const effort = session.effort ||
+      this.state.channelEfforts[session.parentChannelId] ||
+      this.config.defaultEffort
+    const fastMode = session.fastMode ?? this.state.channelFastMode[session.parentChannelId]
+    const yoloMode = session.yoloMode ??
+      this.state.channelYoloMode[session.parentChannelId] ??
+      false
+    const serviceTier = await this.serviceTierForFastMode(model, fastMode)
+    const runtimeRoots = this.runtimeWorkspaceRoots(session)
+    return {
+      ...(model ? { model } : {}),
+      ...(effort ? { effort } : {}),
+      ...(fastMode !== undefined ? { fastMode } : {}),
+      yoloMode,
+      options: {
+        threadId: session.codexThreadId,
+        includeTurns: true,
+        cwd: session.directory,
+        ...(model ? { model } : {}),
+        ...(serviceTier !== undefined ? { serviceTier } : {}),
+        ...(runtimeRoots ? { runtimeWorkspaceRoots: runtimeRoots } : {}),
+        ...(!yoloMode && session.permissions
+          ? { permissions: session.permissions }
+          : { sandbox: yoloMode ? 'danger-full-access' : this.config.sandbox }),
+        approvalPolicy: yoloMode ? 'never' : this.config.approvalPolicy,
+      },
+    }
+  }
+
+  private async finalizeResumedSession(
+    session: SessionState,
+    resumed: Awaited<ReturnType<CodexAppServer['resumeThread']>>,
+    desired: {
+      model?: string
+      effort?: ReasoningEffort
+      fastMode?: boolean
+      yoloMode: boolean
+    },
+  ): Promise<void> {
+    if (desired.effort && resumed.effort !== desired.effort) {
+      await this.codex.updateThreadSettings({
+        threadId: session.codexThreadId,
+        effort: desired.effort,
+      })
+    }
+    const previous = structuredClone(session)
+    const replayWasBlocked = this.contextReplayBlocked.has(session.codexThreadId)
+    const pendingUsage = this.pendingContextUsage.get(session.codexThreadId)
+    const resumedModel = resumed.model || desired.model
+    const modelTransition = resumedModel !== undefined &&
+      session.model !== undefined &&
+      resumedModel !== session.model
+    const resumedFastMode = resumed.serviceTier !== undefined
+      ? await this.fastModeForServiceTier(resumedModel, resumed.serviceTier)
+      : desired.fastMode
+    if (modelTransition) {
+      this.contextReplayBlocked.add(session.codexThreadId)
+      this.pendingContextUsage.delete(session.codexThreadId)
+    } else {
+      this.contextReplayBlocked.delete(session.codexThreadId)
+    }
+    if (resumedModel) session.model = resumedModel
+    const resumedEffort = desired.effort || resumed.effort
+    if (resumedEffort) session.effort = resumedEffort
+    if (resumedFastMode !== undefined) session.fastMode = resumedFastMode
+    session.yoloMode = desired.yoloMode
+    delete session.archived
+    session.updatedAt = new Date().toISOString()
+    if (modelTransition) {
+      delete session.contextTokens
+      delete session.contextWindow
+    } else {
+      this.hydratePendingContextUsage(session)
+    }
+    this.loadedThreads.add(session.codexThreadId)
+    try {
+      await saveState(this.state)
+    } catch (error) {
+      this.restoreSessionState(session, previous)
+      this.loadedThreads.delete(session.codexThreadId)
+      if (replayWasBlocked) this.contextReplayBlocked.add(session.codexThreadId)
+      else this.contextReplayBlocked.delete(session.codexThreadId)
+      if (pendingUsage) this.pendingContextUsage.set(session.codexThreadId, pendingUsage)
+      else this.pendingContextUsage.delete(session.codexThreadId)
+      throw error
+    }
+    this.preserveArchivedUntilResume.delete(session.codexThreadId)
+  }
+
+  private async reconcileSessionLifecycleIntents(): Promise<void> {
+    const pending = Object.values(this.state.sessions).filter(
+      (session) => session.lifecycleIntent?.kind === 'archive' ||
+        session.lifecycleIntent?.kind === 'resume',
+    )
+    if (pending.length === 0) return
+
+    const intentKinds = new Map<string, 'archive' | 'resume'>()
+    for (const session of pending) {
+      const kind = session.lifecycleIntent?.kind
+      if (kind !== 'archive' && kind !== 'resume') continue
+      const existing = intentKinds.get(session.codexThreadId)
+      if (existing && existing !== kind) {
+        throw new Error(`Conflicting lifecycle intents for Codex thread ${session.codexThreadId}`)
+      }
+      intentKinds.set(session.codexThreadId, kind)
+    }
+
+    const [activeThreads, archivedThreads] = await Promise.all([
+      this.codex.listAllThreads(),
+      this.codex.listAllThreads({ archived: true }),
+    ])
+    const activeIds = new Set(activeThreads.map((thread) => thread.id))
+    const archivedIds = new Set(archivedThreads.map((thread) => thread.id))
+
+    for (const pendingSession of pending) {
+      await this.resumeQueue.run(pendingSession.codexThreadId, async () => {
+        await this.codexEventQueue.run(pendingSession.codexThreadId, async () => {
+          const session = this.state.sessions[pendingSession.discordThreadId]
+          if (!session || session.codexThreadId !== pendingSession.codexThreadId) return
+          const kind = session.lifecycleIntent?.kind
+          if (kind !== 'archive' && kind !== 'resume') return
+          let active = activeIds.has(session.codexThreadId)
+          let archived = archivedIds.has(session.codexThreadId)
+          if (!active && !archived) {
+            const [refreshedActive, refreshedArchived] = await Promise.all([
+              this.codex.listAllThreads(),
+              this.codex.listAllThreads({ archived: true }),
+            ])
+            activeIds.clear()
+            archivedIds.clear()
+            for (const thread of refreshedActive) activeIds.add(thread.id)
+            for (const thread of refreshedArchived) archivedIds.add(thread.id)
+            active = activeIds.has(session.codexThreadId)
+            archived = archivedIds.has(session.codexThreadId)
+          }
+          if (!active && !archived) {
+            const entries = Object.entries(this.state.sessions).filter(
+              ([, candidate]) => candidate.codexThreadId === session.codexThreadId,
+            )
+            for (const [discordThreadId] of entries) {
+              this.unlinkedCodexSessionChannels.add(discordThreadId)
+            }
+            await this.cleanupDeletedCodexThread(session.codexThreadId, entries)
+            return
+          }
+          // The two listings are not one atomic snapshot. If a delayed RPC
+          // completes between them, prefer the state requested by the durable intent.
+          if (active && archived) {
+            if (kind === 'archive') active = false
+            else archived = false
+          }
+
+          if (kind === 'archive') {
+            if (active) {
+              await this.codex.archiveThread(session.codexThreadId)
+              this.expectArchiveNotification(session.codexThreadId, 'archived')
+              activeIds.delete(session.codexThreadId)
+              archivedIds.add(session.codexThreadId)
+            }
+            await this.finalizeArchivedSession(session)
+            await this.convergeDiscordLifecycleState(
+              session,
+              'archive',
+              true,
+              'Recovered pending Cordex archive',
+            )
+            return
+          }
+
+          this.preserveArchivedUntilResume.add(session.codexThreadId)
+          if (archived) {
+            await this.codex.unarchiveThread(session.codexThreadId)
+            this.expectArchiveNotification(session.codexThreadId, 'unarchived')
+            archivedIds.delete(session.codexThreadId)
+            activeIds.add(session.codexThreadId)
+          }
+          const configuration = await this.persistedResumeConfiguration(session)
+          const resumed = await this.codex.resumeThread(configuration.options)
+          await this.finalizeResumedSession(session, resumed, configuration)
+          await this.convergeDiscordLifecycleState(
+            session,
+            'resume',
+            false,
+            'Recovered pending Cordex resume',
+          )
+        })
+      })
+    }
+  }
+
+  private async finalizeWorktreeRemoval(
+    session: SessionState,
+    worktree: NonNullable<SessionState['worktree']>,
+  ): Promise<void> {
+    const previous = structuredClone(session)
+    const removedDirectory = path.resolve(worktree.directory)
+    session.directory = path.resolve(worktree.projectDirectory)
+    if (session.workspaceRoots) {
+      session.workspaceRoots = session.workspaceRoots.filter(
+        (root) => !pathIsWithinOrEqual(removedDirectory, root),
+      )
+      if (session.workspaceRoots.length === 0) delete session.workspaceRoots
+    }
+    delete session.worktree
+    if (session.lifecycleIntent?.kind === 'remove-worktree') delete session.lifecycleIntent
+    session.updatedAt = new Date().toISOString()
+    try {
+      await saveState(this.state)
+    } catch (error) {
+      this.restoreSessionState(session, previous)
+      throw error
+    }
+    this.loadedThreads.delete(session.codexThreadId)
+  }
+
+  private async reconcileWorktreeRemovalIntents(): Promise<void> {
+    const pending = Object.values(this.state.sessions).filter(
+      (session) => session.lifecycleIntent?.kind === 'remove-worktree',
+    )
+    for (const pendingSession of pending) {
+      await this.projectMutationQueue.run(
+        `channel:${pendingSession.parentChannelId}`,
+        async () => {
+          const session = this.state.sessions[pendingSession.discordThreadId]
+          if (
+            !session ||
+            session.codexThreadId !== pendingSession.codexThreadId ||
+            session.lifecycleIntent?.kind !== 'remove-worktree'
+          ) return
+          const worktree = session.worktree
+          if (!worktree) {
+            throw new Error(
+              `Cannot reconcile worktree removal for ${session.codexThreadId}: metadata is missing`,
+            )
+          }
+          await removeMergedWorktree({
+            projectDirectory: worktree.projectDirectory,
+            worktreeDirectory: worktree.directory,
+            branch: worktree.branch,
+          })
+          await this.finalizeWorktreeRemoval(session, worktree)
+        },
+      )
+    }
+  }
+
+  private async completePendingWorktreeRemovalBeforeSessionDrop(
+    session: SessionState,
+  ): Promise<void> {
+    if (session.lifecycleIntent?.kind !== 'remove-worktree') return
+    const worktree = session.worktree
+    if (!worktree) {
+      throw new Error(
+        `Cannot finish worktree removal for ${session.codexThreadId}: metadata is missing`,
+      )
+    }
+    await removeMergedWorktree({
+      projectDirectory: worktree.projectDirectory,
+      worktreeDirectory: worktree.directory,
+      branch: worktree.branch,
+    })
+  }
+
   async start(): Promise<void> {
-    this.stopping = false
+    this.assertNotStopping()
+    if (this.stopPromise) throw new CordexStoppingError()
     this.beginIngressBarrier()
     let started = false
     try {
       await this.pruneAttachmentCache().catch((error: unknown) => {
         console.error(`Failed to prune Discord attachment cache: ${errorText(error)}`)
       })
+      this.assertNotStopping()
       await this.registerCommands()
+      this.assertNotStopping()
       await this.client.login(this.config.token)
+      this.assertNotStopping()
+      await this.reconcileSessionLifecycleIntents()
+      this.assertNotStopping()
+      await this.reconcileWorktreeRemovalIntents()
+      this.assertNotStopping()
       try {
         await withManagementLock(async () => {
+          this.assertNotStopping()
           await this.refreshProjectsFromDisk()
+          this.assertNotStopping()
           await this.pruneDeletedProjectMappings()
+          this.assertNotStopping()
           await this.pruneOrphanedState()
+          this.assertNotStopping()
           const guild = await this.client.guilds.fetch(this.config.guildId)
+          this.assertNotStopping()
           const root = await ensureRootChannel({
             guild,
             config: this.config,
             ...(this.client.user?.username ? { botName: this.client.user.username } : {}),
           })
+          this.assertNotStopping()
           if (root) {
             try {
               await saveManagedConfig(this.config)
+              this.assertNotStopping()
             } catch (error) {
               if (root.created) {
                 delete this.config.projects[root.textChannel.id]
@@ -806,13 +1335,20 @@ export class CordexDiscordBot {
           }
         })
       } catch (error) {
+        if (error instanceof CordexStoppingError) throw error
         throw new Error(`Cordex channel setup failed: ${errorText(error)}`, { cause: error })
       }
+      this.assertNotStopping()
       await this.recoverDiscordOutbox()
+      this.assertNotStopping()
       await this.reconcilePersistedQueuedSources()
+      this.assertNotStopping()
       await this.resumeActiveGoalSessions()
+      this.assertNotStopping()
       await this.reconcileSessionTitles()
+      this.assertNotStopping()
       await this.recoverPersistedPromptQueues()
+      this.assertNotStopping()
       this.scheduler.start()
       started = true
     } finally {
@@ -999,16 +1535,20 @@ export class CordexDiscordBot {
     this.queuedSourceRetryAttempts.set(threadId, attempt + 1)
     const timer = setTimeout(() => {
       this.queuedSourceRetryTimers.delete(threadId)
-      void this.retryBlockedQueuedSourceThread(threadId).catch((error: unknown) => {
-        this.logVerbose('queued source retry failed', {
-          discordThreadId: threadId,
-          error: errorText(error),
-        })
-      }).finally(() => {
-        if (this.blockedQueuedSourceThreads.has(threadId)) {
-          this.scheduleQueuedSourceRetry(threadId)
-        }
-      })
+      if (this.stopping) return
+      this.trackBackgroundWork(
+        this.retryBlockedQueuedSourceThread(threadId).catch((error: unknown) => {
+          this.logVerbose('queued source retry failed', {
+            discordThreadId: threadId,
+            error: errorText(error),
+          })
+        }).finally(() => {
+          if (this.blockedQueuedSourceThreads.has(threadId)) {
+            this.scheduleQueuedSourceRetry(threadId)
+          }
+        }),
+        'queued Discord source retry',
+      )
     }, delayMs)
     timer.unref()
     this.queuedSourceRetryTimers.set(threadId, timer)
@@ -1267,6 +1807,7 @@ export class CordexDiscordBot {
     this.titleVerificationRetryAttempts.set(threadId, Math.min(attempt + 1, 6))
     const timer = setTimeout(() => {
       this.titleVerificationRetryTimers.delete(threadId)
+      if (this.stopping) return
       const current = this.state.sessions[session.discordThreadId]
       if (
         current?.codexThreadId !== threadId ||
@@ -1280,12 +1821,15 @@ export class CordexDiscordBot {
         this.scheduleTitleVerificationRetry(current)
         return
       }
-      void this.retryPendingSessionTitle(current).catch((error: unknown) => {
-        this.logVerbose('deferred title verification failed', {
-          threadId,
-          error: errorText(error),
-        })
-      })
+      this.trackBackgroundWork(
+        this.retryPendingSessionTitle(current).catch((error: unknown) => {
+          this.logVerbose('deferred title verification failed', {
+            threadId,
+            error: errorText(error),
+          })
+        }),
+        'deferred title verification',
+      )
     }, delayMs)
     timer.unref()
     this.titleVerificationRetryTimers.set(threadId, timer)
@@ -1477,9 +2021,17 @@ export class CordexDiscordBot {
   }
 
   async stop(): Promise<void> {
-    this.stopping = true
-    this.finishIngressBarrier()
-    await this.scheduler.stopAndDrain()
+    if (!this.stopPromise) {
+      this.stopping = true
+      this.resolveShutdownRequested()
+      this.finishIngressBarrier()
+      this.stopPromise = this.stopInternal()
+      this.stopPromise.catch(() => undefined)
+    }
+    await this.stopPromise
+  }
+
+  private clearShutdownTimers(): void {
     for (const timer of this.titleVerificationRetryTimers.values()) clearTimeout(timer)
     this.titleVerificationRetryTimers.clear()
     this.titleVerificationRetryAttempts.clear()
@@ -1489,15 +2041,37 @@ export class CordexDiscordBot {
     this.clearAllQueuedSourceRetries()
     this.invalidateSkillCache()
     for (const run of this.runs.values()) clearInterval(run.typingTimer)
-    await this.codex.close()
-    while (this.pendingCodexNotifications.size > 0) {
-      await Promise.all([...this.pendingCodexNotifications])
+  }
+
+  private async dismissPendingControlsForShutdown(): Promise<void> {
+    const channelIds = new Set([
+      ...Array.from(this.approvals.values(), (pending) => pending.channel.id),
+      ...Array.from(this.pendingUserInputs.values(), (pending) => pending.channel.id),
+      ...Array.from(this.pendingActionButtons.values(), (pending) => pending.channel.id),
+      ...Array.from(this.pendingMcpElicitations.values(), (pending) => pending.channel.id),
+    ])
+    await Promise.all(Array.from(channelIds, (channelId) =>
+      this.dismissPendingControlsForChannel(channelId, '_Cordex is shutting down._')))
+  }
+
+  private async stopInternal(): Promise<void> {
+    await this.scheduler.stopAndDrain()
+    this.clearShutdownTimers()
+    try {
+      await this.drainShutdownWork()
+      await this.dismissPendingControlsForShutdown()
+      await this.drainShutdownWork()
+      this.finishCodexRecovery(this.codexRecoveryGeneration)
+      await this.codex.close()
+      await this.drainShutdownWork()
+      await this.dismissPendingControlsForShutdown()
+      await this.drainShutdownWork()
+    } finally {
+      this.clearShutdownTimers()
+      this.finishCodexRecovery(this.codexRecoveryGeneration)
+      this.unlinkedCodexSessionChannels.clear()
+      this.client.destroy()
     }
-    while (this.pendingCodexDeletionCleanups.size > 0) {
-      await Promise.all([...this.pendingCodexDeletionCleanups])
-    }
-    this.unlinkedCodexSessionChannels.clear()
-    this.client.destroy()
   }
 
   private async registerCommands(): Promise<void> {
@@ -1614,6 +2188,7 @@ export class CordexDiscordBot {
         }
       }
       if (validThread) continue
+      await this.completePendingWorktreeRemovalBeforeSessionDrop(session)
       this.deletedDiscordThreads.add(threadId)
       await this.interruptRuntimeTurn(session).catch(() => undefined)
       await this.codex.archiveThread(session.codexThreadId).catch(() => undefined)
@@ -2115,6 +2690,7 @@ export class CordexDiscordBot {
       else if (interaction.commandName === 'toggle-worktrees') await this.handleToggleWorktreesCommand(interaction)
       else if (interaction.commandName === 'worktrees') await this.handleWorktreesCommand(interaction)
       else if (interaction.commandName === 'merge-worktree') await this.handleMergeWorktreeCommand(interaction)
+      else if (interaction.commandName === 'delete-worktree') await this.handleDeleteWorktreeCommand(interaction)
       else if (interaction.commandName === 'queue') await this.handleQueueCommand(interaction)
       else if (interaction.commandName === 'clear-queue') await this.handleClearQueueCommand(interaction)
       else if (interaction.commandName === 'run-shell-command') await this.handleShellCommand(interaction)
@@ -2265,11 +2841,15 @@ export class CordexDiscordBot {
     archiveSessions: boolean,
   ): Promise<number> {
     const project = this.config.projects[channelId]
+    const matchingSessions = Object.entries(this.state.sessions).filter(
+      ([, session]) => session.parentChannelId === channelId,
+    )
+    for (const [, session] of matchingSessions) {
+      await this.completePendingWorktreeRemovalBeforeSessionDrop(session)
+    }
     const sessions = archiveSessions
       ? await this.archiveProjectSessions(channelId, false)
-      : Object.entries(this.state.sessions).filter(
-          ([, session]) => session.parentChannelId === channelId,
-        )
+      : matchingSessions
     if (!project && sessions.length === 0) return 0
     for (const [discordThreadId, session] of sessions) {
       this.loadedThreads.delete(session.codexThreadId)
@@ -2300,6 +2880,7 @@ export class CordexDiscordBot {
   ): Promise<void> {
     const session = this.state.sessions[threadId]
     if (!session) return
+    await this.completePendingWorktreeRemovalBeforeSessionDrop(session)
     await this.dismissPendingControlsForChannel(threadId, '_Thread deleted._')
     await interruption
     await this.interruptDeletedRuntimeTurn(threadId, session).catch((error: unknown) => {
@@ -2459,6 +3040,9 @@ export class CordexDiscordBot {
   private async ensureSessionLoaded(session: SessionState): Promise<void> {
     await this.resumeQueue.run(session.codexThreadId, async () => {
       await this.codexEventQueue.run(session.codexThreadId, async () => {
+        if (session.lifecycleIntent) {
+          throw new Error(`Session ${session.lifecycleIntent.kind} operation is still pending`)
+        }
         if (this.loadedThreads.has(session.codexThreadId)) {
           await this.retryPendingSessionTitle(session)
           return
@@ -3278,6 +3862,9 @@ export class CordexDiscordBot {
           if (this.removingProjects.has(parentChannelId)) throw new Error('Project is being removed')
           const sourceSession = this.state.sessions[sourceThreadId]
           if (!sourceSession) return undefined
+          if (sourceSession.lifecycleIntent) {
+            throw new Error(`Session ${sourceSession.lifecycleIntent.kind} operation is still pending`)
+          }
           const directory = path.resolve(sourceSession.directory)
           this.pendingSessionDirectoryReservations.set(
             directory,
@@ -3360,6 +3947,12 @@ export class CordexDiscordBot {
           ([, session]) => session.codexThreadId === codexThreadId,
         )
         const knownSession = knownEntry?.[1]
+        if (
+          knownSession?.lifecycleIntent &&
+          knownSession.lifecycleIntent.kind !== 'resume'
+        ) {
+          throw new Error(`Session ${knownSession.lifecycleIntent.kind} operation is still pending`)
+        }
         let existingChannel: ThreadChannel | undefined
         if (knownEntry) {
           try {
@@ -3374,9 +3967,15 @@ export class CordexDiscordBot {
             !knownSession.archived &&
             this.loadedThreads.has(codexThreadId)
           ) {
-            await saveState(this.state)
-            if (existingChannel.archived) {
-              await existingChannel.setArchived(false, 'Resume existing Cordex session')
+            const channelAvailable = await this.convergeDiscordLifecycleState(
+              knownSession,
+              'resume',
+              false,
+              'Resume existing Cordex session',
+              existingChannel,
+            )
+            if (!channelAvailable) {
+              throw new Error('Discord session thread no longer exists; run /resume again')
             }
             await existingChannel.members.add(interaction.user.id).catch(() => undefined)
             queueDrain = { session: knownSession, channel: existingChannel }
@@ -3415,7 +4014,9 @@ export class CordexDiscordBot {
         }
 
         let resumed
-        if (knownSession?.archived) {
+        if (knownSession?.archived || knownSession?.lifecycleIntent?.kind === 'resume') {
+          if (!knownSession) throw new Error('Archived session linkage is missing')
+          await this.persistSessionLifecycleIntent(knownSession, 'resume')
           this.preserveArchivedUntilResume.add(codexThreadId)
           let unarchiveError: unknown
           try {
@@ -3435,10 +4036,8 @@ export class CordexDiscordBot {
           } catch (error) {
             if (!/archived.*unarchive|session .* is archived/i.test(errorText(error))) throw error
             if (knownSession) {
-              knownSession.archived = true
-              knownSession.updatedAt = new Date().toISOString()
+              await this.persistSessionLifecycleIntent(knownSession, 'resume')
               this.preserveArchivedUntilResume.add(codexThreadId)
-              await saveState(this.state)
             }
             await this.codex.unarchiveThread(codexThreadId)
             this.expectArchiveNotification(codexThreadId, 'unarchived')
@@ -3494,8 +4093,15 @@ export class CordexDiscordBot {
             throw error
           }
           this.preserveArchivedUntilResume.delete(codexThreadId)
-          if (existingChannel.archived) {
-            await existingChannel.setArchived(false, 'Resume existing Cordex session')
+          const channelAvailable = await this.convergeDiscordLifecycleState(
+            knownSession,
+            'resume',
+            false,
+            'Resume existing Cordex session',
+            existingChannel,
+          )
+          if (!channelAvailable) {
+            throw new Error('Discord session thread no longer exists; run /resume again')
           }
           await this.synchronizeThreadTitle(
             knownSession,
@@ -3619,13 +4225,22 @@ export class CordexDiscordBot {
     if (resumeReply) await interaction.editReply(resumeReply)
   }
 
-  private requireThreadSession(interaction: ChatInputCommandInteraction): {
+  private requireThreadSession(
+    interaction: ChatInputCommandInteraction,
+    allowedLifecycleIntent?: NonNullable<SessionState['lifecycleIntent']>['kind'],
+  ): {
     channel: ThreadChannel
     session: SessionState
   } {
     if (!interaction.channel?.isThread()) throw new Error('Command requires a Cordex thread')
     const session = this.state.sessions[interaction.channel.id]
     if (!session) throw new Error('Thread has no Cordex session')
+    if (
+      session.lifecycleIntent &&
+      session.lifecycleIntent.kind !== allowedLifecycleIntent
+    ) {
+      throw new Error(`Session ${session.lifecycleIntent.kind} operation is still pending`)
+    }
     return { channel: interaction.channel, session }
   }
 
@@ -3829,7 +4444,6 @@ export class CordexDiscordBot {
     channel: ThreadChannel,
     previousName?: string,
   ): Promise<void> {
-    if (this.stopping) return
     const title = normalizeThreadTitle(channel.name)
     const session = this.state.sessions[channel.id]
     if (!session || session.archived || this.deletedDiscordThreads.has(channel.id)) return
@@ -4145,11 +4759,17 @@ export class CordexDiscordBot {
   }
 
   private async handleArchiveCommand(interaction: ChatInputCommandInteraction): Promise<void> {
-    const { channel, session } = this.requireThreadSession(interaction)
+    const { channel, session } = this.requireThreadSession(interaction, 'archive')
     await interaction.deferReply()
-    if (session.archived) {
-      await saveState(this.state)
-      if (!channel.archived) await channel.setArchived(true, 'Archived by Cordex user')
+    if (session.archived && !session.lifecycleIntent) {
+      await this.persistSessionLifecycleIntent(session, 'archive')
+      await this.convergeDiscordLifecycleState(
+        session,
+        'archive',
+        true,
+        'Archived by Cordex user',
+        channel,
+      )
       await interaction.editReply('Session is already archived.')
       return
     }
@@ -4188,38 +4808,20 @@ export class CordexDiscordBot {
           }
           const goal = await this.codex.getThreadGoal(session.codexThreadId)
           if (goal?.status === 'active') throw new Error('Pause, complete, or clear the active goal before archiving')
-          const previousUpdatedAt = session.updatedAt
-          session.archived = true
-          session.updatedAt = new Date().toISOString()
-          try {
-            await saveState(this.state)
-          } catch (error) {
-            delete session.archived
-            session.updatedAt = previousUpdatedAt
-            throw error
-          }
-          try {
-            await this.codex.archiveThread(session.codexThreadId)
-          } catch (error) {
-            delete session.archived
-            session.updatedAt = previousUpdatedAt
-            try {
-              await saveState(this.state)
-            } catch (rollbackError) {
-              session.archived = true
-              session.updatedAt = new Date().toISOString()
-              throw rollbackError
-            }
-            throw error
-          }
+          await this.persistSessionLifecycleIntent(session, 'archive')
+          await this.codex.archiveThread(session.codexThreadId)
           this.expectArchiveNotification(session.codexThreadId, 'archived')
-          this.loadedThreads.delete(session.codexThreadId)
-          this.preserveArchivedUntilResume.delete(session.codexThreadId)
-          this.clearTitleVerificationState(session.codexThreadId, [channel.id])
+          await this.finalizeArchivedSession(session)
+          await this.convergeDiscordLifecycleState(
+            session,
+            'archive',
+            true,
+            'Archived by Cordex user',
+            channel,
+          )
         })
       })
       await interaction.editReply('Session archived.')
-      await channel.setArchived(true, 'Archived by Cordex user')
     } finally {
       this.archivingDiscordThreads.delete(channel.id)
     }
@@ -4670,7 +5272,7 @@ export class CordexDiscordBot {
       createdAt: new Date().toISOString(),
       deliveryKind: 'queued',
     }, session.archived === true)
-    if (session.archived) {
+    if (session.archived && session.lifecycleIntent?.kind !== 'archive') {
       await channel.send(`» **scheduled task queued while archived:** ${truncate(task.prompt, 1_650)}`)
         .catch(() => undefined)
     } else {
@@ -4840,9 +5442,15 @@ export class CordexDiscordBot {
           ...(targetBranch ? { targetBranch } : {}),
         })
         if (result.status !== 'conflict') {
+          const previous = structuredClone(current.session)
           worktree.merged = true
           current.session.updatedAt = new Date().toISOString()
-          await saveState(this.state)
+          try {
+            await saveState(this.state)
+          } catch (error) {
+            this.restoreSessionState(current.session, previous)
+            throw error
+          }
         }
         return { ...current, result }
       },
@@ -4886,11 +5494,129 @@ export class CordexDiscordBot {
       await interaction.editReply(
         `Nothing to merge from \`${result.branch}\` into \`${result.targetBranch}\`; cleared the worktree marker.${titleWarning}`,
       )
+    } else if (result.status === 'already-merged') {
+      await interaction.editReply(
+        `Recovered completed merge of \`${result.branch}\` into \`${result.targetBranch}\` @ ${result.shortSha}.\nWorktree remains at detached HEAD.${titleWarning}`,
+      )
     } else {
       await interaction.editReply(
         `Merged \`${result.branch}\` into \`${result.targetBranch}\` @ ${result.shortSha} (${result.commitCount} commit${result.commitCount === 1 ? '' : 's'}).\nWorktree remains at detached HEAD.${titleWarning}`,
       )
     }
+  }
+
+  private async handleDeleteWorktreeCommand(
+    interaction: ChatInputCommandInteraction,
+  ): Promise<void> {
+    const initial = this.requireThreadSession(interaction, 'remove-worktree')
+    await interaction.deferReply()
+    const removal = await this.projectMutationQueue.run(
+      `channel:${initial.session.parentChannelId}`,
+      async () => this.promptQueue.run(initial.channel.id, async () => {
+        const current = this.requireThreadSession(interaction, 'remove-worktree')
+        return this.resumeQueue.run(current.session.codexThreadId, async () =>
+          this.codexEventQueue.run(current.session.codexThreadId, async () => {
+            const { channel, session } = this.requireThreadSession(interaction, 'remove-worktree')
+            const worktree = session.worktree
+            if (!worktree) throw new Error('Session is not associated with a worktree')
+            const existingIntent = session.lifecycleIntent
+            if (existingIntent && existingIntent.kind !== 'remove-worktree') {
+              throw new Error(`Session ${existingIntent.kind} operation is still pending`)
+            }
+            if (session.activeTurnId || this.runs.has(session.codexThreadId)) {
+              throw new Error('Wait for active turn or run /abort first')
+            }
+            if (this.pendingTurnStarts.has(session.codexThreadId)) {
+              throw new Error('Wait for the pending turn start or run /abort first')
+            }
+            if ((this.state.queues[channel.id] || []).length > 0) {
+              throw new Error('Wait for or clear pending prompts before deleting the worktree')
+            }
+            const pendingTask = Object.values(this.state.tasks).find(
+              (task) => task.threadId === channel.id &&
+                (task.status === 'scheduled' || task.status === 'running'),
+            )
+            if (pendingTask) {
+              throw new Error(`Cancel scheduled task ${pendingTask.id} before deleting the worktree`)
+            }
+            const goal = await this.codex.getThreadGoal(session.codexThreadId)
+            if (goal?.status === 'active') {
+              throw new Error('Pause, complete, or clear the active goal before deleting the worktree')
+            }
+            const project = this.config.projects[session.parentChannelId]
+            if (!project) throw new Error('Parent project mapping not found')
+            if (path.resolve(project.directory) !== path.resolve(worktree.projectDirectory)) {
+              throw new Error('Worktree project no longer matches its Discord project mapping')
+            }
+            const worktreeDirectory = path.resolve(worktree.directory)
+            const reservedDirectory = [...this.pendingSessionDirectoryReservations.entries()]
+              .find(([directory, count]) => count > 0 && pathIsWithinOrEqual(worktreeDirectory, directory))
+            if (reservedDirectory) {
+              throw new Error('Worktree is being inherited by a new session; retry after it finishes starting')
+            }
+            const sharedSession = Object.values(this.state.sessions).find((candidate) => {
+              if (candidate.discordThreadId === session.discordThreadId) return false
+              return pathIsWithinOrEqual(worktreeDirectory, candidate.directory) ||
+                (candidate.worktree !== undefined &&
+                  pathIsWithinOrEqual(worktreeDirectory, candidate.worktree.directory)) ||
+                candidate.workspaceRoots?.some((root) => pathIsWithinOrEqual(worktreeDirectory, root))
+            })
+            if (sharedSession) {
+              throw new Error(
+                `Worktree is still referenced by <#${sharedSession.discordThreadId}>; move or remove that session first`,
+              )
+            }
+
+            await inspectMergedWorktreeRemoval({
+              projectDirectory: worktree.projectDirectory,
+              worktreeDirectory: worktree.directory,
+              branch: worktree.branch,
+            })
+            if (!existingIntent) {
+              const previous = structuredClone(session)
+              session.lifecycleIntent = {
+                kind: 'remove-worktree',
+                requestedAt: new Date().toISOString(),
+              }
+              session.updatedAt = session.lifecycleIntent.requestedAt
+              try {
+                await saveState(this.state)
+              } catch (error) {
+                this.restoreSessionState(session, previous)
+                throw error
+              }
+            }
+            const result = await removeMergedWorktree({
+              projectDirectory: worktree.projectDirectory,
+              worktreeDirectory: worktree.directory,
+              branch: worktree.branch,
+            })
+            await this.finalizeWorktreeRemoval(session, worktree)
+            return { channel, session, result }
+          }),
+        )
+      }),
+    )
+
+    let warning = ''
+    if (!removal.session.archived) {
+      await this.ensureSessionLoaded(removal.session).catch((error: unknown) => {
+        warning += `\nCodex reload deferred: ${truncate(errorText(error), 300)}`
+      })
+    }
+    if (removal.channel.name.startsWith('⬦ ')) {
+      await this.synchronizeThreadTitle(
+        removal.session,
+        removal.channel,
+        removal.channel.name.slice(2),
+      ).catch((error: unknown) => {
+        warning += `\nTitle synchronization failed: ${truncate(errorText(error), 300)}`
+      })
+    }
+    await interaction.editReply(
+      `${removal.result.status === 'already-removed' ? 'Reconciled' : 'Deleted'} merged worktree. ` +
+      `Session now uses \`${removal.session.directory}\`.${warning}`,
+    )
   }
 
   private queueFor(threadId: string): QueuedPrompt[] {
@@ -4914,6 +5640,9 @@ export class CordexDiscordBot {
       }
       if (!session || this.unlinkedCodexSessionChannels.has(threadId)) {
         throw new Error('Thread has no Codex session')
+      }
+      if (session.lifecycleIntent) {
+        throw new Error(`Session ${session.lifecycleIntent.kind} operation is still pending`)
       }
       if (
         this.removingProjects.has(session.parentChannelId) ||
@@ -5114,6 +5843,43 @@ export class CordexDiscordBot {
     await this.recoverPersistedPrompts(session, channel)
   }
 
+  async enqueueDaemonPrompt(options: {
+    threadId: string
+    requestId: string
+    input: UserInput[]
+    displayText: string
+  }): Promise<{ threadId: string; position: number }> {
+    if (this.stopping) throw new CordexStoppingError()
+    await this.waitForIngressReady()
+    const channel = await this.client.channels.fetch(options.threadId)
+    if (!channel?.isThread()) throw new Error('Discord target is not an existing thread')
+    const session = this.state.sessions[channel.id]
+    if (!session || this.unlinkedCodexSessionChannels.has(channel.id)) {
+      throw new Error('Discord thread has no Cordex session')
+    }
+    if (session.archived) throw new Error('Session is archived; resume it before sending')
+    const position = await this.enqueuePrompt(channel.id, {
+      id: `cli:${options.requestId}`,
+      authorId: this.client.user?.id || this.config.applicationId,
+      authorName: 'Cordex CLI',
+      input: options.input,
+      displayText: options.displayText,
+      createdAt: new Date().toISOString(),
+      deliveryKind: 'direct',
+    })
+    this.trackBackgroundWork(
+      this.recoverPersistedPrompts(session, channel).catch((error: unknown) => {
+        this.logVerbose('daemon prompt delivery deferred', {
+          threadId: session.codexThreadId,
+          requestId: options.requestId,
+          error: errorText(error),
+        })
+      }),
+      'daemon prompt recovery',
+    )
+    return { threadId: channel.id, position }
+  }
+
   private async steerNextQueuedPrompt(run: ActiveRun): Promise<void> {
     await this.promptQueue.run(run.channel.id, () => this.steerNextQueuedPromptUnlocked(run))
   }
@@ -5208,7 +5974,7 @@ export class CordexDiscordBot {
     allowWithoutGoal: boolean,
     knownGoalStatus?: string,
   ): void {
-    void (async () => {
+    this.trackBackgroundWork((async () => {
       while (!this.stopping) {
         await this.waitForCodexRecovery()
         let retryAfterRecovery = false
@@ -5236,7 +6002,7 @@ export class CordexDiscordBot {
         if (!retryAfterRecovery) return
         await new Promise((resolve) => setTimeout(resolve, 10))
       }
-    })()
+    })(), 'queued Discord prompt drain')
   }
 
   private async handleQueueCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -5308,9 +6074,13 @@ export class CordexDiscordBot {
 
   private async handleShellCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     const { project } = this.requireProject(this.parentChannelId(interaction.channel))
-    const directory = interaction.channel?.isThread()
-      ? this.state.sessions[interaction.channel.id]?.directory || project.directory
-      : project.directory
+    const session = interaction.channel?.isThread()
+      ? this.state.sessions[interaction.channel.id]
+      : undefined
+    if (session?.lifecycleIntent) {
+      throw new Error(`Session ${session.lifecycleIntent.kind} operation is still pending`)
+    }
+    const directory = session?.directory || project.directory
     await this.sendShellResult(interaction, interaction.options.getString('command', true), directory)
   }
 
@@ -5454,9 +6224,13 @@ export class CordexDiscordBot {
         const command = message.content.slice(1).trim()
         if (!command) return
         const project = this.config.projects[parentId]
-        const directory = message.channel.isThread()
-          ? this.state.sessions[message.channel.id]?.directory || project.directory
-          : project.directory
+        const session = message.channel.isThread()
+          ? this.state.sessions[message.channel.id]
+          : undefined
+        if (session?.lifecycleIntent) {
+          throw new Error(`Session ${session.lifecycleIntent.kind} operation is still pending`)
+        }
+        const directory = session?.directory || project.directory
         this.logVerbose('shell command', { command, directory, userId: message.author.id })
         const result = await runShellCommand({ command, cwd: directory })
         const content = formatShellCommandResult({
@@ -5699,6 +6473,9 @@ export class CordexDiscordBot {
     const project = this.config.projects[parentChannelId]
     if (!project) throw new Error('Project not configured')
     let session = this.state.sessions[channel.id]
+    if (session?.lifecycleIntent) {
+      throw new Error(`Session ${session.lifecycleIntent.kind} operation is still pending`)
+    }
     if (session) this.assertCodexSessionLinked(session)
     if (session?.archived) throw new Error('Session is archived; run /resume first')
     let createdSession = false
@@ -6317,7 +7094,6 @@ export class CordexDiscordBot {
   }
 
   private async onThreadNameUpdated(params: JsonObject): Promise<void> {
-    if (this.stopping) return
     const threadId = text(params.threadId)
     const rawTitle = text(params.threadName)
     if (!threadId || rawTitle === undefined) return
@@ -6510,24 +7286,45 @@ export class CordexDiscordBot {
     this.pendingCodexTitles.delete(threadId)
     this.recentCodexTitleEchoes.delete(threadId)
     let changed = false
+    const restorations: Array<{ session: SessionState; previous: SessionState }> = []
+    const now = new Date().toISOString()
     for (const [discordThreadId, session] of entries) {
       if (this.deletedDiscordThreads.has(discordThreadId)) continue
       this.expectedDiscordTitles.delete(discordThreadId)
       this.recentDiscordTitleEchoes.delete(discordThreadId)
       this.pendingDiscordTitles.delete(discordThreadId)
-      if (!session.archived) {
+      if (!session.archived || !session.lifecycleIntent) {
+        restorations.push({ session, previous: structuredClone(session) })
         session.archived = true
-        session.updatedAt = new Date().toISOString()
+        session.lifecycleIntent ||= { kind: 'archive', requestedAt: now }
+        session.updatedAt = now
         changed = true
       }
     }
-    if (changed) await saveState(this.state)
-    await Promise.all(entries.map(async ([discordThreadId]) => {
-      if (this.deletedDiscordThreads.has(discordThreadId)) return
-      const channel = await this.client.channels.fetch(discordThreadId).catch(() => undefined)
-      if (channel?.isThread() && !channel.archived) {
-        await channel.setArchived(true, 'Codex session archived').catch(() => undefined)
+    if (changed) {
+      try {
+        await saveState(this.state)
+      } catch (error) {
+        for (const { session, previous } of restorations) {
+          this.restoreSessionState(session, previous)
+        }
+        throw error
       }
+    }
+    await Promise.all(entries.map(async ([discordThreadId, original]) => {
+      if (this.deletedDiscordThreads.has(discordThreadId)) return
+      const session = this.state.sessions[discordThreadId]
+      if (
+        !session ||
+        session.codexThreadId !== original.codexThreadId ||
+        session.lifecycleIntent?.kind !== 'archive'
+      ) return
+      await this.convergeDiscordLifecycleState(
+        session,
+        'archive',
+        true,
+        'Codex session archived',
+      )
     }))
   }
 
@@ -6535,13 +7332,19 @@ export class CordexDiscordBot {
     const threadId = text(params.threadId)
     if (!threadId || !this.acceptsArchiveNotification(threadId, 'unarchived')) return
     if (this.preserveArchivedUntilResume.delete(threadId)) return
+    if (Object.values(this.state.sessions).some(
+      (session) => session.codexThreadId === threadId &&
+        session.lifecycleIntent?.kind === 'resume',
+    )) return
     let changed = false
+    const restorations: Array<{ session: SessionState; previous: SessionState }> = []
     const recoveries: Array<{ session: SessionState; channel: ThreadChannel }> = []
     for (const [discordThreadId, session] of Object.entries(this.state.sessions)) {
       if (
         session.codexThreadId !== threadId ||
         this.deletedDiscordThreads.has(discordThreadId) ||
-        !session.archived
+        !session.archived ||
+        session.lifecycleIntent?.kind === 'archive'
       ) continue
       const channel = await this.client.channels.fetch(discordThreadId).catch(() => undefined)
       if (!channel?.isThread()) continue
@@ -6552,12 +7355,22 @@ export class CordexDiscordBot {
           continue
         }
       }
+      restorations.push({ session, previous: structuredClone(session) })
       delete session.archived
       session.updatedAt = new Date().toISOString()
       changed = true
       recoveries.push({ session, channel })
     }
-    if (changed) await saveState(this.state)
+    if (changed) {
+      try {
+        await saveState(this.state)
+      } catch (error) {
+        for (const { session, previous } of restorations) {
+          this.restoreSessionState(session, previous)
+        }
+        throw error
+      }
+    }
     for (const { session, channel } of recoveries) {
       if ((this.state.queues[channel.id]?.length || 0) === 0) continue
       if (this.blockedQueuedSourceThreads.has(channel.id)) {
@@ -6565,15 +7378,18 @@ export class CordexDiscordBot {
       }
       const timer = setTimeout(() => {
         if (this.stopping) return
-        void this.recoverPersistedPrompts(session, channel).catch((error: unknown) => {
-          this.logVerbose('externally unarchived prompt recovery failed', {
-            threadId: session.codexThreadId,
-            error: errorText(error),
-          })
-          if (this.blockedQueuedSourceThreads.has(channel.id)) {
-            this.scheduleQueuedSourceRetry(channel.id)
-          }
-        })
+        this.trackBackgroundWork(
+          this.recoverPersistedPrompts(session, channel).catch((error: unknown) => {
+            this.logVerbose('externally unarchived prompt recovery failed', {
+              threadId: session.codexThreadId,
+              error: errorText(error),
+            })
+            if (this.blockedQueuedSourceThreads.has(channel.id)) {
+              this.scheduleQueuedSourceRetry(channel.id)
+            }
+          }),
+          'externally unarchived prompt recovery',
+        )
       }, 0)
       timer.unref()
     }
@@ -6632,6 +7448,10 @@ export class CordexDiscordBot {
   ): Promise<void> {
     const removedChannels = new Set<string>()
     await Promise.all(entries.map(async ([discordThreadId]) => {
+      const pendingSession = this.state.sessions[discordThreadId]
+      if (pendingSession?.codexThreadId === threadId) {
+        await this.completePendingWorktreeRemovalBeforeSessionDrop(pendingSession)
+      }
       await this.dismissPendingControlsForChannel(discordThreadId, '_Codex session deleted._')
       this.expectedDiscordTitles.delete(discordThreadId)
       this.recentDiscordTitleEchoes.delete(discordThreadId)
@@ -6947,12 +7767,15 @@ export class CordexDiscordBot {
     await saveState(this.state)
     this.runs.delete(run.session.codexThreadId)
     if (shouldDrainTerminalOutput) {
-      void this.drainDiscordOutbox(run.channel).catch((error: unknown) => {
-        this.logVerbose('terminal turn output delivery deferred', {
-          threadId: run.session.codexThreadId,
-          error: errorText(error),
-        })
-      })
+      this.trackBackgroundWork(
+        this.drainDiscordOutbox(run.channel).catch((error: unknown) => {
+          this.logVerbose('terminal turn output delivery deferred', {
+            threadId: run.session.codexThreadId,
+            error: errorText(error),
+          })
+        }),
+        'terminal turn output delivery',
+      )
     }
     if (generation === this.codexGeneration) {
       this.scheduleQueueDrain(run.session, run.channel, status === 'completed')
@@ -7006,6 +7829,19 @@ export class CordexDiscordBot {
     return pending
   }
 
+  private takePendingMcpElicitation(key: string): PendingMcpElicitation | undefined {
+    const pending = this.pendingMcpElicitations.get(key)
+    if (!pending) return undefined
+    this.pendingMcpElicitations.delete(key)
+    clearTimeout(pending.timeout)
+    this.unregisterPendingRequestControl(pending.request, 'mcpElicitation', key)
+    return pending
+  }
+
+  private mcpElicitationMessages(pending: PendingMcpElicitation): DiscordMessage[] {
+    return [...pending.fieldMessages, pending.actionMessage]
+  }
+
   private async onServerRequestResolved(params: JsonObject): Promise<void> {
     const requestId = params.requestId
     if (typeof requestId !== 'string' && typeof requestId !== 'number') return
@@ -7031,6 +7867,15 @@ export class CordexDiscordBot {
       const pending = this.takePendingUserInput(control.key)
       if (!pending) return
       await Promise.all(pending.messages.map((message) => message.edit({
+        content: `${message.content}\n_Resolved elsewhere._`,
+        components: [],
+      }).catch(() => undefined)))
+      return
+    }
+    if (control.kind === 'mcpElicitation') {
+      const pending = this.takePendingMcpElicitation(control.key)
+      if (!pending) return
+      await Promise.all(this.mcpElicitationMessages(pending).map((message) => message.edit({
         content: `${message.content}\n_Resolved elsewhere._`,
         components: [],
       }).catch(() => undefined)))
@@ -7066,6 +7911,12 @@ export class CordexDiscordBot {
         const pending = this.takePendingActionButtons(key)
         return pending ? [pending] : []
       })
+    const mcpElicitations = Array.from(this.pendingMcpElicitations.entries())
+      .filter(([, pending]) => pending.channel.id === discordThreadId)
+      .flatMap(([key]) => {
+        const pending = this.takePendingMcpElicitation(key)
+        return pending ? [pending] : []
+      })
 
     await Promise.all([
       ...approvals.map((pending) => pending.message.edit({
@@ -7080,6 +7931,12 @@ export class CordexDiscordBot {
         content: `**Action Required**\n${status}`,
         components: [],
       }).catch(() => undefined)),
+      ...mcpElicitations.flatMap((pending) => this.mcpElicitationMessages(pending).map(
+        (message) => message.edit({
+          content: `${message.content}\n${status}`,
+          components: [],
+        }).catch(() => undefined),
+      )),
     ])
   }
 
@@ -7173,7 +8030,11 @@ export class CordexDiscordBot {
     const autoResolutionMs = request.params.autoResolutionMs
     if (typeof autoResolutionMs === 'number' && autoResolutionMs > 0) {
       pending.timeout = setTimeout(() => {
-        void this.finishUserInput(key, true)
+        if (this.stopping) return
+        this.trackBackgroundWork(
+          this.finishUserInput(key, true),
+          'user input auto-resolution',
+        )
       }, autoResolutionMs)
       pending.timeout.unref()
     }
@@ -7302,6 +8163,557 @@ export class CordexDiscordBot {
     }
   }
 
+  private mcpElicitationHeader(request: ServerRequest): string {
+    const serverName = text(request.params.serverName) || 'unknown'
+    const message = text(request.params.message)?.trim() || 'The MCP server requested input.'
+    return [
+      `**MCP request from ${discordInlineCode(serverName)}**`,
+      truncate(message, 650),
+    ].join('\n')
+  }
+
+  private mcpToolApprovalDisclosureChunks(request: ServerRequest): string[] | undefined {
+    const params = mcpToolApprovalDisplayParams(request.params._meta)
+    let rendered = `${this.mcpElicitationHeader(request)}\n\n**Tool parameters**`
+    if (params.length === 0) {
+      rendered += '\n_None._'
+    } else {
+      try {
+        const serialized = JSON.stringify(params.map((param) => ({
+          name: param.name,
+          displayName: param.displayName,
+          value: param.value,
+        })), null, 2)
+        if (serialized === undefined) return undefined
+        rendered += `\n\`\`\`json\n${serialized}\n\`\`\``
+      } catch {
+        return undefined
+      }
+    }
+    const chunks = splitMarkdownForDiscord(rendered, 1_900)
+    return chunks.length <= maxMcpToolApprovalDisclosureChunks ? chunks : undefined
+  }
+
+  private mcpElicitationFieldValueLabel(
+    field: McpElicitationField,
+    value: JsonValue | undefined,
+  ): string {
+    if (value === undefined) return '_Not answered_'
+    if (field.kind === 'string' || field.kind === 'number') return '_Recorded_'
+    if (field.kind === 'boolean') return value === true ? '`True`' : '`False`'
+    if (field.kind === 'singleSelect' && typeof value === 'string') {
+      return discordInlineCode(field.options.find((option) => option.value === value)?.label || value || '(empty)')
+    }
+    if (field.kind === 'multiSelect' && Array.isArray(value)) {
+      if (value.length === 0) return '`None`'
+      const labels = value.slice(0, 5).map((entry) => {
+        const selected = typeof entry === 'string'
+          ? field.options.find((option) => option.value === entry)?.label || entry
+          : String(entry)
+        return discordInlineCode(truncate(selected, 80))
+      })
+      if (value.length > labels.length) labels.push(`_${value.length - labels.length} more_`)
+      return labels.join(', ')
+    }
+    return discordInlineCode(truncate(String(value), 180))
+  }
+
+  private mcpElicitationFieldContent(
+    request: ServerRequest,
+    field: McpElicitationField,
+    value: JsonValue | undefined,
+    includeHeader: boolean,
+  ): string {
+    const sections: string[] = []
+    if (includeHeader) sections.push(this.mcpElicitationHeader(request))
+    const required = field.required ? ' · required' : ' · optional'
+    const fieldLines = [`**${escapeInlineMarkdown(truncate(field.label, 100))}**${required}`]
+    if (field.description !== field.label) fieldLines.push(truncate(field.description, 500))
+    const constraints: string[] = []
+    if (field.kind === 'string') {
+      if (field.format) constraints.push(field.format)
+      if (field.minLength !== undefined) constraints.push(`min ${field.minLength} characters`)
+      if (field.maxLength !== undefined) constraints.push(`max ${field.maxLength} characters`)
+    } else if (field.kind === 'number') {
+      constraints.push(field.integer ? 'integer' : 'number')
+      if (field.minimum !== undefined) constraints.push(`min ${field.minimum}`)
+      if (field.maximum !== undefined) constraints.push(`max ${field.maximum}`)
+    } else if (field.kind === 'multiSelect') {
+      if (field.minItems !== undefined) constraints.push(`min ${field.minItems} selections`)
+      if (field.maxItems !== undefined) constraints.push(`max ${field.maxItems} selections`)
+    }
+    if (constraints.length > 0) fieldLines.push(`_${constraints.join(' · ')}_`)
+    fieldLines.push(`Current: ${this.mcpElicitationFieldValueLabel(field, value)}`)
+    sections.push(fieldLines.join('\n'))
+    return sections.join('\n\n')
+  }
+
+  private mcpElicitationFieldComponents(
+    key: string,
+    index: number,
+    field: McpElicitationField,
+    value: JsonValue | undefined,
+  ) {
+    if (field.kind === 'string' || field.kind === 'number') {
+      const fixedEmpty = field.kind === 'string' && field.maxLength === 0
+      const button = new ButtonBuilder()
+        .setCustomId(`mcp-elicit-field:${key}:${index}`)
+        .setLabel(fixedEmpty ? 'Empty value' : value === undefined ? 'Enter value' : 'Edit value')
+        .setStyle(ButtonStyle.Primary)
+        .setDisabled(fixedEmpty)
+      return [new ActionRowBuilder<ButtonBuilder>().addComponents(button)]
+    }
+    const selected = new Set(
+      Array.isArray(value)
+        ? value.filter((entry): entry is string => typeof entry === 'string')
+        : typeof value === 'string'
+          ? [value]
+          : [],
+    )
+    const options = field.kind === 'boolean'
+      ? [
+          { label: 'True', value: 'true', selected: value === true },
+          { label: 'False', value: 'false', selected: value === false },
+        ]
+      : field.options.map((option, optionIndex) => ({
+          label: truncate(option.label || '(empty)', 100),
+          value: `option:${optionIndex}`,
+          selected: selected.has(option.value),
+        }))
+    if (field.kind === 'multiSelect' && field.maxItems === 0) {
+      return [new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`mcp-elicit-field:${key}:${index}`)
+          .setLabel('Empty selection')
+          .setStyle(ButtonStyle.Secondary)
+          .setDisabled(true),
+      )]
+    }
+    const select = new StringSelectMenuBuilder()
+      .setCustomId(`mcp-elicit-select:${key}:${index}`)
+      .setPlaceholder(truncate(field.label || 'Choose a value', 100))
+      .addOptions(...options.map((option) => ({
+        label: option.label,
+        value: option.value,
+        default: option.selected,
+      })))
+    if (field.kind === 'multiSelect') {
+      select
+        .setMinValues(field.minItems ?? 0)
+        .setMaxValues(Math.min(field.maxItems ?? field.options.length, field.options.length))
+    } else {
+      select.setMinValues(field.required ? 1 : 0).setMaxValues(1)
+    }
+    return [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select)]
+  }
+
+  private mcpElicitationActionComponents(
+    key: string,
+    request: ServerRequest,
+    form: McpElicitationForm | undefined,
+    url: string | undefined,
+  ): ActionRowBuilder<ButtonBuilder>[] {
+    if (url) {
+      const serverName = text(request.params.serverName)
+      return [new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`mcp-elicit-action:${key}:open`)
+          .setLabel(serverName === 'codex_apps' ? 'Open sign-in URL' : 'Open link')
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId(`mcp-elicit-action:${key}:accept`)
+          .setLabel(serverName === 'codex_apps' ? 'I already signed in' : 'I finished')
+          .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+          .setCustomId(`mcp-elicit-action:${key}:decline`)
+          .setLabel('Decline')
+          .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder()
+          .setCustomId(`mcp-elicit-action:${key}:cancel`)
+          .setLabel('Cancel')
+          .setStyle(ButtonStyle.Danger),
+      )]
+    }
+    if (form && form.fields.length > 0) {
+      return [new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`mcp-elicit-action:${key}:submit`)
+          .setLabel('Submit')
+          .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+          .setCustomId(`mcp-elicit-action:${key}:decline`)
+          .setLabel('Decline')
+          .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder()
+          .setCustomId(`mcp-elicit-action:${key}:cancel`)
+          .setLabel('Cancel')
+          .setStyle(ButtonStyle.Danger),
+      )]
+    }
+    const toolApproval = isMcpToolApproval(request.params._meta)
+    const buttons = [new ButtonBuilder()
+      .setCustomId(`mcp-elicit-action:${key}:accept`)
+      .setLabel('Allow')
+      .setStyle(ButtonStyle.Success)]
+    const persistModes = mcpElicitationPersistModes(request.params._meta)
+    if (persistModes.includes('session')) {
+      buttons.push(new ButtonBuilder()
+        .setCustomId(`mcp-elicit-action:${key}:session`)
+        .setLabel('Allow for this session')
+        .setStyle(ButtonStyle.Primary))
+    }
+    if (persistModes.includes('always')) {
+      buttons.push(new ButtonBuilder()
+        .setCustomId(`mcp-elicit-action:${key}:always`)
+        .setLabel('Always allow')
+        .setStyle(ButtonStyle.Primary))
+    }
+    if (!toolApproval) {
+      buttons.push(new ButtonBuilder()
+        .setCustomId(`mcp-elicit-action:${key}:decline`)
+        .setLabel('Deny')
+        .setStyle(ButtonStyle.Secondary))
+    }
+    buttons.push(new ButtonBuilder()
+      .setCustomId(`mcp-elicit-action:${key}:cancel`)
+      .setLabel('Cancel')
+      .setStyle(ButtonStyle.Danger))
+    return [new ActionRowBuilder<ButtonBuilder>().addComponents(...buttons)]
+  }
+
+  private async resolvePendingMcpElicitation(
+    key: string,
+    result: JsonObject,
+    status: string,
+  ): Promise<boolean> {
+    const pending = this.takePendingMcpElicitation(key)
+    if (!pending) return false
+    this.respondToCodex(pending.request, result)
+    await Promise.all(this.mcpElicitationMessages(pending).map((message) => message.edit({
+      content: `${message.content}\n${status}`,
+      components: [],
+    }).catch(() => undefined)))
+    return true
+  }
+
+  private async expireMcpElicitation(key: string): Promise<boolean> {
+    return this.resolvePendingMcpElicitation(
+      key,
+      { action: 'cancel', content: null, _meta: null },
+      '_Request expired._',
+    )
+  }
+
+  private async handleMcpElicitationRequest(request: ServerRequest): Promise<void> {
+    const channel = await this.resolveRunChannel(request)
+    if (!channel) {
+      this.respondToCodex(request, { action: 'decline', content: null, _meta: null })
+      return
+    }
+    const mode = text(request.params.mode)
+    if (mode === 'openai/form') {
+      this.respondToCodex(request, { action: 'decline', content: null, _meta: null })
+      return
+    }
+    const key = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 9)}`
+    let form: McpElicitationForm | undefined
+    let url: string | undefined
+    if (mode === 'form') {
+      try {
+        form = parseMcpElicitationForm(request.params.requestedSchema)
+      } catch (error) {
+        this.respondToCodex(request, { action: 'decline', content: null, _meta: null })
+        this.logVerbose('MCP elicitation schema declined', {
+          requestId: request.id,
+          error: errorText(error),
+        })
+        await channel.send({
+          content: `${this.mcpElicitationHeader(request)}\n\n_This form could not be rendered safely and was declined._`,
+          allowedMentions: { parse: [] },
+        }).catch(() => undefined)
+        return
+      }
+    } else if (mode === 'url') {
+      url = validateMcpElicitationUrl(request.params.url, request.params.serverName)
+      if (!url || typeof request.params.elicitationId !== 'string') {
+        this.respondToCodex(request, { action: 'decline', content: null, _meta: null })
+        await channel.send({
+          content: `${this.mcpElicitationHeader(request)}\n\n_The external URL was unsafe or unsupported and was declined._`,
+          allowedMentions: { parse: [] },
+        }).catch(() => undefined)
+        return
+      }
+    } else {
+      this.respondToCodex(request, { action: 'decline', content: null, _meta: null })
+      return
+    }
+
+    const toolApproval = Boolean(
+      form && form.fields.length === 0 && isMcpToolApproval(request.params._meta),
+    )
+    const toolApprovalChunks = toolApproval
+      ? this.mcpToolApprovalDisclosureChunks(request)
+      : undefined
+    if (toolApproval && !toolApprovalChunks) {
+      this.respondToCodex(request, { action: 'decline', content: null, _meta: null })
+      await channel.send({
+        content: `${this.mcpElicitationHeader(request)}\n\n_The complete tool parameters were too large to display safely, so this request was declined._`,
+        allowedMentions: { parse: [] },
+      }).catch(() => undefined)
+      return
+    }
+
+    const fieldMessages: DiscordMessage[] = []
+    let actionMessage: DiscordMessage
+    try {
+      if (form) {
+        for (let index = 0; index < form.fields.length; index++) {
+          const field = form.fields[index]
+          if (!field) continue
+          fieldMessages.push(await channel.send({
+            content: this.mcpElicitationFieldContent(
+              request,
+              field,
+              form.initialContent[field.id],
+              index === 0,
+            ),
+            components: this.mcpElicitationFieldComponents(
+              key,
+              index,
+              field,
+              form.initialContent[field.id],
+            ),
+            allowedMentions: { parse: [] },
+          }))
+        }
+      }
+      if (toolApprovalChunks) {
+        for (const chunk of toolApprovalChunks.slice(0, -1)) {
+          fieldMessages.push(await channel.send({
+            content: chunk,
+            allowedMentions: { parse: [] },
+          }))
+        }
+      }
+      const actionContent = toolApprovalChunks?.at(-1) || (form?.fields.length
+        ? '**MCP form response**'
+        : this.mcpElicitationHeader(request))
+      actionMessage = await channel.send({
+        content: actionContent,
+        components: this.mcpElicitationActionComponents(key, request, form, url),
+        allowedMentions: { parse: [] },
+      })
+    } catch (error) {
+      this.respondToCodex(request, { action: 'decline', content: null, _meta: null })
+      await Promise.all(fieldMessages.map((message) => message.edit({
+        content: `${message.content}\n_Cancelled because Discord could not show the complete request._`,
+        components: [],
+      }).catch(() => undefined)))
+      this.logVerbose('MCP elicitation UI failed', { requestId: request.id, error: errorText(error) })
+      return
+    }
+    const timeout = setTimeout(() => {
+      if (this.stopping) return
+      this.trackBackgroundWork(
+        this.expireMcpElicitation(key).then(() => undefined),
+        'MCP elicitation expiry',
+      )
+    }, defaultMcpElicitationTimeoutMinutes * 60_000)
+    timeout.unref()
+    this.pendingMcpElicitations.set(key, {
+      request,
+      channel,
+      mode,
+      ...(form ? { form } : {}),
+      ...(url ? { url } : {}),
+      content: form
+        ? Object.assign(Object.create(null), structuredClone(form.initialContent)) as Record<string, JsonValue>
+        : Object.create(null) as Record<string, JsonValue>,
+      fieldMessages,
+      actionMessage,
+      timeout,
+      toolApproval,
+    })
+    this.registerPendingRequestControl(request, 'mcpElicitation', key)
+  }
+
+  private async refreshMcpElicitationField(
+    key: string,
+    pending: PendingMcpElicitation,
+    index: number,
+  ): Promise<void> {
+    const field = pending.form?.fields[index]
+    const message = pending.fieldMessages[index]
+    if (!field || !message) return
+    await message.edit({
+      content: this.mcpElicitationFieldContent(
+        pending.request,
+        field,
+        pending.content[field.id],
+        index === 0,
+      ),
+      components: this.mcpElicitationFieldComponents(
+        key,
+        index,
+        field,
+        pending.content[field.id],
+      ),
+      allowedMentions: { parse: [] },
+    })
+  }
+
+  private async showMcpElicitationModal(
+    interaction: ButtonInteraction,
+    key: string,
+    index: number,
+  ): Promise<void> {
+    const pending = this.pendingMcpElicitations.get(key)
+    const field = pending?.form?.fields[index]
+    if (
+      !pending ||
+      !field ||
+      (field.kind !== 'string' && field.kind !== 'number') ||
+      interaction.channelId !== pending.channel.id
+    ) {
+      await interaction.reply({ content: 'This MCP request is no longer available.', ephemeral: true })
+      return
+    }
+    const current = pending.content[field.id]
+    const input = new TextInputBuilder()
+      .setCustomId('value')
+      .setLabel(truncate(field.label || 'Value', 45))
+      .setStyle(field.kind === 'string' && (field.maxLength ?? 4_000) > 200
+        ? TextInputStyle.Paragraph
+        : TextInputStyle.Short)
+      .setRequired(field.kind === 'number' ? field.required : field.required && (field.minLength ?? 0) > 0)
+      .setMaxLength(field.kind === 'string' ? Math.max(1, Math.min(field.maxLength ?? 4_000, 4_000)) : 100)
+    if (field.kind === 'string' && field.minLength && field.minLength <= 4_000) {
+      input.setMinLength(field.minLength)
+    }
+    if (current !== undefined) input.setValue(String(current).slice(0, 4_000))
+    await interaction.showModal(new ModalBuilder()
+      .setCustomId(`mcp-elicit-modal:${key}:${index}`)
+      .setTitle(truncate(field.label || 'MCP request', 45))
+      .addComponents(new ActionRowBuilder<TextInputBuilder>().addComponents(input)))
+  }
+
+  private async handleMcpElicitationSelect(
+    interaction: StringSelectMenuInteraction,
+  ): Promise<void> {
+    if (!(await this.requireAccess(interaction))) return
+    const [, key, indexText] = interaction.customId.split(':')
+    const index = Number(indexText)
+    const pending = key ? this.pendingMcpElicitations.get(key) : undefined
+    const field = pending?.form?.fields[index]
+    if (
+      !key ||
+      !pending ||
+      !field ||
+      (field.kind !== 'boolean' && field.kind !== 'singleSelect' && field.kind !== 'multiSelect') ||
+      interaction.channelId !== pending.channel.id
+    ) {
+      await interaction.reply({ content: 'This MCP request is no longer available.', ephemeral: true })
+      return
+    }
+    await interaction.deferUpdate()
+    await this.waitForMutationIngressReady()
+    const current = this.pendingMcpElicitations.get(key)
+    const currentField = current?.form?.fields[index]
+    if (!current || !currentField || currentField.kind !== field.kind) {
+      await interaction.followUp({ content: 'This MCP request is no longer available.', ephemeral: true })
+        .catch(() => undefined)
+      return
+    }
+    let value: JsonValue | undefined
+    if (currentField.kind === 'boolean') {
+      if (interaction.values.length === 1) {
+        if (interaction.values[0] !== 'true' && interaction.values[0] !== 'false') {
+          await interaction.followUp({ content: 'Invalid boolean selection.', ephemeral: true })
+            .catch(() => undefined)
+          return
+        }
+        value = interaction.values[0] === 'true'
+      }
+    } else {
+      const indexes = interaction.values.map((selected) =>
+        selected.startsWith('option:') ? Number(selected.slice(7)) : Number.NaN)
+      if (indexes.some((selected) => !Number.isInteger(selected) || !currentField.options[selected])) {
+        await interaction.followUp({ content: 'Invalid MCP form selection.', ephemeral: true })
+          .catch(() => undefined)
+        return
+      }
+      const values = indexes.map((selected) => currentField.options[selected]?.value || '')
+      value = currentField.kind === 'singleSelect' ? values[0] : values
+    }
+    if (value === undefined || (currentField.kind !== 'multiSelect' && interaction.values.length === 0)) {
+      delete current.content[currentField.id]
+    } else if (currentField.kind === 'multiSelect' && interaction.values.length === 0 && !currentField.required) {
+      delete current.content[currentField.id]
+    } else {
+      const error = validateMcpElicitationFieldValue(currentField, value)
+      if (error) {
+        await interaction.followUp({
+          content: `${currentField.label} ${error}.`,
+          ephemeral: true,
+        }).catch(() => undefined)
+        return
+      }
+      current.content[currentField.id] = value
+    }
+    await this.refreshMcpElicitationField(key, current, index)
+  }
+
+  private async handleMcpElicitationModal(interaction: ModalSubmitInteraction): Promise<void> {
+    if (!(await this.requireAccess(interaction))) return
+    const [, key, indexText] = interaction.customId.split(':')
+    const index = Number(indexText)
+    const pending = key ? this.pendingMcpElicitations.get(key) : undefined
+    const field = pending?.form?.fields[index]
+    if (
+      !key ||
+      !pending ||
+      !field ||
+      (field.kind !== 'string' && field.kind !== 'number') ||
+      interaction.channelId !== pending.channel.id
+    ) {
+      await interaction.reply({ content: 'This MCP request is no longer available.', ephemeral: true })
+      return
+    }
+    const raw = interaction.fields.getTextInputValue('value')
+    await interaction.deferUpdate()
+    await this.waitForMutationIngressReady()
+    const current = this.pendingMcpElicitations.get(key)
+    const currentField = current?.form?.fields[index]
+    if (
+      !current ||
+      !currentField ||
+      (currentField.kind !== 'string' && currentField.kind !== 'number')
+    ) {
+      await interaction.followUp({ content: 'This MCP request is no longer available.', ephemeral: true })
+        .catch(() => undefined)
+      return
+    }
+    if (raw === '' && !currentField.required) {
+      delete current.content[currentField.id]
+      await this.refreshMcpElicitationField(key, current, index)
+      return
+    }
+    const value = currentField.kind === 'number' ? parseMcpElicitationNumberInput(raw) : raw
+    if (value === undefined) {
+      await interaction.followUp({ content: `${currentField.label} must be a number.`, ephemeral: true })
+        .catch(() => undefined)
+      return
+    }
+    const error = validateMcpElicitationFieldValue(currentField, value)
+    if (error) {
+      await interaction.followUp({ content: `${currentField.label} ${error}.`, ephemeral: true })
+        .catch(() => undefined)
+      return
+    }
+    current.content[currentField.id] = value
+    await this.refreshMcpElicitationField(key, current, index)
+  }
+
   private takePendingActionButtons(key: string): PendingActionButtons | undefined {
     const pending = this.pendingActionButtons.get(key)
     if (!pending) return undefined
@@ -7391,11 +8803,15 @@ export class CordexDiscordBot {
       return
     }
     const timeout = setTimeout(() => {
-      void this.finishPendingActionButtons(
-        key,
-        '_Expired._',
-        'Action button request expired before the user selected an option.',
-        false,
+      if (this.stopping) return
+      this.trackBackgroundWork(
+        this.finishPendingActionButtons(
+          key,
+          '_Expired._',
+          'Action button request expired before the user selected an option.',
+          false,
+        ).then(() => undefined),
+        'action button expiry',
       )
     }, actionButtonTtlMs)
     timeout.unref()
@@ -7652,7 +9068,7 @@ export class CordexDiscordBot {
       return
     }
     if (request.method === 'mcpServer/elicitation/request') {
-      this.respondToCodex(request, { action: 'decline', content: null, _meta: null })
+      await this.handleMcpElicitationRequest(request)
       return
     }
     const supported = new Set([
@@ -7703,12 +9119,17 @@ export class CordexDiscordBot {
       return
     }
     const expiry = setTimeout(() => {
+      if (this.stopping) return
       const pending = this.takePendingApproval(key)
       if (!pending) return
       this.respondToCodex(pending.request, this.approvalTimeoutResult(pending))
-      void pending.message
-        .edit({ content: `${pending.message.content}\n\n**Approval expired.**`, components: [] })
-        .catch(() => undefined)
+      this.trackBackgroundWork(
+        pending.message
+          .edit({ content: `${pending.message.content}\n\n**Approval expired.**`, components: [] })
+          .then(() => undefined)
+          .catch(() => undefined),
+        'approval expiry',
+      )
     }, (this.config.approvalTimeoutMinutes ?? 10) * 60_000)
     expiry.unref()
     this.approvals.set(key, { request, channel, message, choices, timeout: expiry })
@@ -7737,7 +9158,127 @@ export class CordexDiscordBot {
     return { decision: choice === 'once' ? 'accept' : choice === 'session' ? 'acceptForSession' : 'decline' }
   }
 
+  private mcpElicitationActionResult(
+    pending: PendingMcpElicitation,
+    action: string,
+  ): { result: JsonObject; confirmation: string } | { error: string } {
+    if (action === 'cancel') {
+      return {
+        result: { action: 'cancel', content: null, _meta: null },
+        confirmation: 'Cancelled',
+      }
+    }
+    if (action === 'decline') {
+      if (pending.toolApproval) return { error: 'This tool approval can only be allowed or cancelled.' }
+      return {
+        result: { action: 'decline', content: null, _meta: null },
+        confirmation: 'Declined',
+      }
+    }
+    if (action === 'submit') {
+      if (!pending.form || pending.form.fields.length === 0) return { error: 'Invalid form action.' }
+      const validationError = validateMcpElicitationContent(pending.form, pending.content)
+      if (validationError) return { error: validationError }
+      return {
+        result: {
+          action: 'accept',
+          content: structuredClone(pending.content),
+          _meta: null,
+        },
+        confirmation: 'Submitted',
+      }
+    }
+    if (action === 'accept') {
+      if (pending.mode === 'form' && pending.form && pending.form.fields.length > 0) {
+        return { error: 'Complete and submit the form instead.' }
+      }
+      return {
+        result: { action: 'accept', content: null, _meta: null },
+        confirmation: 'Accepted',
+      }
+    }
+    if (action === 'session' || action === 'always') {
+      if (
+        pending.mode !== 'form' ||
+        !pending.form ||
+        pending.form.fields.length > 0 ||
+        !mcpElicitationPersistModes(pending.request.params._meta).includes(action)
+      ) return { error: 'This persistence option is unavailable.' }
+      return {
+        result: {
+          action: 'accept',
+          content: null,
+          _meta: { persist: action },
+        },
+        confirmation: action === 'session' ? 'Accepted for this session' : 'Always accepted',
+      }
+    }
+    return { error: 'Invalid MCP request action.' }
+  }
+
+  private async handleMcpElicitationButton(interaction: ButtonInteraction): Promise<void> {
+    if (!(await this.requireAccess(interaction))) return
+    if (interaction.customId.startsWith('mcp-elicit-field:')) {
+      const [, key, indexText] = interaction.customId.split(':')
+      const index = Number(indexText)
+      if (!key || !Number.isInteger(index)) {
+        await interaction.reply({ content: 'Invalid MCP form field.', ephemeral: true })
+        return
+      }
+      await this.showMcpElicitationModal(interaction, key, index)
+      return
+    }
+    const [, key, action] = interaction.customId.split(':')
+    const pending = key ? this.pendingMcpElicitations.get(key) : undefined
+    if (!key || !action || !pending || interaction.channelId !== pending.channel.id) {
+      await interaction.reply({ content: 'This MCP request is no longer available.', ephemeral: true })
+      return
+    }
+    if (action === 'open') {
+      if (pending.mode !== 'url' || !pending.url) {
+        await interaction.reply({ content: 'This MCP link is no longer available.', ephemeral: true })
+        return
+      }
+      await interaction.reply({
+        content: `Open this link: <${pending.url}>`,
+        ephemeral: true,
+        allowedMentions: { parse: [] },
+      })
+      return
+    }
+    const preview = this.mcpElicitationActionResult(pending, action)
+    if ('error' in preview) {
+      await interaction.reply({ content: preview.error, ephemeral: true })
+      return
+    }
+    await interaction.deferUpdate()
+    await this.waitForMutationIngressReady()
+    const current = this.pendingMcpElicitations.get(key)
+    if (!current || interaction.channelId !== current.channel.id) {
+      await interaction.followUp({ content: 'This MCP request is no longer available.', ephemeral: true })
+        .catch(() => undefined)
+      return
+    }
+    const resolution = this.mcpElicitationActionResult(current, action)
+    if ('error' in resolution) {
+      await interaction.followUp({ content: resolution.error, ephemeral: true }).catch(() => undefined)
+      return
+    }
+    await this.resolvePendingMcpElicitation(
+      key,
+      resolution.result,
+      `**${resolution.confirmation} by ${interaction.user}.**`,
+    )
+  }
+
   private async handleButton(interaction: ButtonInteraction): Promise<void> {
+    if (
+      interaction.customId.startsWith('mcp-elicit-field:') ||
+      interaction.customId.startsWith('mcp-elicit-action:')
+    ) {
+      await this.handleMcpElicitationButton(interaction)
+      return
+    }
     if (interaction.customId.startsWith('task:')) {
       if (!(await this.requireAccess(interaction))) return
       const [, action, taskId] = interaction.customId.split(':')

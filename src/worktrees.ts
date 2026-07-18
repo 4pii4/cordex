@@ -1,11 +1,12 @@
 import { createHash } from 'node:crypto'
-import { access, mkdir, rm } from 'node:fs/promises'
+import { access, lstat, mkdir, rm } from 'node:fs/promises'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { setTimeout as delay } from 'node:timers/promises'
 import type { SessionState } from './types.js'
 
 const SUBMODULE_INIT_TIMEOUT_MS = 10 * 60_000
+const WORKTREE_REMOVE_TIMEOUT_MS = 10 * 60_000
 
 export type GitResult = { stdout: string; stderr: string; exitCode: number | null }
 
@@ -301,8 +302,280 @@ export async function removeWorktree(worktree: CreatedWorktree): Promise<void> {
   await runGit(worktree.projectDirectory, ['worktree', 'prune'])
 }
 
+export type RegisteredGitWorktree = {
+  directory: string
+  head?: string
+  branch?: string
+  detached: boolean
+  bare: boolean
+  locked: boolean
+  lockedReason?: string
+  prunable: boolean
+  prunableReason?: string
+  isMainWorktree: boolean
+}
+
+function parseRegisteredWorktrees(output: string): RegisteredGitWorktree[] {
+  const worktrees: RegisteredGitWorktree[] = []
+  let fields: string[] = []
+
+  const finishRecord = (): void => {
+    if (fields.length === 0) return
+    let directory: string | undefined
+    let head: string | undefined
+    let branch: string | undefined
+    let detached = false
+    let bare = false
+    let locked = false
+    let lockedReason: string | undefined
+    let prunable = false
+    let prunableReason: string | undefined
+    for (const field of fields) {
+      if (field.startsWith('worktree ')) directory = field.slice('worktree '.length)
+      else if (field.startsWith('HEAD ')) head = field.slice('HEAD '.length)
+      else if (field.startsWith('branch ')) branch = field.slice('branch '.length)
+      else if (field === 'detached') detached = true
+      else if (field === 'bare') bare = true
+      else if (field === 'locked') locked = true
+      else if (field.startsWith('locked ')) {
+        locked = true
+        lockedReason = field.slice('locked '.length)
+      } else if (field === 'prunable') prunable = true
+      else if (field.startsWith('prunable ')) {
+        prunable = true
+        prunableReason = field.slice('prunable '.length)
+      }
+    }
+    if (!directory) throw new Error('Invalid git worktree registration: missing directory')
+    worktrees.push({
+      directory: path.resolve(directory),
+      ...(head ? { head } : {}),
+      ...(branch ? { branch } : {}),
+      detached,
+      bare,
+      locked,
+      ...(lockedReason ? { lockedReason } : {}),
+      prunable,
+      ...(prunableReason ? { prunableReason } : {}),
+      isMainWorktree: worktrees.length === 0,
+    })
+    fields = []
+  }
+
+  for (const field of output.split('\0')) {
+    if (field) fields.push(field)
+    else finishRecord()
+  }
+  finishRecord()
+  return worktrees
+}
+
+export async function listRegisteredWorktrees(projectDirectory: string): Promise<RegisteredGitWorktree[]> {
+  const output = await git(projectDirectory, ['worktree', 'list', '--porcelain', '-z'])
+  return parseRegisteredWorktrees(output)
+}
+
+export type MergedWorktreeRemovalOptions = {
+  projectDirectory: string
+  worktreeDirectory: string
+  branch: string
+}
+
+export type MergedWorktreeRemovalInspection =
+  | {
+      status: 'ready'
+      registration: RegisteredGitWorktree & { head: string }
+      containingBranches: string[]
+      checkoutPresent: boolean
+    }
+  | { status: 'already-removed'; directory: string }
+
+export type MergedWorktreeRemovalResult =
+  | { status: 'removed'; directory: string; head: string }
+  | { status: 'already-removed'; directory: string }
+
+async function pathExists(candidate: string): Promise<boolean> {
+  try {
+    await lstat(candidate)
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    throw error
+  }
+}
+
+async function localBranchExists(projectDirectory: string, branch: string): Promise<boolean> {
+  const args = ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`]
+  const result = await runGit(projectDirectory, args)
+  if (result.exitCode === 0) return true
+  if (result.exitCode === 1) return false
+  throw gitError(args, result)
+}
+
+async function absoluteGitPath(directory: string, name: '--git-common-dir'): Promise<string> {
+  const value = await git(directory, ['rev-parse', name])
+  return path.resolve(directory, value)
+}
+
+export async function inspectMergedWorktreeRemoval(
+  options: MergedWorktreeRemovalOptions,
+): Promise<MergedWorktreeRemovalInspection> {
+  const projectDirectory = path.resolve(options.projectDirectory)
+  const worktreeDirectory = path.resolve(options.worktreeDirectory)
+  const projectTopLevel = path.resolve(await git(projectDirectory, ['rev-parse', '--show-toplevel']))
+  if (projectTopLevel !== projectDirectory) {
+    throw new Error(`Worktree project directory is not the git root: ${projectTopLevel}`)
+  }
+  if (worktreeDirectory === projectDirectory) {
+    throw new Error('Refusing to remove the main worktree')
+  }
+
+  const registrations = await listRegisteredWorktrees(projectDirectory)
+  const matches = registrations.filter((candidate) => candidate.directory === worktreeDirectory)
+  if (matches.length > 1) {
+    throw new Error(`Multiple git worktree registrations match ${worktreeDirectory}`)
+  }
+  if (matches.length === 0) {
+    if (await pathExists(worktreeDirectory)) {
+      throw new Error(`Worktree directory is not registered in this repository: ${worktreeDirectory}`)
+    }
+    if (await localBranchExists(projectDirectory, options.branch)) {
+      throw new Error(`Worktree feature branch still exists: ${options.branch}`)
+    }
+    return { status: 'already-removed', directory: worktreeDirectory }
+  }
+
+  const registration = matches[0]!
+  if (registration.isMainWorktree || registration.bare) {
+    throw new Error(`Refusing to remove a primary git worktree: ${registration.directory}`)
+  }
+  if (registration.locked) {
+    throw new Error(
+      `Worktree is locked${registration.lockedReason ? `: ${registration.lockedReason}` : ''}`,
+    )
+  }
+  if (!registration.detached || registration.branch) {
+    const found = registration.branch?.replace(/^refs\/heads\//, '') || 'an attached HEAD'
+    throw new Error(`Worktree registration is not merged and detached; found ${found}`)
+  }
+  if (!registration.head) throw new Error('Worktree registration has no HEAD commit')
+  if (await localBranchExists(projectDirectory, options.branch)) {
+    throw new Error(`Worktree feature branch still exists: ${options.branch}`)
+  }
+
+  const containingOutput = await git(projectDirectory, [
+    'for-each-ref',
+    '--format=%(refname:short)',
+    `--contains=${registration.head}`,
+    'refs/heads/',
+  ])
+  const containingBranches = containingOutput.split('\n').map((value) => value.trim()).filter(Boolean)
+  if (containingBranches.length === 0) {
+    throw new Error(`Worktree HEAD ${registration.head.slice(0, 12)} is not merged into a local branch`)
+  }
+
+  const checkoutPresent = await pathExists(worktreeDirectory)
+  if (checkoutPresent) {
+    const worktreeTopLevel = path.resolve(
+      await git(worktreeDirectory, ['rev-parse', '--show-toplevel']),
+    )
+    if (worktreeTopLevel !== registration.directory) {
+      throw new Error(
+        `Worktree checkout does not match its registration: expected ${registration.directory}, found ${worktreeTopLevel}`,
+      )
+    }
+    const [projectCommonDirectory, worktreeCommonDirectory] = await Promise.all([
+      absoluteGitPath(projectDirectory, '--git-common-dir'),
+      absoluteGitPath(worktreeDirectory, '--git-common-dir'),
+    ])
+    if (projectCommonDirectory !== worktreeCommonDirectory) {
+      throw new Error('Worktree checkout belongs to a different git repository')
+    }
+    const worktreeHead = await git(worktreeDirectory, ['rev-parse', 'HEAD'])
+    if (worktreeHead !== registration.head) {
+      throw new Error(
+        `Worktree checkout HEAD does not match its registration: expected ${registration.head}, found ${worktreeHead}`,
+      )
+    }
+    const symbolicHead = await runGit(worktreeDirectory, ['symbolic-ref', '--quiet', 'HEAD'])
+    if (symbolicHead.exitCode === 0) {
+      throw new Error(`Worktree checkout is still attached to ${symbolicHead.stdout}`)
+    }
+    if (symbolicHead.exitCode !== 1) {
+      throw gitError(['symbolic-ref', '--quiet', 'HEAD'], symbolicHead)
+    }
+    const status = await git(worktreeDirectory, [
+      'status',
+      '--porcelain=v1',
+      '--untracked-files=all',
+      '--ignore-submodules=none',
+    ])
+    if (status) throw new Error('Worktree has uncommitted changes; clean it before removal')
+  }
+
+  return {
+    status: 'ready',
+    registration: registration as RegisteredGitWorktree & { head: string },
+    containingBranches,
+    checkoutPresent,
+  }
+}
+
+export async function removeMergedWorktree(
+  options: MergedWorktreeRemovalOptions,
+): Promise<MergedWorktreeRemovalResult> {
+  const inspection = await inspectMergedWorktreeRemoval(options)
+  if (inspection.status === 'already-removed') return inspection
+
+  const hasSubmodules = inspection.checkoutPresent
+    && (await listSubmodulePaths(inspection.registration.directory)).length > 0
+  if (hasSubmodules) {
+    const deinitArgs = ['submodule', 'deinit', '--all']
+    const deinitialized = await runGit(
+      inspection.registration.directory,
+      deinitArgs,
+      WORKTREE_REMOVE_TIMEOUT_MS,
+    )
+    if (deinitialized.exitCode !== 0) throw gitError(deinitArgs, deinitialized)
+    await inspectMergedWorktreeRemoval(options)
+  }
+  // Git requires --force for linked worktrees that have submodule metadata,
+  // even after a clean deinit. The safety inspection above still gates it.
+  const args = [
+    'worktree',
+    'remove',
+    ...(hasSubmodules ? ['--force'] : []),
+    inspection.registration.directory,
+  ]
+  const removed = await runGit(
+    path.resolve(options.projectDirectory),
+    args,
+    WORKTREE_REMOVE_TIMEOUT_MS,
+  )
+  if (removed.exitCode !== 0) {
+    try {
+      const reconciled = await inspectMergedWorktreeRemoval(options)
+      if (reconciled.status === 'already-removed') return reconciled
+    } catch {
+      // Preserve the removal failure when the target is still not safely reconciled.
+    }
+    throw gitError(args, removed)
+  }
+
+  const reconciled = await inspectMergedWorktreeRemoval(options)
+  if (reconciled.status !== 'already-removed') {
+    throw new Error(`Git reported success but worktree is still registered: ${reconciled.registration.directory}`)
+  }
+  return {
+    status: 'removed',
+    directory: reconciled.directory,
+    head: inspection.registration.head,
+  }
+}
+
 export type MergeWorktreeResult =
   | { status: 'merged'; targetBranch: string; branch: string; commitCount: number; shortSha: string }
+  | { status: 'already-merged'; targetBranch: string; branch: string; shortSha: string }
   | { status: 'conflict'; targetBranch: string; message: string }
   | { status: 'nothing-to-merge'; targetBranch: string; branch: string }
 
@@ -354,6 +627,51 @@ export async function mergeWorktree(options: {
   }
   const targetBranch = options.targetBranch || currentBranch
   await git(options.projectDirectory, ['rev-parse', '--verify', `refs/heads/${targetBranch}`])
+  const worktreeBranch = await git(options.worktreeDirectory, ['branch', '--show-current'])
+  if (!worktreeBranch) {
+    let inspection: MergedWorktreeRemovalInspection
+    try {
+      inspection = await inspectMergedWorktreeRemoval(options)
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      throw new Error(`Worktree is detached; cannot prove it was already merged: ${detail}`)
+    }
+    if (inspection.status !== 'ready') {
+      throw new Error('Worktree is detached and no longer registered')
+    }
+    const targetContainsHead = await runGit(options.projectDirectory, [
+      'merge-base',
+      '--is-ancestor',
+      inspection.registration.head,
+      `refs/heads/${targetBranch}`,
+    ])
+    if (targetContainsHead.exitCode === 1) {
+      throw new Error(
+        `Worktree is detached but its HEAD is not merged into ${targetBranch}`,
+      )
+    }
+    if (targetContainsHead.exitCode !== 0) {
+      throw gitError(
+        [
+          'merge-base',
+          '--is-ancestor',
+          inspection.registration.head,
+          `refs/heads/${targetBranch}`,
+        ],
+        targetContainsHead,
+      )
+    }
+    const shortSha = await git(
+      options.projectDirectory,
+      ['rev-parse', '--short', inspection.registration.head],
+    )
+    return {
+      status: 'already-merged',
+      targetBranch,
+      branch: options.branch,
+      shortSha,
+    }
+  }
   if (currentBranch === targetBranch) {
     const mainStatus = await git(options.projectDirectory, ['status', '--porcelain'])
     if (mainStatus) throw new Error('Main worktree has uncommitted changes')
@@ -363,10 +681,8 @@ export async function mergeWorktree(options: {
       throw new Error(`Merge target ${targetBranch} is checked out at ${checkedOutAt}`)
     }
   }
-  const worktreeBranch = await git(options.worktreeDirectory, ['branch', '--show-current'])
-  if (!worktreeBranch) throw new Error('Worktree is detached; checkout its branch before merging')
-  if (worktreeBranch && worktreeBranch !== options.branch) {
-      throw new Error(`Worktree branch changed: expected ${options.branch}, found ${worktreeBranch}`)
+  if (worktreeBranch !== options.branch) {
+    throw new Error(`Worktree branch changed: expected ${options.branch}, found ${worktreeBranch}`)
   }
   const targetHead = await git(options.projectDirectory, ['rev-parse', `refs/heads/${targetBranch}`])
   const worktreeHead = await git(options.worktreeDirectory, ['rev-parse', 'HEAD'])

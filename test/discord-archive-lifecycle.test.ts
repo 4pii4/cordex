@@ -28,6 +28,7 @@ type InternalBot = {
   handleResumeCommand(interaction: ChatInputCommandInteraction): Promise<void>
   handleNotification(notification: ServerNotification): Promise<void>
   handleAutocomplete(interaction: AutocompleteInteraction): Promise<void>
+  reconcileSessionLifecycleIntents(): Promise<void>
   memberAllowed(userId: string): Promise<boolean>
   refreshProjectsSafely(): Promise<void>
 }
@@ -35,6 +36,7 @@ type InternalBot = {
 class ArchiveCodex extends EventEmitter {
   readonly calls: string[] = []
   goalStatus: string | null = 'paused'
+  persistedDuringArchive: SessionState | undefined
 
   async getThreadGoal(threadId: string) {
     this.calls.push(`goal:${threadId}`)
@@ -51,15 +53,22 @@ class ArchiveCodex extends EventEmitter {
 
   async archiveThread(threadId: string): Promise<void> {
     this.calls.push(`archive:${threadId}`)
+    this.persistedDuringArchive = Object.values((await loadState()).sessions).find(
+      (session) => session.codexThreadId === threadId,
+    )
   }
 }
 
 class ResumeCodex extends EventEmitter {
   readonly calls: string[] = []
   resumeOptions: Record<string, unknown> | undefined
+  persistedDuringUnarchive: SessionState | undefined
 
   async unarchiveThread(threadId: string): Promise<CodexThreadSummary> {
     this.calls.push(`unarchive:${threadId}`)
+    this.persistedDuringUnarchive = Object.values((await loadState()).sessions).find(
+      (session) => session.codexThreadId === threadId,
+    )
     return {
       id: threadId,
       preview: 'Archived fixture',
@@ -72,6 +81,49 @@ class ResumeCodex extends EventEmitter {
     this.calls.push(`resume:${String(options.threadId)}`)
     this.resumeOptions = options
     return { model: 'session-model', turns: [] }
+  }
+
+  async updateThreadSettings(): Promise<void> {}
+}
+
+class ReconciliationCodex extends EventEmitter {
+  readonly calls: string[] = []
+
+  constructor(
+    private readonly active: CodexThreadSummary[],
+    private readonly archived: CodexThreadSummary[],
+  ) {
+    super()
+  }
+
+  async listAllThreads(options: { archived?: boolean } = {}): Promise<CodexThreadSummary[]> {
+    this.calls.push(`list:${options.archived ? 'archived' : 'active'}`)
+    return options.archived ? [...this.archived] : [...this.active]
+  }
+
+  async archiveThread(threadId: string): Promise<void> {
+    this.calls.push(`archive:${threadId}`)
+    const index = this.active.findIndex((thread) => thread.id === threadId)
+    if (index >= 0) this.archived.push(...this.active.splice(index, 1))
+  }
+
+  async unarchiveThread(threadId: string): Promise<CodexThreadSummary> {
+    this.calls.push(`unarchive:${threadId}`)
+    const index = this.archived.findIndex((thread) => thread.id === threadId)
+    const thread = index >= 0 ? this.archived.splice(index, 1)[0] : undefined
+    if (!thread) throw new Error(`Archived fixture ${threadId} is missing`)
+    this.active.push(thread)
+    return thread
+  }
+
+  async resumeThread(options: Record<string, unknown>) {
+    this.calls.push(`resume:${String(options.threadId)}`)
+    return {
+      model: 'session-model',
+      effort: 'high' as const,
+      serviceTier: 'fast',
+      turns: [],
+    }
   }
 
   async updateThreadSettings(): Promise<void> {}
@@ -159,11 +211,12 @@ function makeSession(
 
 function makeThreadChannel(
   id: string,
-  options: { archived?: boolean; name?: string } = {},
+  options: { archived?: boolean; name?: string; setArchivedError?: Error } = {},
 ): ThreadChannel & {
   archiveCalls: boolean[]
   memberAdds: string[]
   sent: string[]
+  setArchivedError?: Error
 } {
   const channel = {
     id,
@@ -174,6 +227,7 @@ function makeThreadChannel(
     archiveCalls: [] as boolean[],
     memberAdds: [] as string[],
     sent: [] as string[],
+    ...(options.setArchivedError ? { setArchivedError: options.setArchivedError } : {}),
     isThread: () => true,
     toString: () => `<#${id}>`,
     members: {
@@ -183,6 +237,7 @@ function makeThreadChannel(
     },
     async setArchived(value: boolean) {
       channel.archiveCalls.push(value)
+      if (channel.setArchivedError) throw channel.setArchivedError
       channel.archived = value
       return channel
     },
@@ -295,7 +350,79 @@ test('archive preserves the full session and clears its loaded runtime marker', 
         `goal:${session.codexThreadId}`,
         `archive:${session.codexThreadId}`,
       ])
+      assert.equal(codex.persistedDuringArchive?.archived, true)
+      assert.equal(codex.persistedDuringArchive?.lifecycleIntent?.kind, 'archive')
+      assert.equal(
+        typeof codex.persistedDuringArchive?.lifecycleIntent?.requestedAt,
+        'string',
+      )
+      assert.equal(session.lifecycleIntent, undefined)
       assert.deepEqual(channel.archiveCalls, [true])
+    } finally {
+      bot.client.destroy()
+    }
+  })
+})
+
+test('archive keeps its lifecycle intent when the final Discord archive fails', async () => {
+  await withTemporaryHome(async (project) => {
+    const session = makeSession(path.join(project, 'worktree'))
+    const state = makeState([session])
+    const codex = new ArchiveCodex()
+    const channel = makeThreadChannel(session.discordThreadId, {
+      setArchivedError: new Error('Discord archive unavailable'),
+    })
+    const bot = new CordexDiscordBot(makeConfig(project), state, codex as unknown as CodexAppServer)
+    const internal = bot as unknown as InternalBot
+    internal.loadedThreads.add(session.codexThreadId)
+
+    try {
+      await assert.rejects(
+        internal.handleArchiveCommand(archiveInteraction(channel)),
+        /Discord archive unavailable/,
+      )
+      assert.equal(session.archived, true)
+      assert.equal(session.lifecycleIntent?.kind, 'archive')
+      assert.equal(internal.loadedThreads.has(session.codexThreadId), false)
+      assert.deepEqual(channel.archiveCalls, [true])
+      assert.deepEqual(codex.calls, [
+        `goal:${session.codexThreadId}`,
+        `archive:${session.codexThreadId}`,
+      ])
+      assert.equal(
+        (await loadState()).sessions[session.discordThreadId]?.lifecycleIntent?.kind,
+        'archive',
+      )
+    } finally {
+      bot.client.destroy()
+    }
+  })
+})
+
+test('already archived command state also keeps an intent until Discord converges', async () => {
+  await withTemporaryHome(async (project) => {
+    const session = makeSession(path.join(project, 'worktree'), { archived: true })
+    const state = makeState([session])
+    const codex = new ArchiveCodex()
+    const channel = makeThreadChannel(session.discordThreadId, {
+      setArchivedError: new Error('Discord archive unavailable'),
+    })
+    const bot = new CordexDiscordBot(makeConfig(project), state, codex as unknown as CodexAppServer)
+    const internal = bot as unknown as InternalBot
+
+    try {
+      await assert.rejects(
+        internal.handleArchiveCommand(archiveInteraction(channel)),
+        /Discord archive unavailable/,
+      )
+      assert.equal(session.archived, true)
+      assert.equal(session.lifecycleIntent?.kind, 'archive')
+      assert.deepEqual(codex.calls, [])
+      assert.deepEqual(channel.archiveCalls, [true])
+      assert.equal(
+        (await loadState()).sessions[session.discordThreadId]?.lifecycleIntent?.kind,
+        'archive',
+      )
     } finally {
       bot.client.destroy()
     }
@@ -453,9 +580,16 @@ test('known archived resume unarchives then resumes and reuses the retained Disc
         permissions: retained.permissions,
         approvalPolicy: 'never',
       })
+      assert.equal(codex.persistedDuringUnarchive?.archived, true)
+      assert.equal(codex.persistedDuringUnarchive?.lifecycleIntent?.kind, 'resume')
+      assert.equal(
+        typeof codex.persistedDuringUnarchive?.lifecycleIntent?.requestedAt,
+        'string',
+      )
       assert.strictEqual(state.sessions[channel.id], session)
       assert.equal(Object.keys(state.sessions).length, 1)
       assert.equal(session.archived, undefined)
+      assert.equal(session.lifecycleIntent, undefined)
       assert.equal(session.directory, retained.directory)
       assert.equal(session.effort, retained.effort)
       assert.equal(session.mode, retained.mode)
@@ -472,7 +606,52 @@ test('known archived resume unarchives then resumes and reuses the retained Disc
   })
 })
 
-test('resume rolls back local state when persistence fails and succeeds on retry', async () => {
+test('resume keeps its lifecycle intent until Discord unarchives and clears it on retry', async () => {
+  await withTemporaryHome(async (project) => {
+    const session = makeSession(path.join(project, 'retained-worktree'), { archived: true })
+    const state = makeState([session])
+    const codex = new ResumeCodex()
+    const channel = makeThreadChannel(session.discordThreadId, {
+      archived: true,
+      setArchivedError: new Error('Discord unarchive unavailable'),
+    })
+    const replies: string[] = []
+    const bot = new CordexDiscordBot(makeConfig(project), state, codex as unknown as CodexAppServer)
+    const internal = bot as unknown as InternalBot
+    ;(bot.client.channels as unknown as { fetch(id: string): Promise<ThreadChannel> }).fetch =
+      async () => channel
+
+    try {
+      await assert.rejects(
+        internal.handleResumeCommand(resumeInteraction(session.codexThreadId, replies)),
+        /Discord unarchive unavailable/,
+      )
+      assert.equal(session.archived, undefined)
+      assert.equal(session.lifecycleIntent?.kind, 'resume')
+      assert.equal(internal.loadedThreads.has(session.codexThreadId), true)
+      assert.deepEqual(channel.archiveCalls, [false])
+      assert.equal(
+        (await loadState()).sessions[session.discordThreadId]?.lifecycleIntent?.kind,
+        'resume',
+      )
+
+      delete channel.setArchivedError
+      await internal.handleResumeCommand(resumeInteraction(session.codexThreadId, replies))
+
+      assert.equal(session.lifecycleIntent, undefined)
+      assert.deepEqual(channel.archiveCalls, [false, false])
+      assert.deepEqual(codex.calls, [
+        `unarchive:${session.codexThreadId}`,
+        `resume:${session.codexThreadId}`,
+      ])
+      assert.equal((await loadState()).sessions[session.discordThreadId]?.lifecycleIntent, undefined)
+    } finally {
+      bot.client.destroy()
+    }
+  })
+})
+
+test('resume persists its intent before RPC, rolls back on save failure, and retries', async () => {
   await withFailingStateHome(async (project, homePath) => {
     const session = makeSession(path.join(project, 'retained-worktree'), { archived: true })
     const retained = structuredClone(session)
@@ -490,6 +669,7 @@ test('resume rolls back local state when persistence fails and succeeds on retry
       )
       assert.deepEqual(session, retained)
       assert.equal(internal.loadedThreads.has(session.codexThreadId), false)
+      assert.deepEqual(codex.calls, [])
       assert.deepEqual(channel.archiveCalls, [])
 
       await rm(homePath, { force: true })
@@ -500,6 +680,312 @@ test('resume rolls back local state when persistence fails and succeeds on retry
       assert.equal(internal.loadedThreads.has(session.codexThreadId), true)
       assert.deepEqual(channel.archiveCalls, [false])
       assert.equal((await loadState()).sessions[channel.id]?.archived, undefined)
+    } finally {
+      bot.client.destroy()
+    }
+  })
+})
+
+test('startup reconciliation completes archive intents on either side of the RPC crash window', async (t) => {
+  for (const remoteState of ['active', 'archived'] as const) {
+    await t.test(remoteState, async () => {
+      await withTemporaryHome(async (project) => {
+        const session = makeSession(path.join(project, 'worktree'))
+        session.archived = true
+        session.lifecycleIntent = {
+          kind: 'archive',
+          requestedAt: '2026-07-19T01:02:03.004Z',
+        }
+        const retained = structuredClone(session)
+        const state = makeState([session])
+        state.queues[session.discordThreadId] = [{
+          id: 'retained-queue',
+          authorId: 'user-1',
+          authorName: 'Queue User',
+          input: [{ type: 'text', text: 'Retained work', text_elements: [] }],
+          displayText: 'Retained work',
+          createdAt: new Date(0).toISOString(),
+        }]
+        const summary: CodexThreadSummary = {
+          id: session.codexThreadId,
+          preview: 'Archive crash fixture',
+          cwd: session.directory,
+          updatedAt: 1,
+        }
+        const codex = new ReconciliationCodex(
+          remoteState === 'active' ? [summary] : [],
+          remoteState === 'archived' ? [summary] : [],
+        )
+        const channel = makeThreadChannel(session.discordThreadId)
+        const bot = new CordexDiscordBot(
+          makeConfig(project),
+          state,
+          codex as unknown as CodexAppServer,
+        )
+        const internal = bot as unknown as InternalBot
+        internal.loadedThreads.add(session.codexThreadId)
+        ;(bot.client.channels as unknown as { fetch(id: string): Promise<ThreadChannel> }).fetch =
+          async () => channel
+
+        try {
+          await internal.reconcileSessionLifecycleIntents()
+
+          assert.deepEqual(codex.calls, [
+            'list:active',
+            'list:archived',
+            ...(remoteState === 'active' ? [`archive:${session.codexThreadId}`] : []),
+          ])
+          assert.equal(session.archived, true)
+          assert.equal(session.lifecycleIntent, undefined)
+          assert.equal(internal.loadedThreads.has(session.codexThreadId), false)
+          assert.deepEqual(session.worktree, retained.worktree)
+          assert.deepEqual(session.workspaceRoots, retained.workspaceRoots)
+          assert.equal(session.permissions, retained.permissions)
+          assert.equal(session.contextTokens, retained.contextTokens)
+          assert.deepEqual(state.queues[session.discordThreadId], [{
+            id: 'retained-queue',
+            authorId: 'user-1',
+            authorName: 'Queue User',
+            input: [{ type: 'text', text: 'Retained work', text_elements: [] }],
+            displayText: 'Retained work',
+            createdAt: new Date(0).toISOString(),
+          }])
+          assert.deepEqual(channel.archiveCalls, [true])
+          assert.equal((await loadState()).sessions[session.discordThreadId]?.lifecycleIntent, undefined)
+        } finally {
+          bot.client.destroy()
+        }
+      })
+    })
+  }
+})
+
+test('startup reconciliation completes resume intents on either side of the unarchive crash window', async (t) => {
+  for (const remoteState of ['archived', 'active'] as const) {
+    await t.test(remoteState, async () => {
+      await withTemporaryHome(async (project) => {
+        const session = makeSession(path.join(project, 'worktree'), { archived: true })
+        session.lifecycleIntent = {
+          kind: 'resume',
+          requestedAt: '2026-07-19T02:03:04.005Z',
+        }
+        const retained = structuredClone(session)
+        const state = makeState([session])
+        state.queues[session.discordThreadId] = [{
+          id: 'resume-queue',
+          authorId: 'user-1',
+          authorName: 'Queue User',
+          input: [{ type: 'text', text: 'Resume this work', text_elements: [] }],
+          displayText: 'Resume this work',
+          createdAt: new Date(0).toISOString(),
+        }]
+        const summary: CodexThreadSummary = {
+          id: session.codexThreadId,
+          preview: 'Resume crash fixture',
+          cwd: session.directory,
+          updatedAt: 1,
+        }
+        const codex = new ReconciliationCodex(
+          remoteState === 'active' ? [summary] : [],
+          remoteState === 'archived' ? [summary] : [],
+        )
+        const channel = makeThreadChannel(session.discordThreadId, { archived: true })
+        const bot = new CordexDiscordBot(
+          makeConfig(project),
+          state,
+          codex as unknown as CodexAppServer,
+        )
+        const internal = bot as unknown as InternalBot
+        ;(bot.client.channels as unknown as { fetch(id: string): Promise<ThreadChannel> }).fetch =
+          async () => channel
+
+        try {
+          await internal.reconcileSessionLifecycleIntents()
+
+          assert.deepEqual(codex.calls, [
+            'list:active',
+            'list:archived',
+            ...(remoteState === 'archived' ? [`unarchive:${session.codexThreadId}`] : []),
+            `resume:${session.codexThreadId}`,
+          ])
+          assert.equal(session.archived, undefined)
+          assert.equal(session.lifecycleIntent, undefined)
+          assert.equal(internal.loadedThreads.has(session.codexThreadId), true)
+          assert.equal(session.directory, retained.directory)
+          assert.equal(session.mode, retained.mode)
+          assert.deepEqual(session.worktree, retained.worktree)
+          assert.deepEqual(session.workspaceRoots, retained.workspaceRoots)
+          assert.equal(session.permissions, retained.permissions)
+          assert.equal(session.contextTokens, retained.contextTokens)
+          assert.deepEqual(state.queues[session.discordThreadId]?.map((prompt) => prompt.id), [
+            'resume-queue',
+          ])
+          assert.deepEqual(channel.archiveCalls, [false])
+          assert.equal((await loadState()).sessions[session.discordThreadId]?.lifecycleIntent, undefined)
+        } finally {
+          bot.client.destroy()
+        }
+      })
+    })
+  }
+})
+
+test('startup reconciliation preserves lifecycle intents across transient Discord failures', async (t) => {
+  for (const kind of ['archive', 'resume'] as const) {
+    await t.test(kind, async () => {
+      await withTemporaryHome(async (project) => {
+        const session = makeSession(path.join(project, 'worktree'), {
+          archived: kind === 'archive',
+        })
+        session.lifecycleIntent = {
+          kind,
+          requestedAt: '2026-07-19T02:30:00.000Z',
+        }
+        const state = makeState([session])
+        const summary: CodexThreadSummary = {
+          id: session.codexThreadId,
+          preview: 'Discord convergence fixture',
+          cwd: session.directory,
+          updatedAt: 1,
+        }
+        const codex = new ReconciliationCodex(
+          kind === 'resume' ? [summary] : [],
+          kind === 'archive' ? [summary] : [],
+        )
+        const channel = makeThreadChannel(session.discordThreadId, {
+          archived: kind === 'resume',
+          setArchivedError: new Error('Discord lifecycle unavailable'),
+        })
+        const bot = new CordexDiscordBot(
+          makeConfig(project),
+          state,
+          codex as unknown as CodexAppServer,
+        )
+        const internal = bot as unknown as InternalBot
+        ;(bot.client.channels as unknown as { fetch(id: string): Promise<ThreadChannel> }).fetch =
+          async () => channel
+
+        try {
+          await assert.rejects(
+            internal.reconcileSessionLifecycleIntents(),
+            /Discord lifecycle unavailable/,
+          )
+          assert.equal(session.lifecycleIntent?.kind, kind)
+          assert.equal(
+            (await loadState()).sessions[session.discordThreadId]?.lifecycleIntent?.kind,
+            kind,
+          )
+
+          delete channel.setArchivedError
+          await internal.reconcileSessionLifecycleIntents()
+
+          assert.equal(session.lifecycleIntent, undefined)
+          assert.deepEqual(channel.archiveCalls, [kind === 'archive', kind === 'archive'])
+          assert.equal(
+            (await loadState()).sessions[session.discordThreadId]?.lifecycleIntent,
+            undefined,
+          )
+        } finally {
+          bot.client.destroy()
+        }
+      })
+    })
+  }
+})
+
+test('startup reconciliation clears an intent when its Discord thread is authoritatively missing', async () => {
+  await withTemporaryHome(async (project) => {
+    const session = makeSession(path.join(project, 'worktree'), { archived: true })
+    session.lifecycleIntent = {
+      kind: 'archive',
+      requestedAt: '2026-07-19T02:45:00.000Z',
+    }
+    const state = makeState([session])
+    const summary: CodexThreadSummary = {
+      id: session.codexThreadId,
+      preview: 'Missing Discord thread fixture',
+      cwd: session.directory,
+      updatedAt: 1,
+    }
+    const codex = new ReconciliationCodex([], [summary])
+    const bot = new CordexDiscordBot(makeConfig(project), state, codex as unknown as CodexAppServer)
+    const internal = bot as unknown as InternalBot
+    ;(bot.client.channels as unknown as { fetch(id: string): Promise<ThreadChannel> }).fetch =
+      async () => {
+        throw Object.assign(new Error('Unknown Channel'), { code: 10_003 })
+      }
+
+    try {
+      await internal.reconcileSessionLifecycleIntents()
+      assert.equal(session.archived, true)
+      assert.equal(session.lifecycleIntent, undefined)
+      assert.equal((await loadState()).sessions[session.discordThreadId]?.lifecycleIntent, undefined)
+    } finally {
+      bot.client.destroy()
+    }
+  })
+})
+
+test('startup reconciliation cleans a lifecycle intent whose Codex thread was deleted', async () => {
+  await withTemporaryHome(async (project) => {
+    const session = makeSession(path.join(project, 'worktree'))
+    session.archived = true
+    session.lifecycleIntent = {
+      kind: 'archive',
+      requestedAt: '2026-07-19T03:04:05.006Z',
+    }
+    const state = makeState([session])
+    const codex = new ReconciliationCodex([], [])
+    const bot = new CordexDiscordBot(makeConfig(project), state, codex as unknown as CodexAppServer)
+    const internal = bot as unknown as InternalBot
+
+    try {
+      await internal.reconcileSessionLifecycleIntents()
+      assert.equal(state.sessions[session.discordThreadId], undefined)
+      assert.equal(codex.calls.some((call) => call.startsWith('archive:')), false)
+    } finally {
+      bot.client.destroy()
+    }
+  })
+})
+
+test('thread/archived creates and preserves an archive intent until Discord converges', async () => {
+  await withTemporaryHome(async (project) => {
+    const session = makeSession(path.join(project, 'worktree'))
+    const state = makeState([session])
+    const codex = new NotificationCodex()
+    const channel = makeThreadChannel(session.discordThreadId, {
+      setArchivedError: new Error('Discord notification archive unavailable'),
+    })
+    const bot = new CordexDiscordBot(makeConfig(project), state, codex as unknown as CodexAppServer)
+    const internal = bot as unknown as InternalBot
+    internal.loadedThreads.add(session.codexThreadId)
+    ;(bot.client.channels as unknown as { fetch(id: string): Promise<ThreadChannel> }).fetch =
+      async () => channel
+    const notification: ServerNotification = {
+      method: 'thread/archived',
+      params: { threadId: session.codexThreadId },
+    }
+
+    try {
+      await assert.rejects(
+        internal.handleNotification(notification),
+        /Discord notification archive unavailable/,
+      )
+      assert.equal(session.archived, true)
+      assert.equal(session.lifecycleIntent?.kind, 'archive')
+      assert.equal(internal.loadedThreads.has(session.codexThreadId), false)
+      assert.equal(
+        (await loadState()).sessions[session.discordThreadId]?.lifecycleIntent?.kind,
+        'archive',
+      )
+
+      delete channel.setArchivedError
+      await internal.handleNotification(notification)
+
+      assert.equal(session.lifecycleIntent, undefined)
+      assert.deepEqual(channel.archiveCalls, [true, true])
+      assert.equal((await loadState()).sessions[session.discordThreadId]?.lifecycleIntent, undefined)
     } finally {
       bot.client.destroy()
     }
@@ -518,6 +1004,11 @@ test('archive lifecycle notifications are idempotent and closed is non-destructi
     ;(bot.client.channels as unknown as { fetch(id: string): Promise<ThreadChannel> }).fetch = async () => channel
 
     try {
+      session.archived = true
+      session.lifecycleIntent = {
+        kind: 'archive',
+        requestedAt: '2026-07-19T04:05:06.007Z',
+      }
       const archived: ServerNotification = {
         method: 'thread/archived',
         params: { threadId: session.codexThreadId },
@@ -525,6 +1016,7 @@ test('archive lifecycle notifications are idempotent and closed is non-destructi
       await internal.handleNotification(archived)
       await internal.handleNotification(archived)
       assert.equal(session.archived, true)
+      assert.equal(session.lifecycleIntent, undefined)
       assert.equal(internal.loadedThreads.has(session.codexThreadId), false)
       assert.deepEqual(channel.archiveCalls, [true])
 

@@ -788,6 +788,9 @@ test('Codex deletion releases the event queue before waiting for prompt cleanup'
         () => fixture.state.sessions[channel.id] === undefined,
         'deleted Codex thread cleanup did not finish after lock release',
       )
+      while (fixture.internal.pendingCodexDeletionCleanups.size > 0) {
+        await Promise.all([...fixture.internal.pendingCodexDeletionCleanups])
+      }
     } finally {
       releaseCodexAttempt()
       clearRunTimers(fixture.internal)

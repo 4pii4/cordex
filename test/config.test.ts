@@ -97,6 +97,10 @@ test('config and session state round trip', async () => {
       directory,
       codexThreadId: 'codex-thread',
       archived: true,
+      lifecycleIntent: {
+        kind: 'archive',
+        requestedAt: new Date(0).toISOString(),
+      },
       activeTurnId: 'turn',
       workspaceRoots: [path.join(directory, 'extra')],
       permissions: ':read-only',
@@ -246,6 +250,77 @@ test('state loading sanitizes persisted context usage fields', async () => {
     assert.equal(state.sessions.malformedWindow?.contextWindow, undefined)
     assert.equal(state.sessions.overWindow?.contextTokens, 11_000)
     assert.equal(state.sessions.overWindow?.contextWindow, 10_000)
+  } finally {
+    if (oldHome === undefined) delete process.env.CORDEX_HOME
+    else process.env.CORDEX_HOME = oldHome
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('state loading accepts only exact session lifecycle intent variants', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'cordex-lifecycle-state-'))
+  const oldHome = process.env.CORDEX_HOME
+  process.env.CORDEX_HOME = directory
+  const baseSession = {
+    discordThreadId: 'thread',
+    parentChannelId: 'channel',
+    directory,
+    codexThreadId: 'codex-thread',
+    updatedAt: new Date(0).toISOString(),
+  }
+  try {
+    await writeFile(getStatePath(), JSON.stringify({
+      sessions: {
+        archive: {
+          ...baseSession,
+          lifecycleIntent: {
+            kind: 'archive',
+            requestedAt: '2026-07-19T01:02:03.004Z',
+            phase: 'untrusted-extra',
+          },
+        },
+        removal: {
+          ...baseSession,
+          discordThreadId: 'thread-removal',
+          codexThreadId: 'codex-thread-removal',
+          lifecycleIntent: {
+            kind: 'remove-worktree',
+            requestedAt: '2026-07-19T02:03:04.005Z',
+            directory: '/untrusted',
+          },
+        },
+        badKind: {
+          ...baseSession,
+          discordThreadId: 'thread-bad-kind',
+          codexThreadId: 'codex-thread-bad-kind',
+          lifecycleIntent: {
+            kind: 'delete-thread',
+            requestedAt: '2026-07-19T03:04:05.006Z',
+          },
+        },
+        badTimestamp: {
+          ...baseSession,
+          discordThreadId: 'thread-bad-time',
+          codexThreadId: 'codex-thread-bad-time',
+          lifecycleIntent: {
+            kind: 'resume',
+            requestedAt: 'not-a-date',
+          },
+        },
+      },
+    }))
+
+    const state = await loadState()
+    assert.deepEqual(state.sessions.archive?.lifecycleIntent, {
+      kind: 'archive',
+      requestedAt: '2026-07-19T01:02:03.004Z',
+    })
+    assert.deepEqual(state.sessions.removal?.lifecycleIntent, {
+      kind: 'remove-worktree',
+      requestedAt: '2026-07-19T02:03:04.005Z',
+    })
+    assert.equal(state.sessions.badKind?.lifecycleIntent, undefined)
+    assert.equal(state.sessions.badTimestamp?.lifecycleIntent, undefined)
   } finally {
     if (oldHome === undefined) delete process.env.CORDEX_HOME
     else process.env.CORDEX_HOME = oldHome

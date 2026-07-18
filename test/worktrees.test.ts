@@ -8,7 +8,10 @@ import {
   createWorktree,
   formatWorktreeBranch,
   getManagedWorktreeDirectory,
+  inspectMergedWorktreeRemoval,
+  listRegisteredWorktrees,
   mergeWorktree,
+  removeMergedWorktree,
   resolveBestBaseRef,
   runGit,
   slugifyWorktreeName,
@@ -24,6 +27,40 @@ async function gitOutput(cwd: string, args: string[]): Promise<string> {
   const result = await runGit(cwd, args)
   assert.equal(result.exitCode, 0, `${args.join(' ')}: ${result.stderr}`)
   return result.stdout
+}
+
+async function createWorktreeFixture(name: string) {
+  const root = await mkdtemp(path.join(tmpdir(), 'cordex-worktree-removal-'))
+  const dataRoot = await mkdtemp(path.join(tmpdir(), 'cordex-worktree-removal-data-'))
+  try {
+    await git(root, ['init', '-b', 'main'])
+    await git(root, ['config', 'user.email', 'cordex@test.invalid'])
+    await git(root, ['config', 'user.name', 'Cordex Test'])
+    await writeFile(path.join(root, 'README.md'), 'base\n')
+    await git(root, ['add', 'README.md'])
+    await git(root, ['commit', '-m', 'base'])
+    const created = await createWorktree({ projectDirectory: root, dataRoot, name })
+    return { root, dataRoot, created }
+  } catch (error) {
+    await rm(root, { recursive: true, force: true })
+    await rm(dataRoot, { recursive: true, force: true })
+    throw error
+  }
+}
+
+async function commitAndMergeFixture(
+  root: string,
+  created: Awaited<ReturnType<typeof createWorktree>>,
+): Promise<void> {
+  await writeFile(path.join(created.directory, 'README.md'), 'base\nfeature\n')
+  await git(created.directory, ['add', 'README.md'])
+  await git(created.directory, ['commit', '-m', 'feature'])
+  const merged = await mergeWorktree({
+    projectDirectory: root,
+    worktreeDirectory: created.directory,
+    branch: created.branch,
+  })
+  assert.equal(merged.status, 'merged')
 }
 
 test('worktree create, branch commit, rebase, fast-forward merge', async () => {
@@ -56,6 +93,28 @@ test('worktree create, branch commit, rebase, fast-forward merge', async () => {
     assert.equal(result.status, 'merged')
     if (result.status === 'merged') assert.equal(result.commitCount, 1)
     assert.equal(await readFile(path.join(root, 'README.md'), 'utf8'), 'base\nfeature\n')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+    await rm(dataRoot, { recursive: true, force: true })
+  }
+})
+
+test('worktree merge recognizes a completed merge after its caller lost the result', async () => {
+  const { root, dataRoot, created } = await createWorktreeFixture('merge recovery')
+  try {
+    await commitAndMergeFixture(root, created)
+    const expectedShortSha = await gitOutput(root, ['rev-parse', '--short', 'main'])
+
+    assert.deepEqual(await mergeWorktree({
+      projectDirectory: root,
+      worktreeDirectory: created.directory,
+      branch: created.branch,
+    }), {
+      status: 'already-merged',
+      targetBranch: 'main',
+      branch: created.branch,
+      shortSha: expectedShortSha,
+    })
   } finally {
     await rm(root, { recursive: true, force: true })
     await rm(dataRoot, { recursive: true, force: true })
@@ -192,7 +251,7 @@ test('worktree creation initializes a submodule commit available only from the s
   }
 })
 
-test('worktree creation initializes submodules normally when no source checkout is available', async () => {
+test('worktree creation and merged removal handle submodules without a source checkout', async () => {
   const sandbox = await mkdtemp(path.join(tmpdir(), 'cordex-worktree-submodule-fallback-'))
   const root = path.join(sandbox, 'parent')
   const submoduleRemote = path.join(sandbox, 'module.git')
@@ -231,6 +290,18 @@ test('worktree creation initializes submodules normally when no source checkout 
       await readFile(path.join(created.directory, 'deps', 'module', 'README.md'), 'utf8'),
       'module\n',
     )
+    const merged = await mergeWorktree({
+      projectDirectory: root,
+      worktreeDirectory: created.directory,
+      branch: created.branch,
+    })
+    assert.equal(merged.status, 'nothing-to-merge')
+    assert.equal((await removeMergedWorktree({
+      projectDirectory: root,
+      worktreeDirectory: created.directory,
+      branch: created.branch,
+    })).status, 'removed')
+    await assert.rejects(access(created.directory))
   } finally {
     await rm(sandbox, { recursive: true, force: true })
   }
@@ -522,4 +593,173 @@ test('active worktree listing spans projects and sorts newest first', () => {
     session('new', new Date(2).toISOString()),
   ])
   assert.deepEqual(result.map((item) => item.discordThreadId), ['new', 'old'])
+})
+
+test('merged worktree removal is exact and idempotent', async () => {
+  const { root, dataRoot, created } = await createWorktreeFixture('safe removal')
+  try {
+    await commitAndMergeFixture(root, created)
+    const inspection = await inspectMergedWorktreeRemoval({
+      projectDirectory: root,
+      worktreeDirectory: created.directory,
+      branch: created.branch,
+    })
+    assert.equal(inspection.status, 'ready')
+    if (inspection.status === 'ready') {
+      assert.equal(inspection.registration.detached, true)
+      assert.equal(inspection.registration.branch, undefined)
+      assert.deepEqual(inspection.containingBranches, ['main'])
+      assert.equal(inspection.checkoutPresent, true)
+    }
+
+    const removed = await removeMergedWorktree({
+      projectDirectory: root,
+      worktreeDirectory: created.directory,
+      branch: created.branch,
+    })
+    assert.equal(removed.status, 'removed')
+    await assert.rejects(access(created.directory))
+    assert.equal(
+      (await listRegisteredWorktrees(root)).some(
+        (registration) => registration.directory === path.resolve(created.directory),
+      ),
+      false,
+    )
+
+    assert.deepEqual(await removeMergedWorktree({
+      projectDirectory: root,
+      worktreeDirectory: created.directory,
+      branch: created.branch,
+    }), {
+      status: 'already-removed',
+      directory: path.resolve(created.directory),
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+    await rm(dataRoot, { recursive: true, force: true })
+  }
+})
+
+test('merged worktree removal rejects a dirty checkout', async () => {
+  const { root, dataRoot, created } = await createWorktreeFixture('dirty removal')
+  try {
+    await commitAndMergeFixture(root, created)
+    await writeFile(path.join(created.directory, 'UNTRACKED.md'), 'keep me\n')
+    await assert.rejects(
+      removeMergedWorktree({
+        projectDirectory: root,
+        worktreeDirectory: created.directory,
+        branch: created.branch,
+      }),
+      /uncommitted changes/,
+    )
+    await access(created.directory)
+    assert.equal(
+      (await listRegisteredWorktrees(root)).some(
+        (registration) => registration.directory === path.resolve(created.directory),
+      ),
+      true,
+    )
+  } finally {
+    await rm(root, { recursive: true, force: true })
+    await rm(dataRoot, { recursive: true, force: true })
+  }
+})
+
+test('merged worktree removal rejects a surviving feature branch', async () => {
+  const { root, dataRoot, created } = await createWorktreeFixture('surviving branch')
+  try {
+    await commitAndMergeFixture(root, created)
+    await git(root, ['branch', created.branch, 'HEAD'])
+    await assert.rejects(
+      removeMergedWorktree({
+        projectDirectory: root,
+        worktreeDirectory: created.directory,
+        branch: created.branch,
+      }),
+      /feature branch still exists/,
+    )
+    await access(created.directory)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+    await rm(dataRoot, { recursive: true, force: true })
+  }
+})
+
+test('merged worktree removal rejects an unreachable detached commit', async () => {
+  const { root, dataRoot, created } = await createWorktreeFixture('unreachable commit')
+  try {
+    await writeFile(path.join(created.directory, 'README.md'), 'unmerged\n')
+    await git(created.directory, ['add', 'README.md'])
+    await git(created.directory, ['commit', '-m', 'unmerged'])
+    await git(created.directory, ['checkout', '--detach'])
+    await git(root, ['branch', '-D', created.branch])
+
+    await assert.rejects(
+      removeMergedWorktree({
+        projectDirectory: root,
+        worktreeDirectory: created.directory,
+        branch: created.branch,
+      }),
+      /not merged into a local branch/,
+    )
+    await access(created.directory)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+    await rm(dataRoot, { recursive: true, force: true })
+  }
+})
+
+test('merged worktree removal rejects an unregistered directory', async () => {
+  const { root, dataRoot, created } = await createWorktreeFixture('registration mismatch')
+  const unregistered = path.join(dataRoot, 'not-the-registered-worktree')
+  try {
+    await commitAndMergeFixture(root, created)
+    await mkdir(unregistered, { recursive: true })
+    await assert.rejects(
+      removeMergedWorktree({
+        projectDirectory: root,
+        worktreeDirectory: unregistered,
+        branch: created.branch,
+      }),
+      /not registered in this repository/,
+    )
+    await access(unregistered)
+    await access(created.directory)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+    await rm(dataRoot, { recursive: true, force: true })
+  }
+})
+
+test('merged worktree removal reconciles a registered checkout already missing on disk', async () => {
+  const { root, dataRoot, created } = await createWorktreeFixture('stale registration')
+  try {
+    await commitAndMergeFixture(root, created)
+    await rm(created.directory, { recursive: true, force: true })
+    const inspection = await inspectMergedWorktreeRemoval({
+      projectDirectory: root,
+      worktreeDirectory: created.directory,
+      branch: created.branch,
+    })
+    assert.equal(inspection.status, 'ready')
+    if (inspection.status === 'ready') assert.equal(inspection.checkoutPresent, false)
+
+    assert.equal((await removeMergedWorktree({
+      projectDirectory: root,
+      worktreeDirectory: created.directory,
+      branch: created.branch,
+    })).status, 'removed')
+    assert.deepEqual(await inspectMergedWorktreeRemoval({
+      projectDirectory: root,
+      worktreeDirectory: created.directory,
+      branch: created.branch,
+    }), {
+      status: 'already-removed',
+      directory: path.resolve(created.directory),
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+    await rm(dataRoot, { recursive: true, force: true })
+  }
 })

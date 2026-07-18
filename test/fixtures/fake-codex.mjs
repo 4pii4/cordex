@@ -131,16 +131,20 @@ lines.on('line', (line) => {
     send({ id: message.id, result: { cleared } })
   } else if (message.method === 'thread/list') {
     threadListParams = message.params
+    const paginated = message.params.searchTerm === 'paginated lifecycle'
+    const page = paginated && message.params.cursor === 'fixture-next-page' ? 2 : 1
     send({
       id: message.id,
       result: {
         data: [{
-          id: message.params.archived ? 'thread-archived' : 'thread-1',
+          id: paginated
+            ? `thread-page-${page}`
+            : message.params.archived ? 'thread-archived' : 'thread-1',
           preview: message.params.archived ? 'fixture archived preview' : 'fixture preview',
           cwd: process.cwd(),
           updatedAt: 1,
         }],
-        nextCursor: null,
+        nextCursor: paginated && page === 1 ? 'fixture-next-page' : null,
         backwardsCursor: null,
       },
     })

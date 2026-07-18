@@ -6,6 +6,25 @@ versioning once tagged releases begin.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-07-19
+
+### Added
+
+- Authenticated local Unix-socket automation through `cordex send --thread`,
+  including daemon-side text and image file ingestion with durable prompt enqueue.
+- Stable MCP form and URL elicitation controls with typed validation, safe URL
+  handling, empty-form persistence choices, and restart/timeout cleanup.
+- `/delete-worktree` for exact, clean, merged worktree removal with durable startup
+  reconciliation and session reload at the project root.
+
+### Changed
+
+- Made archive and resume crash-durable through persisted lifecycle intents and
+  reconciliation against complete active and archived Codex thread listings.
+- Graceful shutdown now stops new ingress and drains Discord interactions, Codex
+  requests and notifications, scheduled work, state/outbox queues, and deletion
+  cleanup before closing the runtime.
+
 ## [0.1.2] - 2026-07-18
 
 ### Added

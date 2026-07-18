@@ -35,6 +35,11 @@ export type CordexConfig = {
   projects: Record<string, ProjectConfig>
 }
 
+export type SessionLifecycleIntent = {
+  kind: 'archive' | 'resume' | 'remove-worktree'
+  requestedAt: string
+}
+
 export type SessionState = {
   discordThreadId: string
   parentChannelId: string
@@ -54,6 +59,7 @@ export type SessionState = {
     merged?: boolean
   }
   archived?: boolean
+  lifecycleIntent?: SessionLifecycleIntent
   activeTurnId?: string
   contextTokens?: number
   contextWindow?: number

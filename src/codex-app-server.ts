@@ -1177,15 +1177,17 @@ export class CodexAppServer extends EventEmitter {
     await this.request('thread/settings/update', params)
   }
 
-  async listThreads(options: {
+  private async listThreadsPage(options: {
     cwd?: string
     searchTerm?: string
     limit?: number
     archived?: boolean
-  } = {}): Promise<CodexThreadSummary[]> {
+    cursor?: string
+  } = {}): Promise<{ data: CodexThreadSummary[]; nextCursor?: string }> {
     await this.ready
     const response = asRecord(
       await this.request('thread/list', {
+        ...(options.cursor ? { cursor: options.cursor } : {}),
         limit: options.limit ?? 25,
         sortKey: 'updated_at',
         sortDirection: 'desc',
@@ -1196,10 +1198,52 @@ export class CodexAppServer extends EventEmitter {
       'thread/list',
     )
     if (!Array.isArray(response.data)) throw new Error('Codex thread/list omitted data')
-    return response.data.flatMap((item) => {
-      const thread = parseThreadSummary(item)
-      return thread ? [thread] : []
-    })
+    if (
+      response.nextCursor !== undefined &&
+      response.nextCursor !== null &&
+      typeof response.nextCursor !== 'string'
+    ) throw new Error('Codex thread/list returned an invalid pagination cursor')
+    return {
+      data: response.data.flatMap((item) => {
+        const thread = parseThreadSummary(item)
+        return thread ? [thread] : []
+      }),
+      ...(typeof response.nextCursor === 'string' && response.nextCursor
+        ? { nextCursor: response.nextCursor }
+        : {}),
+    }
+  }
+
+  async listThreads(options: {
+    cwd?: string
+    searchTerm?: string
+    limit?: number
+    archived?: boolean
+  } = {}): Promise<CodexThreadSummary[]> {
+    return (await this.listThreadsPage(options)).data
+  }
+
+  async listAllThreads(options: {
+    cwd?: string
+    searchTerm?: string
+    archived?: boolean
+  } = {}): Promise<CodexThreadSummary[]> {
+    const threads: CodexThreadSummary[] = []
+    const seenCursors = new Set<string>()
+    let cursor: string | undefined
+    do {
+      const page = await this.listThreadsPage({
+        ...options,
+        limit: 100,
+        ...(cursor ? { cursor } : {}),
+      })
+      threads.push(...page.data)
+      cursor = page.nextCursor
+      if (!cursor) break
+      if (seenCursors.has(cursor)) throw new Error('Codex thread/list repeated its pagination cursor')
+      seenCursors.add(cursor)
+    } while (true)
+    return threads
   }
 
   async getThreadRuntimeState(threadId: string): Promise<CodexThreadRuntimeState> {

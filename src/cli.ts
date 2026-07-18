@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { execFile } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { access } from 'node:fs/promises'
 import path from 'node:path'
 import { promisify } from 'node:util'
@@ -11,6 +12,7 @@ import {
   assertDirectory,
   emptyState,
   getConfigPath,
+  getCordexHome,
   getProjectsDirectory,
   loadConfig,
   loadState,
@@ -18,6 +20,12 @@ import {
   saveState,
   withManagementLock,
 } from './config.js'
+import {
+  materializeCordexDaemonInput,
+  sendCordexDaemonPrompt,
+  startCordexDaemonIpc,
+  type CordexDaemonIpcServer,
+} from './daemon-ipc.js'
 import { CordexDiscordBot } from './discord-bot.js'
 import { runProjectCli } from './project-cli.js'
 import type { CordexConfig } from './types.js'
@@ -30,11 +38,13 @@ Commands:
   init                         Write or update Discord credentials
   doctor                       Validate the local Codex and project setup
   start                        Start the Discord bot
+  send --thread <id> <prompt>  Send a prompt to an existing Cordex thread
   project <subcommand>         Manage Discord project mappings
   add-project [directory]      Alias for "project add"
 
 Options:
   --projects-dir <path>        Override the projects directory
+  --file <path>                Attach a UTF-8 text file or supported image
   --verbose, -v                Enable verbose backend logging
   --help, -h                   Show this help
   --version, -V                Show the Cordex version`
@@ -103,6 +113,57 @@ async function doctor(): Promise<void> {
   console.log('Doctor: OK')
 }
 
+async function send(commandArgs: string[]): Promise<void> {
+  let target: { kind: 'thread' | 'channel'; id: string } | undefined
+  let filePath: string | undefined
+  const prompt: string[] = []
+  let parsingOptions = true
+  for (let index = 1; index < commandArgs.length; index++) {
+    const argument = commandArgs[index]!
+    if (parsingOptions && argument === '--') {
+      parsingOptions = false
+      continue
+    }
+    if (parsingOptions && (argument === '--help' || argument === '-h')) {
+      console.log('Usage: cordex send --thread <thread-id> [--file <path>] [--] <prompt>')
+      return
+    }
+    if (parsingOptions && (argument === '--thread' || argument === '--channel')) {
+      if (target) throw new Error('Specify exactly one of --thread or --channel')
+      const id = commandArgs[++index]
+      if (!id) throw new Error(`${argument} requires a Discord ID`)
+      target = { kind: argument === '--thread' ? 'thread' : 'channel', id }
+      continue
+    }
+    if (parsingOptions && argument === '--file') {
+      if (filePath) throw new Error('Specify --file at most once')
+      const value = commandArgs[++index]
+      if (!value) throw new Error('--file requires a path')
+      filePath = path.resolve(value)
+      continue
+    }
+    if (parsingOptions && argument.startsWith('-')) {
+      throw new Error(`Unknown send option: ${argument}; use -- before prompt text beginning with -`)
+    }
+    prompt.push(argument)
+  }
+  if (!target) throw new Error('Usage: cordex send --thread <thread-id> [--file <path>] <prompt>')
+  if (target.kind === 'channel') {
+    throw new Error(
+      'Safe channel session creation is not supported yet; use --thread with an existing Cordex thread',
+    )
+  }
+  const text = prompt.join(' ').trim()
+  if (!text) throw new Error('cordex send requires a non-empty prompt')
+  const result = await sendCordexDaemonPrompt({
+    requestId: randomUUID(),
+    target,
+    prompt: text,
+    ...(filePath ? { filePath } : {}),
+  })
+  console.log(`Prompt accepted for Discord thread ${result.threadId}.`)
+}
+
 async function start(verbose = false): Promise<void> {
   const config = await loadConfig()
   const releaseRuntimeLock = await acquireRuntimeLock()
@@ -122,24 +183,59 @@ async function start(verbose = false): Promise<void> {
   }
   const codex = new CodexAppServer({ verbose })
   const bot = new CordexDiscordBot(config, state, codex, { verbose })
-  let stopping = false
-  const stop = async () => {
-    if (stopping) return
-    stopping = true
-    try {
-      await bot.stop()
-      process.exitCode = 0
-    } finally {
-      await releaseRuntimeLock()
-    }
+  let ipc: CordexDaemonIpcServer | undefined
+  let shutdown: Promise<void> | undefined
+  const stop = (setExitCode: boolean): Promise<void> => {
+    shutdown ??= (async () => {
+      try {
+        await ipc?.close()
+        await bot.stop()
+        if (setExitCode) process.exitCode = 0
+      } finally {
+        await releaseRuntimeLock()
+      }
+    })()
+    return shutdown
   }
-  process.once('SIGINT', () => void stop())
-  process.once('SIGTERM', () => void stop())
+  process.once('SIGINT', () => void stop(true))
+  process.once('SIGTERM', () => void stop(true))
   try {
     await bot.start()
+    if (shutdown) {
+      await shutdown
+      return
+    }
+    const startedIpc = await startCordexDaemonIpc({
+      home: getCordexHome(),
+      async onSend(request) {
+        if (request.target.kind === 'channel') {
+          throw new Error(
+            'Safe channel session creation is not supported yet; use an existing Cordex thread',
+          )
+        }
+        const prepared = await materializeCordexDaemonInput({
+          prompt: request.prompt,
+          ...(request.filePath ? { filePath: request.filePath } : {}),
+          home: getCordexHome(),
+        })
+        return bot.enqueueDaemonPrompt({
+          threadId: request.target.id,
+          requestId: request.requestId,
+          input: prepared.input,
+          displayText: prepared.displayText,
+        })
+      },
+    })
+    if (shutdown) {
+      await startedIpc.close()
+      await shutdown
+      return
+    }
+    ipc = startedIpc
   } catch (error) {
-    await bot.stop().catch(() => undefined)
-    await releaseRuntimeLock()
+    const shutdownAlreadyRequested = shutdown !== undefined
+    await stop(false).catch(() => undefined)
+    if (shutdownAlreadyRequested) return
     throw error
   }
   console.log(`Cordex connected. Guild ${config.guildId}.`)
@@ -148,6 +244,10 @@ async function start(verbose = false): Promise<void> {
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2)
+  if (args[0] === 'send') {
+    await send(args)
+    return
+  }
   const verbose = args.includes('--verbose') || args.includes('-v') || process.env.CORDEX_VERBOSE === '1'
   const projectsDirectoryIndex = args.indexOf('--projects-dir')
   if (projectsDirectoryIndex >= 0) {

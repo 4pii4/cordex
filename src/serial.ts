@@ -17,4 +17,10 @@ export class KeyedSerialQueue {
       if (this.tails.get(key) === tail) this.tails.delete(key)
     }
   }
+
+  async drain(): Promise<void> {
+    while (this.tails.size > 0) {
+      await Promise.all([...this.tails.values()].map((tail) => tail.catch(() => undefined)))
+    }
+  }
 }

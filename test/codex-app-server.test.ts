@@ -449,6 +449,21 @@ test('Codex app-server supports reversible archive lifecycle and archived thread
       searchTerm: 'fixture',
       archived: true,
     })
+
+    assert.deepEqual(
+      (await codex.listAllThreads({ searchTerm: 'paginated lifecycle' }))
+        .map((thread) => thread.id),
+      ['thread-page-1', 'thread-page-2'],
+    )
+    assert.deepEqual(await codex.request('fixture/threadListParams', {}), {
+      cursor: 'fixture-next-page',
+      limit: 100,
+      sortKey: 'updated_at',
+      sortDirection: 'desc',
+      cwd: null,
+      searchTerm: 'paginated lifecycle',
+      archived: false,
+    })
   } finally {
     await codex.close()
   }

@@ -146,6 +146,21 @@ cordex project remove DISCORD_CHANNEL_ID
 Discord `/remove-project` deletes the selected managed Discord channel after its
 safety checks.
 
+While `cordex start` is running, another local process owned by the same operating-
+system user can durably submit a prompt to an existing Cordex session thread:
+
+```bash
+cordex send --thread DISCORD_THREAD_ID "Run the focused tests"
+cordex send --thread DISCORD_THREAD_ID --file ./failure.log "Diagnose this failure"
+```
+
+The daemon reads `--file` itself and accepts UTF-8 text plus PNG, JPEG, GIF, and
+WebP images within the same limits as Discord input. It listens on a mode-`0600`
+Unix socket under `~/.cordex/ipc` and authenticates each request with a per-start
+mode-`0600` token. Accepted prompts enter the durable direct-delivery ledger before
+the CLI reports success. Safe channel or session creation is not yet exposed by
+this boundary; use `--thread` with an existing Cordex thread.
+
 For detailed backend logging, run:
 
 ```bash
@@ -165,7 +180,7 @@ Slash commands are registered in the configured Discord server.
 | Sessions | `/new-session`, `/resume`, `/rename`, `/fork`, `/fork-subagent`, `/btw`, `/abort`, `/archive`, `/compact`, `/last-sessions`, `/session-id`, `/status` |
 | Models and runtime | `/model`, `/model-variant`, `/unset-model-override`, `/mode`, `/fast`, `/permissions`, `/add-dir`, `/verbosity`, `/context-usage` |
 | Goals | `/goal`, `/clear-goal` |
-| Git and worktrees | `/diff`, `/review`, `/rollback`, `/new-worktree`, `/merge-worktree`, `/toggle-worktrees`, `/worktrees` |
+| Git and worktrees | `/diff`, `/review`, `/rollback`, `/new-worktree`, `/merge-worktree`, `/delete-worktree`, `/toggle-worktrees`, `/worktrees` |
 | Automation | `/queue`, `/clear-queue`, `/schedule`, `/tasks`, `/cancel-task` |
 | Codex services | `/skill`, `/skills`, `/mcp`, `/mcp-status`, `/mcp-login`, `/auth-status`, `/rate-limits`, `/account-usage`, `/login` |
 | Host control | `/run-shell-command`, `!command`, `/yolo` |
@@ -184,6 +199,13 @@ optional prompt; Cordex resolves the skill path from Codex metadata at submissio
 `/tasks` includes bounded Run now, Cancel, and Delete controls. Scheduled occurrences
 are persisted before execution, retain stable delivery IDs across restart, and do not
 reappear after a concurrent cancellation or deletion.
+
+Standard MCP `form` elicitations render in Discord with validated strings, dates,
+URLs, numbers, booleans, and single- or multi-select enums. Empty approval forms can
+offer session or permanent persistence when Codex explicitly advertises those choices.
+MCP URL elicitations require credential-free HTTPS links, with stricter ChatGPT-host
+validation for Codex Apps. Arbitrary `openai/form` schemas remain disabled and are
+declined rather than rendered approximately.
 
 Replies include a bounded quote and the referenced Discord author. Text
 attachments use a MIME allowlist; PNG, JPEG, GIF, and WebP images are downloaded
@@ -215,6 +237,10 @@ recorded until that acceptance is confirmed. Scheduled tasks found in `running`
 state after restart retry the same occurrence ID instead of creating a duplicate.
 Completed Discord output and run footers use a separate durable outbox, so a partial
 send or bot restart resumes only missing chunks and does not block the next queued turn.
+Archive and resume operations persist lifecycle intents before mutating Codex and
+reconcile those intents against complete active and archived thread listings on
+startup. A crash after either side accepts the operation therefore converges instead
+of leaving Discord state permanently split from Codex.
 
 At startup, Cordex refetches the Discord messages backing `. queue` entries so
 offline edits replace the stored input and offline deletions remove it. Transient
@@ -226,6 +252,10 @@ before waiting behind earlier messages, `/abort` stays on a priority path, and a
 deleted thread is tombstoned and interrupted immediately so blocked preprocessing
 cannot dispatch work after deletion. Startup also removes persisted sessions whose
 Discord thread disappeared while Cordex was offline.
+During shutdown, Cordex stops admitting new Discord and local-daemon requests, drains
+already accepted interactions, scheduled work, Codex requests and notifications,
+state/outbox queues, and deletion cleanup, then closes Codex and Discord. Concurrent
+shutdown signals share the same drain instead of racing teardown.
 
 `/yolo` switches the selected scope to approval-free `danger-full-access` mode.
 `/run-shell-command` and the `!command` shortcut execute through the host shell in
@@ -238,7 +268,11 @@ and extra workspace roots without claiming ownership of its worktree. Worktree c
 refreshes configured remotes, prefers a strictly newer remote ref, and initializes
 submodules recursively. `/merge-worktree` blocks while another live or starting session
 shares the checkout; successful and no-op merges leave the session checkout detached at
-the merged target commit.
+the merged target commit. `/delete-worktree` then removes only that exact registered,
+clean, merged checkout after confirming its feature branch is gone and no active,
+archived, or starting session still references it. A persisted removal intent lets
+startup finish an interruption between Git deletion and the final state update, after
+which the session reloads at the mapped project root.
 
 ## Configuration
 
