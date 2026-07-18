@@ -597,6 +597,405 @@ test('Codex app-server exposes native skill input and the typed skills/list prot
   }
 })
 
+test('Codex app-server exposes stable skill, hook, plugin, marketplace, and account RPCs', async () => {
+  const codex = new CodexAppServer({ command: process.execPath, args: [fixture] })
+  const pluginInterface = {
+    displayName: 'Fixture Plugin',
+    shortDescription: 'Fixture short description',
+    longDescription: 'Fixture long description',
+    developerName: 'Fixture Developer',
+    category: 'developer-tools',
+    capabilities: ['tools'],
+    websiteUrl: 'https://example.test/plugin',
+    privacyPolicyUrl: null,
+    termsOfServiceUrl: null,
+    defaultPrompt: ['Run fixture'],
+    brandColor: '#123456',
+    composerIcon: '/tmp/fixture/icon.png',
+    composerIconUrl: null,
+    logo: '/tmp/fixture/logo.png',
+    logoDark: null,
+    logoUrl: null,
+    logoUrlDark: null,
+    screenshots: ['/tmp/fixture/screenshot.png'],
+    screenshotUrls: [],
+  }
+  const pluginSummary = {
+    id: 'fixture-plugin-id',
+    remotePluginId: 'fixture-remote-id',
+    version: '1.2.3',
+    localVersion: '1.2.2',
+    name: 'fixture-plugin',
+    shareContext: {
+      remotePluginId: 'fixture-remote-id',
+      remoteVersion: '1.2.3',
+      discoverability: 'PRIVATE',
+      shareUrl: 'https://example.test/share',
+      creatorAccountUserId: 'fixture-user',
+      creatorName: 'Fixture User',
+      sharePrincipals: [
+        { principalType: 'workspace', principalId: 'workspace-1', role: 'reader', name: 'Workspace' },
+      ],
+    },
+    source: {
+      type: 'git',
+      url: 'https://example.test/plugin.git',
+      path: 'plugins/fixture',
+      refName: 'main',
+      sha: '0123456789abcdef',
+    },
+    installed: true,
+    enabled: true,
+    installPolicy: 'AVAILABLE',
+    installPolicySource: 'WORKSPACE_SETTING',
+    authPolicy: 'ON_USE',
+    availability: 'AVAILABLE',
+    interface: pluginInterface,
+    keywords: ['fixture', 'testing'],
+  }
+  const marketplace = {
+    name: 'fixture-marketplace',
+    path: '/tmp/fixture-marketplace',
+    interface: { displayName: 'Fixture Marketplace' },
+    plugins: [pluginSummary],
+  }
+  const appSummary = {
+    id: 'fixture-app',
+    name: 'Fixture App',
+    description: null,
+    installUrl: 'https://example.test/install',
+    category: 'testing',
+  }
+  const pluginDetail = {
+    marketplaceName: 'fixture-marketplace',
+    marketplacePath: '/tmp/fixture-marketplace',
+    summary: pluginSummary,
+    shareUrl: 'https://example.test/share',
+    description: 'Fixture plugin detail',
+    skills: [
+      {
+        name: 'fixture-skill',
+        description: 'Fixture skill',
+        shortDescription: null,
+        interface: null,
+        path: '/tmp/fixture/SKILL.md',
+        enabled: true,
+      },
+    ],
+    hooks: [{ key: 'fixture-hook', eventName: 'preToolUse' }],
+    apps: [appSummary],
+    appTemplates: [
+      {
+        templateId: 'fixture-template',
+        name: 'Fixture Template',
+        description: null,
+        category: null,
+        canonicalConnectorId: null,
+        logoUrl: null,
+        logoUrlDark: null,
+        materializedAppIds: ['fixture-app'],
+        reason: null,
+      },
+    ],
+    mcpServers: ['fixture-mcp'],
+  }
+  const expectedCalls: Array<{ method: string; params: unknown; result: unknown }> = [
+    {
+      method: 'thread/inject_items',
+      params: { threadId: 'thread-1', items: [{ type: 'message', role: 'user' }, 'marker'] },
+      result: {},
+    },
+    {
+      method: 'skills/config/write',
+      params: { path: '/tmp/fixture/SKILL.md', enabled: false },
+      result: { effectiveEnabled: false },
+    },
+    {
+      method: 'skills/extraRoots/set',
+      params: { extraRoots: ['/tmp/skills-one', '/tmp/skills-two'] },
+      result: {},
+    },
+    {
+      method: 'hooks/list',
+      params: { cwds: [process.cwd()] },
+      result: {
+        data: [
+          {
+            cwd: process.cwd(),
+            hooks: [
+              {
+                key: 'fixture-hook',
+                eventName: 'preToolUse',
+                handlerType: 'command',
+                matcher: 'Bash',
+                command: 'echo fixture',
+                timeoutSec: 30,
+                statusMessage: null,
+                sourcePath: '/tmp/fixture/hooks.json',
+                source: 'project',
+                pluginId: null,
+                displayOrder: -1,
+                enabled: true,
+                isManaged: false,
+                currentHash: 'fixture-hash',
+                trustStatus: 'trusted',
+              },
+            ],
+            warnings: ['fixture warning'],
+            errors: [{ path: '/tmp/broken-hook', message: 'fixture error' }],
+          },
+        ],
+      },
+    },
+    {
+      method: 'plugin/list',
+      params: { cwds: [process.cwd()], marketplaceKinds: ['local'] },
+      result: {
+        marketplaces: [marketplace],
+        marketplaceLoadErrors: [],
+        featuredPluginIds: ['fixture-plugin-id'],
+      },
+    },
+    {
+      method: 'plugin/installed',
+      params: { cwds: null, installSuggestionPluginNames: ['fixture-plugin'] },
+      result: { marketplaces: [marketplace], marketplaceLoadErrors: [] },
+    },
+    {
+      method: 'plugin/read',
+      params: {
+        marketplacePath: '/tmp/fixture-marketplace',
+        pluginName: 'fixture-plugin',
+      },
+      result: { plugin: pluginDetail },
+    },
+    {
+      method: 'plugin/skill/read',
+      params: {
+        remoteMarketplaceName: 'fixture-marketplace',
+        remotePluginId: 'fixture-remote-id',
+        skillName: 'fixture-skill',
+      },
+      result: { contents: '# Fixture skill' },
+    },
+    {
+      method: 'plugin/install',
+      params: { remoteMarketplaceName: 'fixture-marketplace', pluginName: 'fixture-plugin' },
+      result: { authPolicy: 'ON_INSTALL', appsNeedingAuth: [appSummary] },
+    },
+    {
+      method: 'plugin/uninstall',
+      params: { pluginId: 'fixture-plugin-id' },
+      result: {},
+    },
+    {
+      method: 'marketplace/add',
+      params: {
+        source: 'https://example.test/marketplace.git',
+        refName: 'main',
+        sparsePaths: null,
+      },
+      result: {
+        marketplaceName: 'fixture-marketplace',
+        installedRoot: '/tmp/fixture-marketplace',
+        alreadyAdded: false,
+      },
+    },
+    {
+      method: 'marketplace/remove',
+      params: { marketplaceName: 'fixture-marketplace' },
+      result: {
+        marketplaceName: 'fixture-marketplace',
+        installedRoot: '/tmp/fixture-marketplace',
+      },
+    },
+    {
+      method: 'marketplace/upgrade',
+      params: { marketplaceName: null },
+      result: {
+        selectedMarketplaces: ['fixture-marketplace'],
+        upgradedRoots: ['/tmp/fixture-marketplace'],
+        errors: [{ marketplaceName: 'broken-marketplace', message: 'fixture failure' }],
+      },
+    },
+    { method: 'account/logout', params: undefined, result: {} },
+    {
+      method: 'account/workspaceMessages/read',
+      params: undefined,
+      result: {
+        featureEnabled: true,
+        messages: [
+          {
+            messageId: 'fixture-message',
+            messageType: 'announcement',
+            messageBody: 'Fixture announcement',
+            createdAt: -100,
+            archivedAt: null,
+          },
+        ],
+      },
+    },
+  ]
+
+  try {
+    await codex.request('fixture/threadStartParams', {})
+    codex.request = async (method, params) => {
+      const expected = expectedCalls.shift()
+      assert.ok(expected, `Unexpected Codex request ${method}`)
+      assert.equal(method, expected.method)
+      assert.deepEqual(params, expected.params)
+      return expected.result
+    }
+
+    await codex.injectThreadItems('thread-1', [{ type: 'message', role: 'user' }, 'marker'])
+    assert.deepEqual(await codex.writeSkillConfig({
+      path: '/tmp/fixture/SKILL.md',
+      enabled: false,
+    }), { effectiveEnabled: false })
+    await codex.setSkillsExtraRoots(['/tmp/skills-one', '/tmp/skills-two'])
+    assert.deepEqual(await codex.listHooks({ cwds: [process.cwd()] }), [
+      {
+        cwd: process.cwd(),
+        hooks: [
+          {
+            key: 'fixture-hook',
+            eventName: 'preToolUse',
+            handlerType: 'command',
+            matcher: 'Bash',
+            command: 'echo fixture',
+            timeoutSec: 30n,
+            statusMessage: null,
+            sourcePath: '/tmp/fixture/hooks.json',
+            source: 'project',
+            pluginId: null,
+            displayOrder: -1n,
+            enabled: true,
+            isManaged: false,
+            currentHash: 'fixture-hash',
+            trustStatus: 'trusted',
+          },
+        ],
+        warnings: ['fixture warning'],
+        errors: [{ path: '/tmp/broken-hook', message: 'fixture error' }],
+      },
+    ])
+    assert.deepEqual(await codex.listPlugins({
+      cwds: [process.cwd()],
+      marketplaceKinds: ['local'],
+    }), {
+      marketplaces: [marketplace],
+      marketplaceLoadErrors: [],
+      featuredPluginIds: ['fixture-plugin-id'],
+    })
+    assert.deepEqual(await codex.listInstalledPlugins({
+      cwds: null,
+      installSuggestionPluginNames: ['fixture-plugin'],
+    }), { marketplaces: [marketplace], marketplaceLoadErrors: [] })
+    assert.deepEqual(await codex.readPlugin({
+      marketplacePath: '/tmp/fixture-marketplace',
+      pluginName: 'fixture-plugin',
+    }), pluginDetail)
+    assert.equal(await codex.readPluginSkill({
+      remoteMarketplaceName: 'fixture-marketplace',
+      remotePluginId: 'fixture-remote-id',
+      skillName: 'fixture-skill',
+    }), '# Fixture skill')
+    assert.deepEqual(await codex.installPlugin({
+      remoteMarketplaceName: 'fixture-marketplace',
+      pluginName: 'fixture-plugin',
+    }), { authPolicy: 'ON_INSTALL', appsNeedingAuth: [appSummary] })
+    await codex.uninstallPlugin('fixture-plugin-id')
+    assert.deepEqual(await codex.addMarketplace({
+      source: 'https://example.test/marketplace.git',
+      refName: 'main',
+      sparsePaths: null,
+    }), {
+      marketplaceName: 'fixture-marketplace',
+      installedRoot: '/tmp/fixture-marketplace',
+      alreadyAdded: false,
+    })
+    assert.deepEqual(await codex.removeMarketplace('fixture-marketplace'), {
+      marketplaceName: 'fixture-marketplace',
+      installedRoot: '/tmp/fixture-marketplace',
+    })
+    assert.deepEqual(await codex.upgradeMarketplaces(), {
+      selectedMarketplaces: ['fixture-marketplace'],
+      upgradedRoots: ['/tmp/fixture-marketplace'],
+      errors: [{ marketplaceName: 'broken-marketplace', message: 'fixture failure' }],
+    })
+    await codex.logoutAccount()
+    assert.deepEqual(await codex.getAccountWorkspaceMessages(), {
+      featureEnabled: true,
+      messages: [
+        {
+          messageId: 'fixture-message',
+          messageType: 'announcement',
+          messageBody: 'Fixture announcement',
+          createdAt: -100,
+          archivedAt: null,
+        },
+      ],
+    })
+    assert.equal(expectedCalls.length, 0)
+  } finally {
+    await codex.close()
+  }
+})
+
+test('Codex app-server rejects malformed stable management responses', async () => {
+  const codex = new CodexAppServer({ command: process.execPath, args: [fixture] })
+  try {
+    await codex.request('fixture/threadStartParams', {})
+
+    await assert.rejects(
+      codex.writeSkillConfig(
+        { enabled: true } as Parameters<CodexAppServer['writeSkillConfig']>[0],
+      ),
+      /exactly one of path or name/,
+    )
+    await assert.rejects(
+      codex.readPlugin(
+        { pluginName: 'fixture' } as Parameters<CodexAppServer['readPlugin']>[0],
+      ),
+      /exactly one of marketplacePath or remoteMarketplaceName/,
+    )
+
+    codex.request = async () => ({ effectiveEnabled: 'false' })
+    await assert.rejects(
+      codex.writeSkillConfig({ name: 'fixture', enabled: false }),
+      /skills\/config\/write omitted effectiveEnabled/,
+    )
+
+    codex.request = async () => ({
+      data: [{ cwd: process.cwd(), hooks: [{ enabled: true, isManaged: false }], warnings: [], errors: [] }],
+    })
+    await assert.rejects(codex.listHooks(), /hooks\/list hook returned an invalid key/)
+
+    codex.request = async () => ({ marketplaces: [], marketplaceLoadErrors: [] })
+    await assert.rejects(codex.listPlugins(), /plugin\/list featuredPluginIds/)
+
+    codex.request = async () => ({ plugin: { marketplaceName: 'fixture' } })
+    await assert.rejects(
+      codex.readPlugin({ remoteMarketplaceName: 'fixture-marketplace', pluginName: 'fixture' }),
+      /plugin\/read returned invalid/,
+    )
+
+    codex.request = async () => ({ featureEnabled: true, messages: [{
+      messageId: 'fixture',
+      messageType: 'headline',
+      messageBody: 'Fixture',
+      createdAt: Number.MAX_SAFE_INTEGER + 1,
+      archivedAt: null,
+    }] })
+    await assert.rejects(
+      codex.getAccountWorkspaceMessages(),
+      /account workspace message createdAt returned an invalid timestamp/,
+    )
+  } finally {
+    await codex.close()
+  }
+})
+
 test('Codex app-server rejects failed RPCs and reinitializes a replacement child', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'cordex-app-server-restart-'))
   const statePath = path.join(directory, 'state.json')

@@ -22,6 +22,8 @@ import {
 } from './config.js'
 import {
   materializeCordexDaemonInput,
+  maxCordexDaemonAttachmentFiles,
+  preflightCordexDaemonFilePaths,
   sendCordexDaemonPrompt,
   startCordexDaemonIpc,
   type CordexDaemonIpcServer,
@@ -44,7 +46,7 @@ Commands:
 
 Options:
   --projects-dir <path>        Override the projects directory
-  --file <path>                Attach a UTF-8 text file or supported image
+  --file <path>                Attach up to 10 UTF-8 text files or supported images
   --verbose, -v                Enable verbose backend logging
   --help, -h                   Show this help
   --version, -V                Show the Cordex version`
@@ -115,7 +117,7 @@ async function doctor(): Promise<void> {
 
 async function send(commandArgs: string[]): Promise<void> {
   let target: { kind: 'thread' | 'channel'; id: string } | undefined
-  let filePath: string | undefined
+  const filePaths: string[] = []
   const prompt: string[] = []
   let parsingOptions = true
   for (let index = 1; index < commandArgs.length; index++) {
@@ -125,7 +127,7 @@ async function send(commandArgs: string[]): Promise<void> {
       continue
     }
     if (parsingOptions && (argument === '--help' || argument === '-h')) {
-      console.log('Usage: cordex send --thread <thread-id> [--file <path>] [--] <prompt>')
+      console.log('Usage: cordex send --thread <thread-id> [--file <path> ...] [--] <prompt>')
       return
     }
     if (parsingOptions && (argument === '--thread' || argument === '--channel')) {
@@ -136,10 +138,12 @@ async function send(commandArgs: string[]): Promise<void> {
       continue
     }
     if (parsingOptions && argument === '--file') {
-      if (filePath) throw new Error('Specify --file at most once')
       const value = commandArgs[++index]
       if (!value) throw new Error('--file requires a path')
-      filePath = path.resolve(value)
+      filePaths.push(path.resolve(value))
+      if (filePaths.length > maxCordexDaemonAttachmentFiles) {
+        throw new Error(`Specify --file at most ${maxCordexDaemonAttachmentFiles} times`)
+      }
       continue
     }
     if (parsingOptions && argument.startsWith('-')) {
@@ -147,7 +151,7 @@ async function send(commandArgs: string[]): Promise<void> {
     }
     prompt.push(argument)
   }
-  if (!target) throw new Error('Usage: cordex send --thread <thread-id> [--file <path>] <prompt>')
+  if (!target) throw new Error('Usage: cordex send --thread <thread-id> [--file <path> ...] <prompt>')
   if (target.kind === 'channel') {
     throw new Error(
       'Safe channel session creation is not supported yet; use --thread with an existing Cordex thread',
@@ -155,11 +159,12 @@ async function send(commandArgs: string[]): Promise<void> {
   }
   const text = prompt.join(' ').trim()
   if (!text) throw new Error('cordex send requires a non-empty prompt')
+  const validatedFilePaths = await preflightCordexDaemonFilePaths(filePaths)
   const result = await sendCordexDaemonPrompt({
     requestId: randomUUID(),
     target,
     prompt: text,
-    ...(filePath ? { filePath } : {}),
+    ...(validatedFilePaths.length > 0 ? { filePaths: validatedFilePaths } : {}),
   })
   console.log(`Prompt accepted for Discord thread ${result.threadId}.`)
 }
@@ -215,7 +220,7 @@ async function start(verbose = false): Promise<void> {
         }
         const prepared = await materializeCordexDaemonInput({
           prompt: request.prompt,
-          ...(request.filePath ? { filePath: request.filePath } : {}),
+          ...(request.filePaths ? { filePaths: request.filePaths } : {}),
           home: getCordexHome(),
         })
         return bot.enqueueDaemonPrompt({

@@ -152,14 +152,20 @@ system user can durably submit a prompt to an existing Cordex session thread:
 ```bash
 cordex send --thread DISCORD_THREAD_ID "Run the focused tests"
 cordex send --thread DISCORD_THREAD_ID --file ./failure.log "Diagnose this failure"
+cordex send --thread DISCORD_THREAD_ID --file ./error.log --file ./screenshot.png "Investigate these artifacts"
 ```
 
-The daemon reads `--file` itself and accepts UTF-8 text plus PNG, JPEG, GIF, and
-WebP images within the same limits as Discord input. It listens on a mode-`0600`
-Unix socket under `~/.cordex/ipc` and authenticates each request with a per-start
-mode-`0600` token. Accepted prompts enter the durable direct-delivery ledger before
-the CLI reports success. Safe channel or session creation is not yet exposed by
-this boundary; use `--thread` with an existing Cordex thread.
+The daemon reads up to ten repeated `--file` values itself and accepts mixed UTF-8
+text plus PNG, JPEG, GIF, and WebP images within the same per-file and aggregate
+limits as Discord input. Byte-identical images are sent to Codex once. It listens
+on a mode-`0600` Unix socket under `~/.cordex/ipc` and authenticates each request
+with a per-start mode-`0600` token. Accepted prompts enter the durable direct-
+delivery ledger before the CLI reports success. Safe channel or session creation
+is not yet exposed by this boundary; use `--thread` with an existing Cordex thread.
+
+Inside an existing Cordex thread, a message beginning with a mention of another
+Discord user is stored as passive model context without starting or steering a
+Codex turn. The next real prompt can use that user-to-user discussion.
 
 For detailed backend logging, run:
 
@@ -182,8 +188,11 @@ Slash commands are registered in the configured Discord server.
 | Goals | `/goal`, `/clear-goal` |
 | Git and worktrees | `/diff`, `/review`, `/rollback`, `/new-worktree`, `/merge-worktree`, `/delete-worktree`, `/toggle-worktrees`, `/worktrees` |
 | Automation | `/queue`, `/clear-queue`, `/schedule`, `/tasks`, `/cancel-task` |
-| Codex services | `/skill`, `/skills`, `/mcp`, `/mcp-status`, `/mcp-login`, `/auth-status`, `/rate-limits`, `/account-usage`, `/login` |
+| Codex services | `/skill`, `/skills`, `/skill-toggle`, `/skill-roots`, `/mcp`, `/mcp-status`, `/mcp-login`, `/auth-status`, `/rate-limits`, `/account-usage`, `/login` |
 | Host control | `/run-shell-command`, `!command`, `/yolo` |
+
+`/diff` renders small patches inline and attaches the complete binary-capable
+patch when it exceeds Discord message limits.
 
 Messages ending in `. queue` are queued behind the active turn. Removing that
 suffix in an edit dequeues the message. In an existing session, punctuation
@@ -196,6 +205,8 @@ tasks, plus any prompt delivery still awaiting recovery, must be resolved first.
 `/rename` keeps the Discord and Codex titles in sync.
 `/skill` invokes an enabled skill from the current session directory and accepts an
 optional prompt; Cordex resolves the skill path from Codex metadata at submission time.
+`/skill-toggle` updates a skill's enabled state through Codex configuration, while
+`/skill-roots` replaces the runtime-only extra skill discovery directories.
 `/tasks` includes bounded Run now, Cancel, and Delete controls. Scheduled occurrences
 are persisted before execution, retain stable delivery IDs across restart, and do not
 reappear after a concurrent cancellation or deletion.
@@ -303,7 +314,7 @@ A representative configuration is:
 Project mappings are normally managed by Cordex. Optional `defaultModel` and
 `defaultEffort` fields can set initial preferences; available models come from
 the installed Codex runtime. Valid configured effort values are
-`minimal`, `low`, `medium`, `high`, `xhigh`, and `ultra`.
+`minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`.
 `approvalTimeoutMinutes` controls how long Discord approval buttons remain active
 before Cordex denies the request and lets Codex continue; it defaults to 10.
 

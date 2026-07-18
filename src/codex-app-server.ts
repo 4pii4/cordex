@@ -7,6 +7,7 @@ import type {
   CodexThreadSummary,
   DynamicToolSpec,
   JsonObject,
+  JsonValue,
   ReasoningEffort,
   SandboxMode,
   ServerNotification,
@@ -310,6 +311,273 @@ export type CodexSkillsListResponse = {
   data: CodexSkillsListEntry[]
 }
 
+export type CodexSkillConfigWriteOptions =
+  | { path: string; name?: never; enabled: boolean }
+  | { name: string; path?: never; enabled: boolean }
+
+export type CodexSkillConfigWriteResult = {
+  effectiveEnabled: boolean
+}
+
+export type CodexHookEventName =
+  | 'preToolUse'
+  | 'permissionRequest'
+  | 'postToolUse'
+  | 'preCompact'
+  | 'postCompact'
+  | 'sessionStart'
+  | 'userPromptSubmit'
+  | 'subagentStart'
+  | 'subagentStop'
+  | 'stop'
+
+export type CodexHookHandlerType = 'command' | 'prompt' | 'agent'
+
+export type CodexHookSource =
+  | 'system'
+  | 'user'
+  | 'project'
+  | 'mdm'
+  | 'sessionFlags'
+  | 'plugin'
+  | 'cloudRequirements'
+  | 'cloudManagedConfig'
+  | 'legacyManagedConfigFile'
+  | 'legacyManagedConfigMdm'
+  | 'unknown'
+
+export type CodexHookTrustStatus = 'managed' | 'untrusted' | 'trusted' | 'modified'
+
+export type CodexHookMetadata = {
+  key: string
+  eventName: CodexHookEventName
+  handlerType: CodexHookHandlerType
+  matcher: string | null
+  command: string | null
+  timeoutSec: bigint
+  statusMessage: string | null
+  sourcePath: string
+  source: CodexHookSource
+  pluginId: string | null
+  displayOrder: bigint
+  enabled: boolean
+  isManaged: boolean
+  currentHash: string
+  trustStatus: CodexHookTrustStatus
+}
+
+export type CodexHooksListEntry = {
+  cwd: string
+  hooks: CodexHookMetadata[]
+  warnings: string[]
+  errors: CodexSkillErrorInfo[]
+}
+
+export type CodexHooksListParams = {
+  cwds?: string[]
+}
+
+export type CodexPluginMarketplaceKind =
+  | 'local'
+  | 'vertical'
+  | 'workspace-directory'
+  | 'shared-with-me'
+  | 'created-by-me-remote'
+
+export type CodexPluginSource =
+  | { type: 'local'; path: string }
+  | { type: 'git'; url: string; path: string | null; refName: string | null; sha: string | null }
+  | { type: 'npm'; package: string; version: string | null; registry: string | null }
+  | { type: 'remote' }
+
+export type CodexPluginAvailability = 'AVAILABLE' | 'DISABLED_BY_ADMIN'
+export type CodexPluginInstallPolicy = 'NOT_AVAILABLE' | 'AVAILABLE' | 'INSTALLED_BY_DEFAULT'
+export type CodexPluginInstallPolicySource = 'WORKSPACE_SETTING' | 'IMPLICIT_CANONICAL_APP'
+export type CodexPluginAuthPolicy = 'ON_INSTALL' | 'ON_USE'
+export type CodexPluginShareDiscoverability = 'LISTED' | 'UNLISTED' | 'PRIVATE'
+export type CodexPluginSharePrincipalType = 'user' | 'group' | 'workspace'
+export type CodexPluginSharePrincipalRole = 'reader' | 'editor' | 'owner'
+
+export type CodexPluginSharePrincipal = {
+  principalType: CodexPluginSharePrincipalType
+  principalId: string
+  role: CodexPluginSharePrincipalRole
+  name: string
+}
+
+export type CodexPluginShareContext = {
+  remotePluginId: string
+  remoteVersion: string | null
+  discoverability: CodexPluginShareDiscoverability | null
+  shareUrl: string | null
+  creatorAccountUserId: string | null
+  creatorName: string | null
+  sharePrincipals: CodexPluginSharePrincipal[] | null
+}
+
+export type CodexPluginInterface = {
+  displayName: string | null
+  shortDescription: string | null
+  longDescription: string | null
+  developerName: string | null
+  category: string | null
+  capabilities: string[]
+  websiteUrl: string | null
+  privacyPolicyUrl: string | null
+  termsOfServiceUrl: string | null
+  defaultPrompt: string[] | null
+  brandColor: string | null
+  composerIcon: string | null
+  composerIconUrl: string | null
+  logo: string | null
+  logoDark: string | null
+  logoUrl: string | null
+  logoUrlDark: string | null
+  screenshots: string[]
+  screenshotUrls: string[]
+}
+
+export type CodexPluginSummary = {
+  id: string
+  remotePluginId: string | null
+  version: string | null
+  localVersion: string | null
+  name: string
+  shareContext: CodexPluginShareContext | null
+  source: CodexPluginSource
+  installed: boolean
+  enabled: boolean
+  installPolicy: CodexPluginInstallPolicy
+  installPolicySource: CodexPluginInstallPolicySource | null
+  authPolicy: CodexPluginAuthPolicy
+  availability: CodexPluginAvailability
+  interface: CodexPluginInterface | null
+  keywords: string[]
+}
+
+export type CodexPluginMarketplaceEntry = {
+  name: string
+  path: string | null
+  interface: { displayName: string | null } | null
+  plugins: CodexPluginSummary[]
+}
+
+export type CodexMarketplaceLoadError = {
+  marketplacePath: string
+  message: string
+}
+
+export type CodexPluginListOptions = {
+  cwds?: string[] | null
+  marketplaceKinds?: CodexPluginMarketplaceKind[] | null
+}
+
+export type CodexPluginListResult = {
+  marketplaces: CodexPluginMarketplaceEntry[]
+  marketplaceLoadErrors: CodexMarketplaceLoadError[]
+  featuredPluginIds: string[]
+}
+
+export type CodexPluginInstalledOptions = {
+  cwds?: string[] | null
+  installSuggestionPluginNames?: string[] | null
+}
+
+export type CodexPluginInstalledResult = Omit<CodexPluginListResult, 'featuredPluginIds'>
+
+export type CodexPluginLocator =
+  | { marketplacePath: string; remoteMarketplaceName?: never; pluginName: string }
+  | { remoteMarketplaceName: string; marketplacePath?: never; pluginName: string }
+
+export type CodexPluginSkillLocator = {
+  remoteMarketplaceName: string
+  remotePluginId: string
+  skillName: string
+}
+
+export type CodexAppSummary = {
+  id: string
+  name: string
+  description: string | null
+  installUrl: string | null
+  category: string | null
+}
+
+export type CodexAppTemplateSummary = {
+  templateId: string
+  name: string
+  description: string | null
+  category: string | null
+  canonicalConnectorId: string | null
+  logoUrl: string | null
+  logoUrlDark: string | null
+  materializedAppIds: string[]
+  reason: 'NOT_CONFIGURED_FOR_WORKSPACE' | 'NO_ACTIVE_WORKSPACE' | null
+}
+
+export type CodexPluginSkillSummary = {
+  name: string
+  description: string
+  shortDescription: string | null
+  interface: CodexSkillInterface | null
+  path: string | null
+  enabled: boolean
+}
+
+export type CodexPluginDetail = {
+  marketplaceName: string
+  marketplacePath: string | null
+  summary: CodexPluginSummary
+  shareUrl: string | null
+  description: string | null
+  skills: CodexPluginSkillSummary[]
+  hooks: Array<{ key: string; eventName: CodexHookEventName }>
+  apps: CodexAppSummary[]
+  appTemplates: CodexAppTemplateSummary[]
+  mcpServers: string[]
+}
+
+export type CodexPluginInstallResult = {
+  authPolicy: CodexPluginAuthPolicy
+  appsNeedingAuth: CodexAppSummary[]
+}
+
+export type CodexMarketplaceAddOptions = {
+  source: string
+  refName?: string | null
+  sparsePaths?: string[] | null
+}
+
+export type CodexMarketplaceAddResult = {
+  marketplaceName: string
+  installedRoot: string
+  alreadyAdded: boolean
+}
+
+export type CodexMarketplaceRemoveResult = {
+  marketplaceName: string
+  installedRoot: string | null
+}
+
+export type CodexMarketplaceUpgradeResult = {
+  selectedMarketplaces: string[]
+  upgradedRoots: string[]
+  errors: Array<{ marketplaceName: string; message: string }>
+}
+
+export type CodexWorkspaceMessage = {
+  messageId: string
+  messageType: 'headline' | 'announcement' | 'unknown'
+  messageBody: string
+  createdAt: number | null
+  archivedAt: number | null
+}
+
+export type CodexWorkspaceMessagesResult = {
+  featureEnabled: boolean
+  messages: CodexWorkspaceMessage[]
+}
+
 function parseThreadTurns(value: unknown): CodexThreadTurn[] {
   if (!Array.isArray(value)) return []
   return value.flatMap((turnValue) => {
@@ -433,6 +701,548 @@ function parseSkillsListResponse(value: unknown): CodexSkillsListResponse {
         }),
       }
     }),
+  }
+}
+
+function requiredString(record: JsonObject, key: string, label: string): string {
+  const value = record[key]
+  if (typeof value !== 'string') throw new Error(`Codex ${label} returned an invalid ${key}`)
+  return value
+}
+
+function nullableString(record: JsonObject, key: string, label: string): string | null {
+  const value = record[key]
+  if (value === null) return null
+  if (typeof value !== 'string') throw new Error(`Codex ${label} returned an invalid ${key}`)
+  return value
+}
+
+function stringArray(value: unknown, label: string): string[] {
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string')) {
+    throw new Error(`Codex ${label} returned an invalid string array`)
+  }
+  return value
+}
+
+function enumString<T extends string>(
+  value: unknown,
+  allowed: readonly T[],
+  label: string,
+): T {
+  if (typeof value !== 'string' || !allowed.includes(value as T)) {
+    throw new Error(`Codex ${label} returned an invalid enum value`)
+  }
+  return value as T
+}
+
+function protocolBigInt(value: unknown, label: string): bigint {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)) {
+    throw new Error(`Codex ${label} returned an invalid integer`)
+  }
+  return BigInt(value)
+}
+
+function protocolUnsignedBigInt(value: unknown, label: string): bigint {
+  const parsed = protocolBigInt(value, label)
+  if (parsed < 0n) throw new Error(`Codex ${label} returned an invalid unsigned integer`)
+  return parsed
+}
+
+function nullableTimestamp(value: unknown, label: string): number | null {
+  if (value === null) return null
+  if (typeof value !== 'number' || !Number.isSafeInteger(value)) {
+    throw new Error(`Codex ${label} returned an invalid timestamp`)
+  }
+  return value
+}
+
+const hookEventNames = [
+  'preToolUse',
+  'permissionRequest',
+  'postToolUse',
+  'preCompact',
+  'postCompact',
+  'sessionStart',
+  'userPromptSubmit',
+  'subagentStart',
+  'subagentStop',
+  'stop',
+] as const satisfies readonly CodexHookEventName[]
+
+const hookSources = [
+  'system',
+  'user',
+  'project',
+  'mdm',
+  'sessionFlags',
+  'plugin',
+  'cloudRequirements',
+  'cloudManagedConfig',
+  'legacyManagedConfigFile',
+  'legacyManagedConfigMdm',
+  'unknown',
+] as const satisfies readonly CodexHookSource[]
+
+function parseHookMetadata(value: unknown): CodexHookMetadata {
+  const hook = asRecord(value, 'hooks/list hook')
+  if (typeof hook.enabled !== 'boolean' || typeof hook.isManaged !== 'boolean') {
+    throw new Error('Codex hooks/list returned invalid hook flags')
+  }
+  return {
+    key: requiredString(hook, 'key', 'hooks/list hook'),
+    eventName: enumString(hook.eventName, hookEventNames, 'hooks/list hook eventName'),
+    handlerType: enumString(
+      hook.handlerType,
+      ['command', 'prompt', 'agent'] as const,
+      'hooks/list hook handlerType',
+    ),
+    matcher: nullableString(hook, 'matcher', 'hooks/list hook'),
+    command: nullableString(hook, 'command', 'hooks/list hook'),
+    timeoutSec: protocolUnsignedBigInt(hook.timeoutSec, 'hooks/list hook timeoutSec'),
+    statusMessage: nullableString(hook, 'statusMessage', 'hooks/list hook'),
+    sourcePath: requiredString(hook, 'sourcePath', 'hooks/list hook'),
+    source: enumString(hook.source, hookSources, 'hooks/list hook source'),
+    pluginId: nullableString(hook, 'pluginId', 'hooks/list hook'),
+    displayOrder: protocolBigInt(hook.displayOrder, 'hooks/list hook displayOrder'),
+    enabled: hook.enabled,
+    isManaged: hook.isManaged,
+    currentHash: requiredString(hook, 'currentHash', 'hooks/list hook'),
+    trustStatus: enumString(
+      hook.trustStatus,
+      ['managed', 'untrusted', 'trusted', 'modified'] as const,
+      'hooks/list hook trustStatus',
+    ),
+  }
+}
+
+function parseHooksListResponse(value: unknown): CodexHooksListEntry[] {
+  const response = asRecord(value, 'hooks/list')
+  if (!Array.isArray(response.data)) throw new Error('Codex hooks/list omitted data')
+  return response.data.map((entryValue) => {
+    const entry = asRecord(entryValue, 'hooks/list entry')
+    if (!Array.isArray(entry.hooks) || !Array.isArray(entry.errors)) {
+      throw new Error('Codex hooks/list returned an invalid entry')
+    }
+    return {
+      cwd: requiredString(entry, 'cwd', 'hooks/list entry'),
+      hooks: entry.hooks.map(parseHookMetadata),
+      warnings: stringArray(entry.warnings, 'hooks/list warnings'),
+      errors: entry.errors.map((errorValue) => {
+        const error = asRecord(errorValue, 'hooks/list error')
+        return {
+          path: requiredString(error, 'path', 'hooks/list error'),
+          message: requiredString(error, 'message', 'hooks/list error'),
+        }
+      }),
+    }
+  })
+}
+
+function parsePluginSource(value: unknown): CodexPluginSource {
+  const source = asRecord(value, 'plugin source')
+  if (source.type === 'local') {
+    return { type: 'local', path: requiredString(source, 'path', 'plugin source') }
+  }
+  if (source.type === 'git') {
+    return {
+      type: 'git',
+      url: requiredString(source, 'url', 'plugin source'),
+      path: nullableString(source, 'path', 'plugin source'),
+      refName: nullableString(source, 'refName', 'plugin source'),
+      sha: nullableString(source, 'sha', 'plugin source'),
+    }
+  }
+  if (source.type === 'npm') {
+    return {
+      type: 'npm',
+      package: requiredString(source, 'package', 'plugin source'),
+      version: nullableString(source, 'version', 'plugin source'),
+      registry: nullableString(source, 'registry', 'plugin source'),
+    }
+  }
+  if (source.type === 'remote') return { type: 'remote' }
+  throw new Error('Codex plugin source returned an invalid type')
+}
+
+function parsePluginSharePrincipal(value: unknown): CodexPluginSharePrincipal {
+  const principal = asRecord(value, 'plugin share principal')
+  return {
+    principalType: enumString(
+      principal.principalType,
+      ['user', 'group', 'workspace'] as const,
+      'plugin share principal type',
+    ),
+    principalId: requiredString(principal, 'principalId', 'plugin share principal'),
+    role: enumString(
+      principal.role,
+      ['reader', 'editor', 'owner'] as const,
+      'plugin share principal role',
+    ),
+    name: requiredString(principal, 'name', 'plugin share principal'),
+  }
+}
+
+function parsePluginShareContext(value: unknown): CodexPluginShareContext {
+  const context = asRecord(value, 'plugin share context')
+  let sharePrincipals: CodexPluginSharePrincipal[] | null
+  if (context.sharePrincipals === null) sharePrincipals = null
+  else if (Array.isArray(context.sharePrincipals)) {
+    sharePrincipals = context.sharePrincipals.map(parsePluginSharePrincipal)
+  } else {
+    throw new Error('Codex plugin share context returned invalid sharePrincipals')
+  }
+  return {
+    remotePluginId: requiredString(context, 'remotePluginId', 'plugin share context'),
+    remoteVersion: nullableString(context, 'remoteVersion', 'plugin share context'),
+    discoverability: context.discoverability === null
+      ? null
+      : enumString(
+          context.discoverability,
+          ['LISTED', 'UNLISTED', 'PRIVATE'] as const,
+          'plugin share discoverability',
+        ),
+    shareUrl: nullableString(context, 'shareUrl', 'plugin share context'),
+    creatorAccountUserId: nullableString(
+      context,
+      'creatorAccountUserId',
+      'plugin share context',
+    ),
+    creatorName: nullableString(context, 'creatorName', 'plugin share context'),
+    sharePrincipals,
+  }
+}
+
+function parsePluginInterface(value: unknown): CodexPluginInterface {
+  const pluginInterface = asRecord(value, 'plugin interface')
+  let defaultPrompt: string[] | null
+  if (pluginInterface.defaultPrompt === null) defaultPrompt = null
+  else defaultPrompt = stringArray(pluginInterface.defaultPrompt, 'plugin interface defaultPrompt')
+  return {
+    displayName: nullableString(pluginInterface, 'displayName', 'plugin interface'),
+    shortDescription: nullableString(pluginInterface, 'shortDescription', 'plugin interface'),
+    longDescription: nullableString(pluginInterface, 'longDescription', 'plugin interface'),
+    developerName: nullableString(pluginInterface, 'developerName', 'plugin interface'),
+    category: nullableString(pluginInterface, 'category', 'plugin interface'),
+    capabilities: stringArray(pluginInterface.capabilities, 'plugin interface capabilities'),
+    websiteUrl: nullableString(pluginInterface, 'websiteUrl', 'plugin interface'),
+    privacyPolicyUrl: nullableString(pluginInterface, 'privacyPolicyUrl', 'plugin interface'),
+    termsOfServiceUrl: nullableString(
+      pluginInterface,
+      'termsOfServiceUrl',
+      'plugin interface',
+    ),
+    defaultPrompt,
+    brandColor: nullableString(pluginInterface, 'brandColor', 'plugin interface'),
+    composerIcon: nullableString(pluginInterface, 'composerIcon', 'plugin interface'),
+    composerIconUrl: nullableString(pluginInterface, 'composerIconUrl', 'plugin interface'),
+    logo: nullableString(pluginInterface, 'logo', 'plugin interface'),
+    logoDark: nullableString(pluginInterface, 'logoDark', 'plugin interface'),
+    logoUrl: nullableString(pluginInterface, 'logoUrl', 'plugin interface'),
+    logoUrlDark: nullableString(pluginInterface, 'logoUrlDark', 'plugin interface'),
+    screenshots: stringArray(pluginInterface.screenshots, 'plugin interface screenshots'),
+    screenshotUrls: stringArray(pluginInterface.screenshotUrls, 'plugin interface screenshotUrls'),
+  }
+}
+
+function parsePluginSummary(value: unknown): CodexPluginSummary {
+  const plugin = asRecord(value, 'plugin summary')
+  if (typeof plugin.installed !== 'boolean' || typeof plugin.enabled !== 'boolean') {
+    throw new Error('Codex plugin summary returned invalid state flags')
+  }
+  return {
+    id: requiredString(plugin, 'id', 'plugin summary'),
+    remotePluginId: nullableString(plugin, 'remotePluginId', 'plugin summary'),
+    version: nullableString(plugin, 'version', 'plugin summary'),
+    localVersion: nullableString(plugin, 'localVersion', 'plugin summary'),
+    name: requiredString(plugin, 'name', 'plugin summary'),
+    shareContext: plugin.shareContext === null
+      ? null
+      : parsePluginShareContext(plugin.shareContext),
+    source: parsePluginSource(plugin.source),
+    installed: plugin.installed,
+    enabled: plugin.enabled,
+    installPolicy: enumString(
+      plugin.installPolicy,
+      ['NOT_AVAILABLE', 'AVAILABLE', 'INSTALLED_BY_DEFAULT'] as const,
+      'plugin installPolicy',
+    ),
+    installPolicySource: plugin.installPolicySource === null
+      ? null
+      : enumString(
+          plugin.installPolicySource,
+          ['WORKSPACE_SETTING', 'IMPLICIT_CANONICAL_APP'] as const,
+          'plugin installPolicySource',
+        ),
+    authPolicy: enumString(
+      plugin.authPolicy,
+      ['ON_INSTALL', 'ON_USE'] as const,
+      'plugin authPolicy',
+    ),
+    availability: enumString(
+      plugin.availability,
+      ['AVAILABLE', 'DISABLED_BY_ADMIN'] as const,
+      'plugin availability',
+    ),
+    interface: plugin.interface === null ? null : parsePluginInterface(plugin.interface),
+    keywords: stringArray(plugin.keywords, 'plugin keywords'),
+  }
+}
+
+function parseMarketplaceLoadError(value: unknown): CodexMarketplaceLoadError {
+  const error = asRecord(value, 'marketplace load error')
+  return {
+    marketplacePath: requiredString(error, 'marketplacePath', 'marketplace load error'),
+    message: requiredString(error, 'message', 'marketplace load error'),
+  }
+}
+
+function parsePluginMarketplace(value: unknown): CodexPluginMarketplaceEntry {
+  const marketplace = asRecord(value, 'plugin marketplace')
+  if (!Array.isArray(marketplace.plugins)) {
+    throw new Error('Codex plugin marketplace returned invalid plugins')
+  }
+  let marketplaceInterface: CodexPluginMarketplaceEntry['interface']
+  if (marketplace.interface === null) marketplaceInterface = null
+  else {
+    const rawInterface = asRecord(marketplace.interface, 'plugin marketplace interface')
+    marketplaceInterface = {
+      displayName: nullableString(rawInterface, 'displayName', 'plugin marketplace interface'),
+    }
+  }
+  return {
+    name: requiredString(marketplace, 'name', 'plugin marketplace'),
+    path: nullableString(marketplace, 'path', 'plugin marketplace'),
+    interface: marketplaceInterface,
+    plugins: marketplace.plugins.map(parsePluginSummary),
+  }
+}
+
+function parsePluginListResult(value: unknown): CodexPluginListResult {
+  const response = asRecord(value, 'plugin/list')
+  if (!Array.isArray(response.marketplaces) || !Array.isArray(response.marketplaceLoadErrors)) {
+    throw new Error('Codex plugin/list returned an invalid catalog')
+  }
+  return {
+    marketplaces: response.marketplaces.map(parsePluginMarketplace),
+    marketplaceLoadErrors: response.marketplaceLoadErrors.map(parseMarketplaceLoadError),
+    featuredPluginIds: stringArray(response.featuredPluginIds, 'plugin/list featuredPluginIds'),
+  }
+}
+
+function parsePluginInstalledResult(value: unknown): CodexPluginInstalledResult {
+  const response = asRecord(value, 'plugin/installed')
+  if (!Array.isArray(response.marketplaces) || !Array.isArray(response.marketplaceLoadErrors)) {
+    throw new Error('Codex plugin/installed returned an invalid catalog')
+  }
+  return {
+    marketplaces: response.marketplaces.map(parsePluginMarketplace),
+    marketplaceLoadErrors: response.marketplaceLoadErrors.map(parseMarketplaceLoadError),
+  }
+}
+
+function parseAppSummary(value: unknown): CodexAppSummary {
+  const app = asRecord(value, 'plugin app summary')
+  return {
+    id: requiredString(app, 'id', 'plugin app summary'),
+    name: requiredString(app, 'name', 'plugin app summary'),
+    description: nullableString(app, 'description', 'plugin app summary'),
+    installUrl: nullableString(app, 'installUrl', 'plugin app summary'),
+    category: nullableString(app, 'category', 'plugin app summary'),
+  }
+}
+
+function parsePluginSkillSummary(value: unknown): CodexPluginSkillSummary {
+  const skill = asRecord(value, 'plugin skill summary')
+  if (typeof skill.enabled !== 'boolean') {
+    throw new Error('Codex plugin skill summary returned invalid enabled state')
+  }
+  return {
+    name: requiredString(skill, 'name', 'plugin skill summary'),
+    description: requiredString(skill, 'description', 'plugin skill summary'),
+    shortDescription: nullableString(skill, 'shortDescription', 'plugin skill summary'),
+    interface: skill.interface === null ? null : parseSkillInterface(skill.interface),
+    path: nullableString(skill, 'path', 'plugin skill summary'),
+    enabled: skill.enabled,
+  }
+}
+
+function parseAppTemplateSummary(value: unknown): CodexAppTemplateSummary {
+  const template = asRecord(value, 'plugin app template summary')
+  return {
+    templateId: requiredString(template, 'templateId', 'plugin app template summary'),
+    name: requiredString(template, 'name', 'plugin app template summary'),
+    description: nullableString(template, 'description', 'plugin app template summary'),
+    category: nullableString(template, 'category', 'plugin app template summary'),
+    canonicalConnectorId: nullableString(
+      template,
+      'canonicalConnectorId',
+      'plugin app template summary',
+    ),
+    logoUrl: nullableString(template, 'logoUrl', 'plugin app template summary'),
+    logoUrlDark: nullableString(template, 'logoUrlDark', 'plugin app template summary'),
+    materializedAppIds: stringArray(
+      template.materializedAppIds,
+      'plugin app template materializedAppIds',
+    ),
+    reason: template.reason === null
+      ? null
+      : enumString(
+          template.reason,
+          ['NOT_CONFIGURED_FOR_WORKSPACE', 'NO_ACTIVE_WORKSPACE'] as const,
+          'plugin app template reason',
+        ),
+  }
+}
+
+function parsePluginDetail(value: unknown): CodexPluginDetail {
+  const response = asRecord(value, 'plugin/read')
+  const plugin = asRecord(response.plugin, 'plugin/read plugin')
+  if (
+    !Array.isArray(plugin.skills) ||
+    !Array.isArray(plugin.hooks) ||
+    !Array.isArray(plugin.apps) ||
+    !Array.isArray(plugin.appTemplates)
+  ) {
+    throw new Error('Codex plugin/read returned invalid plugin collections')
+  }
+  return {
+    marketplaceName: requiredString(plugin, 'marketplaceName', 'plugin/read plugin'),
+    marketplacePath: nullableString(plugin, 'marketplacePath', 'plugin/read plugin'),
+    summary: parsePluginSummary(plugin.summary),
+    shareUrl: nullableString(plugin, 'shareUrl', 'plugin/read plugin'),
+    description: nullableString(plugin, 'description', 'plugin/read plugin'),
+    skills: plugin.skills.map(parsePluginSkillSummary),
+    hooks: plugin.hooks.map((hookValue) => {
+      const hook = asRecord(hookValue, 'plugin hook summary')
+      return {
+        key: requiredString(hook, 'key', 'plugin hook summary'),
+        eventName: enumString(hook.eventName, hookEventNames, 'plugin hook eventName'),
+      }
+    }),
+    apps: plugin.apps.map(parseAppSummary),
+    appTemplates: plugin.appTemplates.map(parseAppTemplateSummary),
+    mcpServers: stringArray(plugin.mcpServers, 'plugin/read mcpServers'),
+  }
+}
+
+function parsePluginInstallResult(value: unknown): CodexPluginInstallResult {
+  const response = asRecord(value, 'plugin/install')
+  if (!Array.isArray(response.appsNeedingAuth)) {
+    throw new Error('Codex plugin/install returned invalid appsNeedingAuth')
+  }
+  return {
+    authPolicy: enumString(
+      response.authPolicy,
+      ['ON_INSTALL', 'ON_USE'] as const,
+      'plugin/install authPolicy',
+    ),
+    appsNeedingAuth: response.appsNeedingAuth.map(parseAppSummary),
+  }
+}
+
+function parseMarketplaceAddResult(value: unknown): CodexMarketplaceAddResult {
+  const response = asRecord(value, 'marketplace/add')
+  if (typeof response.alreadyAdded !== 'boolean') {
+    throw new Error('Codex marketplace/add returned invalid alreadyAdded')
+  }
+  return {
+    marketplaceName: requiredString(response, 'marketplaceName', 'marketplace/add'),
+    installedRoot: requiredString(response, 'installedRoot', 'marketplace/add'),
+    alreadyAdded: response.alreadyAdded,
+  }
+}
+
+function parseMarketplaceRemoveResult(value: unknown): CodexMarketplaceRemoveResult {
+  const response = asRecord(value, 'marketplace/remove')
+  return {
+    marketplaceName: requiredString(response, 'marketplaceName', 'marketplace/remove'),
+    installedRoot: nullableString(response, 'installedRoot', 'marketplace/remove'),
+  }
+}
+
+function parseMarketplaceUpgradeResult(value: unknown): CodexMarketplaceUpgradeResult {
+  const response = asRecord(value, 'marketplace/upgrade')
+  if (!Array.isArray(response.errors)) {
+    throw new Error('Codex marketplace/upgrade returned invalid errors')
+  }
+  return {
+    selectedMarketplaces: stringArray(
+      response.selectedMarketplaces,
+      'marketplace/upgrade selectedMarketplaces',
+    ),
+    upgradedRoots: stringArray(response.upgradedRoots, 'marketplace/upgrade upgradedRoots'),
+    errors: response.errors.map((errorValue) => {
+      const error = asRecord(errorValue, 'marketplace/upgrade error')
+      return {
+        marketplaceName: requiredString(
+          error,
+          'marketplaceName',
+          'marketplace/upgrade error',
+        ),
+        message: requiredString(error, 'message', 'marketplace/upgrade error'),
+      }
+    }),
+  }
+}
+
+function parseWorkspaceMessages(value: unknown): CodexWorkspaceMessagesResult {
+  const response = asRecord(value, 'account/workspaceMessages/read')
+  if (typeof response.featureEnabled !== 'boolean' || !Array.isArray(response.messages)) {
+    throw new Error('Codex account/workspaceMessages/read returned an invalid response')
+  }
+  return {
+    featureEnabled: response.featureEnabled,
+    messages: response.messages.map((messageValue) => {
+      const message = asRecord(messageValue, 'account workspace message')
+      return {
+        messageId: requiredString(message, 'messageId', 'account workspace message'),
+        messageType: enumString(
+          message.messageType,
+          ['headline', 'announcement', 'unknown'] as const,
+          'account workspace message type',
+        ),
+        messageBody: requiredString(message, 'messageBody', 'account workspace message'),
+        createdAt: nullableTimestamp(message.createdAt, 'account workspace message createdAt'),
+        archivedAt: nullableTimestamp(message.archivedAt, 'account workspace message archivedAt'),
+      }
+    }),
+  }
+}
+
+function skillConfigWriteParams(options: CodexSkillConfigWriteOptions): JsonObject {
+  const pathSelector = (options as { path?: unknown }).path
+  const nameSelector = (options as { name?: unknown }).name
+  const hasPath = typeof pathSelector === 'string'
+  const hasName = typeof nameSelector === 'string'
+  if (hasPath === hasName) {
+    throw new Error('Skill config write requires exactly one of path or name')
+  }
+  if (typeof options.enabled !== 'boolean') {
+    throw new Error('Skill config write requires a boolean enabled value')
+  }
+  return {
+    ...(hasPath ? { path: pathSelector } : { name: nameSelector }),
+    enabled: options.enabled,
+  }
+}
+
+function pluginLocatorParams(locator: CodexPluginLocator): JsonObject {
+  const marketplacePath = (locator as { marketplacePath?: unknown }).marketplacePath
+  const remoteMarketplaceName = (locator as { remoteMarketplaceName?: unknown })
+    .remoteMarketplaceName
+  const hasLocalMarketplace = typeof marketplacePath === 'string'
+  const hasRemoteMarketplace = typeof remoteMarketplaceName === 'string'
+  if (hasLocalMarketplace === hasRemoteMarketplace) {
+    throw new Error(
+      'Plugin selection requires exactly one of marketplacePath or remoteMarketplaceName',
+    )
+  }
+  if (typeof locator.pluginName !== 'string') {
+    throw new Error('Plugin selection requires a pluginName')
+  }
+  return {
+    ...(hasLocalMarketplace ? { marketplacePath } : { remoteMarketplaceName }),
+    pluginName: locator.pluginName,
   }
 }
 
@@ -1068,6 +1878,11 @@ export class CodexAppServer extends EventEmitter {
     await this.request('thread/compact/start', { threadId })
   }
 
+  async injectThreadItems(threadId: string, items: JsonValue[]): Promise<void> {
+    await this.ready
+    await this.request('thread/inject_items', { threadId, items })
+  }
+
   async archiveThread(threadId: string): Promise<void> {
     await this.ready
     await this.request('thread/archive', { threadId })
@@ -1460,6 +2275,110 @@ export class CodexAppServer extends EventEmitter {
     return parseSkillsListResponse(await this.request('skills/list', params)).data
   }
 
+  async writeSkillConfig(
+    options: CodexSkillConfigWriteOptions,
+  ): Promise<CodexSkillConfigWriteResult> {
+    await this.ready
+    const response = asRecord(
+      await this.request('skills/config/write', skillConfigWriteParams(options)),
+      'skills/config/write',
+    )
+    if (typeof response.effectiveEnabled !== 'boolean') {
+      throw new Error('Codex skills/config/write omitted effectiveEnabled')
+    }
+    return { effectiveEnabled: response.effectiveEnabled }
+  }
+
+  async setSkillsExtraRoots(extraRoots: string[]): Promise<void> {
+    await this.ready
+    await this.request('skills/extraRoots/set', { extraRoots })
+  }
+
+  async listHooks(params: CodexHooksListParams = {}): Promise<CodexHooksListEntry[]> {
+    await this.ready
+    return parseHooksListResponse(await this.request('hooks/list', params))
+  }
+
+  async listPlugins(options: CodexPluginListOptions = {}): Promise<CodexPluginListResult> {
+    await this.ready
+    return parsePluginListResult(await this.request('plugin/list', {
+      ...('cwds' in options ? { cwds: options.cwds ?? null } : {}),
+      ...('marketplaceKinds' in options
+        ? { marketplaceKinds: options.marketplaceKinds ?? null }
+        : {}),
+    }))
+  }
+
+  async listInstalledPlugins(
+    options: CodexPluginInstalledOptions = {},
+  ): Promise<CodexPluginInstalledResult> {
+    await this.ready
+    return parsePluginInstalledResult(await this.request('plugin/installed', {
+      ...('cwds' in options ? { cwds: options.cwds ?? null } : {}),
+      ...('installSuggestionPluginNames' in options
+        ? { installSuggestionPluginNames: options.installSuggestionPluginNames ?? null }
+        : {}),
+    }))
+  }
+
+  async readPlugin(locator: CodexPluginLocator): Promise<CodexPluginDetail> {
+    await this.ready
+    return parsePluginDetail(
+      await this.request('plugin/read', pluginLocatorParams(locator)),
+    )
+  }
+
+  async readPluginSkill(locator: CodexPluginSkillLocator): Promise<string | null> {
+    await this.ready
+    const response = asRecord(
+      await this.request('plugin/skill/read', locator),
+      'plugin/skill/read',
+    )
+    if (response.contents !== null && typeof response.contents !== 'string') {
+      throw new Error('Codex plugin/skill/read returned invalid contents')
+    }
+    return response.contents
+  }
+
+  async installPlugin(locator: CodexPluginLocator): Promise<CodexPluginInstallResult> {
+    await this.ready
+    return parsePluginInstallResult(
+      await this.request('plugin/install', pluginLocatorParams(locator)),
+    )
+  }
+
+  async uninstallPlugin(pluginId: string): Promise<void> {
+    await this.ready
+    await this.request('plugin/uninstall', { pluginId })
+  }
+
+  async addMarketplace(
+    options: CodexMarketplaceAddOptions,
+  ): Promise<CodexMarketplaceAddResult> {
+    await this.ready
+    return parseMarketplaceAddResult(await this.request('marketplace/add', {
+      source: options.source,
+      ...('refName' in options ? { refName: options.refName ?? null } : {}),
+      ...('sparsePaths' in options ? { sparsePaths: options.sparsePaths ?? null } : {}),
+    }))
+  }
+
+  async removeMarketplace(marketplaceName: string): Promise<CodexMarketplaceRemoveResult> {
+    await this.ready
+    return parseMarketplaceRemoveResult(
+      await this.request('marketplace/remove', { marketplaceName }),
+    )
+  }
+
+  async upgradeMarketplaces(
+    marketplaceName?: string | null,
+  ): Promise<CodexMarketplaceUpgradeResult> {
+    await this.ready
+    return parseMarketplaceUpgradeResult(await this.request('marketplace/upgrade', {
+      marketplaceName: marketplaceName ?? null,
+    }))
+  }
+
   async listMcpServers(threadId?: string): Promise<JsonObject[]> {
     await this.ready
     const servers: JsonObject[] = []
@@ -1672,6 +2591,18 @@ export class CodexAppServer extends EventEmitter {
   async cancelAccountLogin(loginId: string): Promise<void> {
     await this.ready
     await this.request('account/login/cancel', { loginId })
+  }
+
+  async logoutAccount(): Promise<void> {
+    await this.ready
+    await this.request('account/logout', undefined)
+  }
+
+  async getAccountWorkspaceMessages(): Promise<CodexWorkspaceMessagesResult> {
+    await this.ready
+    return parseWorkspaceMessages(
+      await this.request('account/workspaceMessages/read', undefined),
+    )
   }
 
   async close(): Promise<void> {

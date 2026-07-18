@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
-import { access, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { access, mkdtemp, readFile, readdir, rm, stat, truncate, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -16,13 +16,17 @@ import {
 import { CordexDiscordBot } from '../src/discord-bot.js'
 import type { CordexConfig, QueuedPrompt, SessionState } from '../src/types.js'
 
-test('daemon IPC authenticates requests and cleans up private runtime files', async () => {
+test('daemon IPC authenticates requests, accepts legacy filePath, and cleans up private runtime files', async () => {
   const home = await mkdtemp(path.join(tmpdir(), 'cordex-daemon-ipc-'))
-  const requests: string[] = []
+  const requests: Array<{ target: string; prompt: string; filePaths?: string[] }> = []
   const server = await startCordexDaemonIpc({
     home,
     async onSend(request) {
-      requests.push(`${request.target.kind}:${request.target.id}:${request.prompt}`)
+      requests.push({
+        target: `${request.target.kind}:${request.target.id}`,
+        prompt: request.prompt,
+        ...(request.filePaths ? { filePaths: request.filePaths } : {}),
+      })
       return { threadId: request.target.id, position: 0 }
     },
   })
@@ -36,7 +40,23 @@ test('daemon IPC authenticates requests and cleans up private runtime files', as
       prompt: 'Run the focused tests',
     }, { home })
     assert.deepEqual(result, { threadId: '123456789012345678', position: 0 })
-    assert.deepEqual(requests, ['thread:123456789012345678:Run the focused tests'])
+    await sendCordexDaemonPrompt({
+      requestId: 'legacy-file-path',
+      target: { kind: 'thread', id: '123456789012345678' },
+      prompt: 'Inspect legacy input',
+      filePath: '/tmp/legacy-input.txt',
+    }, { home })
+    assert.deepEqual(requests, [
+      {
+        target: 'thread:123456789012345678',
+        prompt: 'Run the focused tests',
+      },
+      {
+        target: 'thread:123456789012345678',
+        prompt: 'Inspect legacy input',
+        filePaths: ['/tmp/legacy-input.txt'],
+      },
+    ])
   } finally {
     await server.close()
   }
@@ -45,57 +65,127 @@ test('daemon IPC authenticates requests and cleans up private runtime files', as
   await rm(home, { recursive: true, force: true })
 })
 
-test('daemon IPC wire budget accepts the full documented non-ASCII prompt limit', async () => {
+test('daemon IPC wire budget accepts the full prompt and attachment-path limits', async () => {
   const home = await mkdtemp(path.join(tmpdir(), 'cordex-daemon-unicode-'))
-  let receivedLength = 0
+  let received: { promptLength: number; fileCount: number } | undefined
   const server = await startCordexDaemonIpc({
     home,
     async onSend(request) {
-      receivedLength = request.prompt.length
+      received = {
+        promptLength: request.prompt.length,
+        fileCount: request.filePaths?.length || 0,
+      }
       return { threadId: request.target.id, position: 0 }
     },
   })
   try {
     const prompt = '界'.repeat(120_000)
+    const filePaths = Array.from(
+      { length: 10 },
+      (_, index) => `/${index}${'界'.repeat(4_094)}`,
+    )
     await sendCordexDaemonPrompt({
       requestId: 'unicode-limit',
       target: { kind: 'thread', id: '123456789012345678' },
       prompt,
+      filePaths,
     }, { home })
-    assert.equal(receivedLength, prompt.length)
+    assert.deepEqual(received, { promptLength: prompt.length, fileCount: 10 })
   } finally {
     await server.close()
     await rm(home, { recursive: true, force: true })
   }
 })
 
-test('daemon input materialization embeds UTF-8 text and persists validated images', async () => {
+test('daemon input materialization combines mixed files deterministically and deduplicates images', async () => {
   const home = await mkdtemp(path.join(tmpdir(), 'cordex-daemon-input-'))
   try {
     const textPath = path.join(home, 'notes.txt')
     await writeFile(textPath, 'line one\nline two\n')
-    const textInput = await materializeCordexDaemonInput({
-      home,
-      prompt: 'Review these notes',
-      filePath: textPath,
-    })
-    assert.equal(textInput.input.length, 1)
-    assert.match(textInput.input[0]?.type === 'text' ? textInput.input[0].text : '', /line two/)
-    assert.equal(textInput.displayText, 'Review these notes [notes.txt]')
+    const secondTextPath = path.join(home, 'failure.log')
+    await writeFile(secondTextPath, 'failure details\n')
 
     const pngPath = path.join(home, 'pixel.png')
     await writeFile(pngPath, Buffer.from([
       0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00,
     ]))
-    const imageInput = await materializeCordexDaemonInput({
+    const duplicatePngPath = path.join(home, 'pixel-copy.png')
+    await writeFile(duplicatePngPath, await readFile(pngPath))
+    const materialized = await materializeCordexDaemonInput({
       home,
-      prompt: 'Inspect this image',
-      filePath: pngPath,
+      prompt: 'Review these inputs',
+      filePaths: [textPath, pngPath, secondTextPath, duplicatePngPath],
     })
-    assert.equal(imageInput.input[1]?.type, 'localImage')
-    const persisted = imageInput.input[1]?.type === 'localImage' ? imageInput.input[1].path : ''
+    assert.equal(materialized.input.length, 2)
+    const combined = materialized.input[0]?.type === 'text' ? materialized.input[0].text : ''
+    assert.ok(combined.indexOf('line two') < combined.indexOf('failure details'))
+    assert.equal(materialized.input[1]?.type, 'localImage')
+    const persisted = materialized.input[1]?.type === 'localImage'
+      ? materialized.input[1].path
+      : ''
     assert.match(persisted, /attachments\/[0-9a-f]{64}\.png$/)
     await access(persisted)
+    assert.equal((await readdir(path.join(home, 'attachments'))).length, 1)
+    assert.equal(
+      materialized.displayText,
+      'Review these inputs [notes.txt, pixel.png, failure.log, pixel-copy.png]',
+    )
+
+    const legacy = await materializeCordexDaemonInput({
+      home,
+      prompt: 'Review legacy input',
+      filePath: textPath,
+    })
+    assert.match(legacy.input[0]?.type === 'text' ? legacy.input[0].text : '', /line two/)
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('daemon input materialization enforces file-count, per-file, and aggregate limits', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'cordex-daemon-limits-'))
+  try {
+    const small = path.join(home, 'small.txt')
+    await writeFile(small, 'small')
+    await assert.rejects(
+      materializeCordexDaemonInput({
+        home,
+        prompt: 'Too many',
+        filePaths: Array.from({ length: 11 }, () => small),
+      }),
+      /at most 10 files/,
+    )
+
+    const oversizedText = path.join(home, 'oversized.txt')
+    await writeFile(oversizedText, 'x')
+    await truncate(oversizedText, 1_000_001)
+    await assert.rejects(
+      materializeCordexDaemonInput({
+        home,
+        prompt: 'Too large',
+        filePaths: [oversizedText],
+      }),
+      /1000000-byte text limit/,
+    )
+
+    const pngHeader = Buffer.from([
+      0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    ])
+    const aggregatePaths: string[] = []
+    for (let index = 0; index < 3; index++) {
+      const filePath = path.join(home, `large-${index}.png`)
+      await writeFile(filePath, pngHeader)
+      await truncate(filePath, 14_000_000)
+      aggregatePaths.push(filePath)
+    }
+    await assert.rejects(
+      materializeCordexDaemonInput({
+        home,
+        prompt: 'Aggregate too large',
+        filePaths: aggregatePaths,
+      }),
+      /40000000-byte aggregate attachment limit/,
+    )
   } finally {
     await rm(home, { recursive: true, force: true })
   }

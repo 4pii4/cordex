@@ -17,7 +17,12 @@ import { defaultDiscordInputLimits } from './discord-input.js'
 import type { UserInput } from './types.js'
 
 const protocolVersion = 1
-const maxRequestBytes = defaultDiscordInputLimits.messageTextCharacters * 6 + 16 * 1_024
+export const maxCordexDaemonAttachmentFiles = 10
+const maxFilePathCharacters = 4_096
+const maxRequestBytes = (
+  defaultDiscordInputLimits.messageTextCharacters +
+  maxCordexDaemonAttachmentFiles * maxFilePathCharacters
+) * 6 + 32 * 1_024
 const maxResponseBytes = 64 * 1_024
 const defaultRequestTimeoutMs = 15_000
 const discordSnowflake = /^\d{17,20}$/
@@ -45,6 +50,8 @@ export type CordexDaemonSendRequest = {
     id: string
   }
   prompt: string
+  filePaths?: string[]
+  /** @deprecated Accepted for compatibility with Cordex 0.1.3 clients. */
   filePath?: string
 }
 
@@ -100,12 +107,43 @@ function authenticated(left: string, right: string): boolean {
   return leftBytes.length === rightBytes.length && timingSafeEqual(leftBytes, rightBytes)
 }
 
+function normalizeFilePaths(value: {
+  filePaths?: unknown
+  filePath?: unknown
+}): string[] {
+  if (value.filePaths !== undefined && value.filePath !== undefined) {
+    throw new Error('Specify filePaths or legacy filePath, not both')
+  }
+  const filePaths = value.filePaths !== undefined
+    ? value.filePaths
+    : value.filePath !== undefined
+      ? [value.filePath]
+      : []
+  if (!Array.isArray(filePaths)) throw new Error('File paths must be an array')
+  if (filePaths.length > maxCordexDaemonAttachmentFiles) {
+    throw new Error(`Specify at most ${maxCordexDaemonAttachmentFiles} files`)
+  }
+  return filePaths.map((filePath) => {
+    if (
+      typeof filePath !== 'string' ||
+      !path.isAbsolute(filePath) ||
+      filePath.length > maxFilePathCharacters
+    ) {
+      throw new Error('Each file path must be an absolute local path')
+    }
+    return filePath
+  })
+}
+
 function validateSendRequest(value: unknown): CordexDaemonSendRequest {
   if (!isRecord(value)) throw new Error('Invalid daemon send request')
   const requestId = value.requestId
   const target = value.target
   const prompt = value.prompt
-  const filePath = value.filePath
+  const filePaths = normalizeFilePaths({
+    filePaths: value.filePaths,
+    filePath: value.filePath,
+  })
   if (typeof requestId !== 'string' || !requestIdPattern.test(requestId)) {
     throw new Error('Invalid daemon request ID')
   }
@@ -126,17 +164,11 @@ function validateSendRequest(value: unknown): CordexDaemonSendRequest {
       `Prompt must contain 1-${defaultDiscordInputLimits.messageTextCharacters} characters`,
     )
   }
-  if (
-    filePath !== undefined &&
-    (typeof filePath !== 'string' || !path.isAbsolute(filePath) || filePath.length > 4_096)
-  ) {
-    throw new Error('File path must be an absolute local path')
-  }
   return {
     requestId,
     target: { kind: target.kind, id: target.id },
     prompt,
-    ...(typeof filePath === 'string' ? { filePath } : {}),
+    ...(filePaths.length > 0 ? { filePaths } : {}),
   }
 }
 
@@ -393,8 +425,57 @@ async function persistLocalImage(home: string, mime: string, bytes: Buffer): Pro
   return target
 }
 
+type CordexDaemonAttachmentSource = {
+  source: string
+  name: string
+  imageMime?: string
+  limit: number
+}
+
+async function inspectCordexDaemonFilePaths(
+  filePaths: string[],
+): Promise<CordexDaemonAttachmentSource[]> {
+  const sources: CordexDaemonAttachmentSource[] = []
+  let totalBytes = 0
+  for (const filePath of filePaths) {
+    const source = await realpath(filePath).catch(() => {
+      throw new Error(`File not found: ${filePath}`)
+    })
+    const metadata = await stat(source)
+    if (!metadata.isFile()) throw new Error(`Not a regular file: ${filePath}`)
+    const extension = path.extname(source).toLowerCase()
+    const imageMime = imageMimeByExtension.get(extension)
+    const limit = imageMime
+      ? defaultDiscordInputLimits.imageAttachmentBytes
+      : defaultDiscordInputLimits.textAttachmentBytes
+    if (metadata.size > limit) {
+      throw new Error(`File exceeds the ${limit}-byte ${imageMime ? 'image' : 'text'} limit: ${filePath}`)
+    }
+    totalBytes += metadata.size
+    if (totalBytes > defaultDiscordInputLimits.messageAttachmentBytes) {
+      throw new Error(
+        `Files exceed the ${defaultDiscordInputLimits.messageAttachmentBytes}-byte aggregate attachment limit`,
+      )
+    }
+    sources.push({
+      source,
+      name: path.basename(source),
+      ...(imageMime ? { imageMime } : {}),
+      limit,
+    })
+  }
+  return sources
+}
+
+export async function preflightCordexDaemonFilePaths(filePaths: string[]): Promise<string[]> {
+  const normalized = normalizeFilePaths({ filePaths })
+  return (await inspectCordexDaemonFilePaths(normalized)).map((source) => source.source)
+}
+
 export async function materializeCordexDaemonInput(options: {
   prompt: string
+  filePaths?: string[]
+  /** @deprecated Accepted for compatibility with Cordex 0.1.3 callers. */
   filePath?: string
   home?: string
 }): Promise<{ input: UserInput[]; displayText: string }> {
@@ -404,67 +485,80 @@ export async function materializeCordexDaemonInput(options: {
       `Prompt must contain 1-${defaultDiscordInputLimits.messageTextCharacters} characters`,
     )
   }
-  if (!options.filePath) {
+  const filePaths = normalizeFilePaths({
+    filePaths: options.filePaths,
+    filePath: options.filePath,
+  })
+  if (filePaths.length === 0) {
     return {
       input: [{ type: 'text', text: prompt, text_elements: [] }],
       displayText: prompt.trim(),
     }
   }
 
-  const source = await realpath(options.filePath).catch(() => {
-    throw new Error(`File not found: ${options.filePath}`)
-  })
-  const metadata = await stat(source)
-  if (!metadata.isFile()) throw new Error(`Not a regular file: ${options.filePath}`)
-  const extension = path.extname(source).toLowerCase()
-  const imageMime = imageMimeByExtension.get(extension)
-  const limit = imageMime
-    ? defaultDiscordInputLimits.imageAttachmentBytes
-    : defaultDiscordInputLimits.textAttachmentBytes
-  if (metadata.size > limit) {
-    throw new Error(`File exceeds the ${limit}-byte ${imageMime ? 'image' : 'text'} limit`)
-  }
-  const bytes = await readFile(source)
-  if (bytes.length > limit) {
-    throw new Error(`File exceeds the ${limit}-byte ${imageMime ? 'image' : 'text'} limit`)
+  const sources = await inspectCordexDaemonFilePaths(filePaths)
+  const textAttachments: string[] = []
+  const images = new Map<string, { mime: string; bytes: Buffer }>()
+  let totalBytes = 0
+  for (const source of sources) {
+    const bytes = await readFile(source.source)
+    if (bytes.length > source.limit) {
+      throw new Error(
+        `File exceeds the ${source.limit}-byte ${source.imageMime ? 'image' : 'text'} limit: ${source.source}`,
+      )
+    }
+    totalBytes += bytes.length
+    if (totalBytes > defaultDiscordInputLimits.messageAttachmentBytes) {
+      throw new Error(
+        `Files exceed the ${defaultDiscordInputLimits.messageAttachmentBytes}-byte aggregate attachment limit`,
+      )
+    }
+    if (source.imageMime) {
+      if (!matchesImageSignature(source.imageMime, bytes)) {
+        throw new Error(
+          `File content does not match its ${path.extname(source.source).toLowerCase()} image extension`,
+        )
+      }
+      const digest = createHash('sha256').update(bytes).digest('hex')
+      const key = `${source.imageMime}:${digest}`
+      if (!images.has(key)) images.set(key, { mime: source.imageMime, bytes })
+      continue
+    }
+
+    let content: string
+    try {
+      content = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+    } catch {
+      throw new Error(
+        `Only UTF-8 text files and PNG, JPEG, GIF, or WebP images are supported: ${source.source}`,
+      )
+    }
+    if (content.includes('\u0000')) {
+      throw new Error(
+        `Only UTF-8 text files and PNG, JPEG, GIF, or WebP images are supported: ${source.source}`,
+      )
+    }
+    textAttachments.push([
+      `Local CLI attachment ${JSON.stringify(source.name)} (${bytes.length} bytes):`,
+      content || '[empty file]',
+    ].join('\n\n'))
   }
 
-  const displayText = `${prompt.trim()} [${path.basename(source)}]`
-  if (imageMime) {
-    if (!matchesImageSignature(imageMime, bytes)) {
-      throw new Error(`File content does not match its ${extension} image extension`)
-    }
-    const localPath = await persistLocalImage(options.home || getCordexHome(), imageMime, bytes)
-    return {
-      input: [
-        { type: 'text', text: prompt, text_elements: [] },
-        { type: 'localImage', path: localPath },
-      ],
-      displayText,
-    }
-  }
-
-  let content: string
-  try {
-    content = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
-  } catch {
-    throw new Error('Only UTF-8 text files and PNG, JPEG, GIF, or WebP images are supported')
-  }
-  if (content.includes('\u0000')) {
-    throw new Error('Only UTF-8 text files and PNG, JPEG, GIF, or WebP images are supported')
-  }
-  const combined = [
-    prompt,
-    `Local CLI attachment ${JSON.stringify(path.basename(source))} (${bytes.length} bytes):`,
-    content || '[empty file]',
-  ].join('\n\n')
+  const combined = [prompt, ...textAttachments].join('\n\n')
   if (combined.length > defaultDiscordInputLimits.messageTextCharacters) {
     throw new Error(
-      `Prompt and file exceed the ${defaultDiscordInputLimits.messageTextCharacters}-character input limit`,
+      `Prompt and files exceed the ${defaultDiscordInputLimits.messageTextCharacters}-character input limit`,
     )
   }
+  const imageInputs: UserInput[] = []
+  for (const image of images.values()) {
+    imageInputs.push({
+      type: 'localImage',
+      path: await persistLocalImage(options.home || getCordexHome(), image.mime, image.bytes),
+    })
+  }
   return {
-    input: [{ type: 'text', text: combined, text_elements: [] }],
-    displayText,
+    input: [{ type: 'text', text: combined, text_elements: [] }, ...imageInputs],
+    displayText: `${prompt.trim()} [${sources.map((source) => source.name).join(', ')}]`,
   }
 }

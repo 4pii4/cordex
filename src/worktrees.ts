@@ -347,9 +347,10 @@ function parseRegisteredWorktrees(output: string): RegisteredGitWorktree[] {
       }
     }
     if (!directory) throw new Error('Invalid git worktree registration: missing directory')
+    const commitHead = head && !/^0+$/.test(head) ? head : undefined
     worktrees.push({
       directory: path.resolve(directory),
-      ...(head ? { head } : {}),
+      ...(commitHead ? { head: commitHead } : {}),
       ...(branch ? { branch } : {}),
       detached,
       bare,
@@ -373,6 +374,32 @@ function parseRegisteredWorktrees(output: string): RegisteredGitWorktree[] {
 export async function listRegisteredWorktrees(projectDirectory: string): Promise<RegisteredGitWorktree[]> {
   const output = await git(projectDirectory, ['worktree', 'list', '--porcelain', '-z'])
   return parseRegisteredWorktrees(output)
+}
+
+export type GitWorktreeCheckoutState = 'clean' | 'dirty' | 'missing' | 'bare' | 'unknown'
+
+export type GitWorktreeComparison = {
+  ref: string
+  head: string
+  relation: 'same' | 'ahead' | 'behind' | 'diverged' | 'unrelated'
+  ahead: number | null
+  behind: number | null
+  merged: boolean
+  containsComparison: boolean
+}
+
+export type GitWorktreeInventoryEntry = RegisteredGitWorktree & {
+  checkoutPresent: boolean
+  checkoutState: GitWorktreeCheckoutState
+  clean: boolean | null
+  containingBranches: string[] | null
+  reachableFromLocalBranch: boolean | null
+  comparison: GitWorktreeComparison | null
+  errors: string[]
+}
+
+export type GitWorktreeInventoryOptions = {
+  comparisonRef?: string
 }
 
 export type MergedWorktreeRemovalOptions = {
@@ -415,6 +442,259 @@ async function localBranchExists(projectDirectory: string, branch: string): Prom
 async function absoluteGitPath(directory: string, name: '--git-common-dir'): Promise<string> {
   const value = await git(directory, ['rev-parse', name])
   return path.resolve(directory, value)
+}
+
+function inventoryGitError(label: string, args: string[], result: GitResult): string {
+  const detail = result.stderr || result.stdout || `exit ${result.exitCode}`
+  return `${label}: git ${args.join(' ')} failed: ${detail}`
+}
+
+async function inspectWorktreeCheckout(options: {
+  projectCommonDirectory: string
+  registration: RegisteredGitWorktree
+}): Promise<{
+  checkoutPresent: boolean
+  checkoutState: GitWorktreeCheckoutState
+  clean: boolean | null
+  errors: string[]
+}> {
+  const { registration } = options
+  const checkoutPresent = await pathExists(registration.directory)
+  if (!checkoutPresent) {
+    return {
+      checkoutPresent: false,
+      checkoutState: 'missing',
+      clean: null,
+      errors: [],
+    }
+  }
+  if (registration.bare) {
+    return {
+      checkoutPresent: true,
+      checkoutState: 'bare',
+      clean: null,
+      errors: [],
+    }
+  }
+
+  const errors: string[] = []
+  const topLevelArgs = ['rev-parse', '--show-toplevel']
+  const topLevel = await runGit(registration.directory, topLevelArgs)
+  if (topLevel.exitCode !== 0) {
+    errors.push(inventoryGitError('Could not identify checkout root', topLevelArgs, topLevel))
+    return { checkoutPresent: true, checkoutState: 'unknown', clean: null, errors }
+  }
+  if (path.resolve(topLevel.stdout) !== registration.directory) {
+    errors.push(
+      `Checkout root mismatch: expected ${registration.directory}, found ${path.resolve(topLevel.stdout)}`,
+    )
+    return { checkoutPresent: true, checkoutState: 'unknown', clean: null, errors }
+  }
+
+  const commonDirectoryArgs = ['rev-parse', '--git-common-dir']
+  const commonDirectory = await runGit(registration.directory, commonDirectoryArgs)
+  if (commonDirectory.exitCode !== 0) {
+    errors.push(inventoryGitError(
+      'Could not identify checkout repository',
+      commonDirectoryArgs,
+      commonDirectory,
+    ))
+    return { checkoutPresent: true, checkoutState: 'unknown', clean: null, errors }
+  }
+  const resolvedCommonDirectory = path.resolve(registration.directory, commonDirectory.stdout)
+  if (resolvedCommonDirectory !== options.projectCommonDirectory) {
+    errors.push('Checkout belongs to a different git repository')
+    return { checkoutPresent: true, checkoutState: 'unknown', clean: null, errors }
+  }
+
+  if (registration.head) {
+    const headArgs = ['rev-parse', 'HEAD']
+    const head = await runGit(registration.directory, headArgs)
+    if (head.exitCode !== 0) {
+      errors.push(inventoryGitError('Could not read checkout HEAD', headArgs, head))
+      return { checkoutPresent: true, checkoutState: 'unknown', clean: null, errors }
+    }
+    if (head.stdout !== registration.head) {
+      errors.push(`Checkout HEAD mismatch: expected ${registration.head}, found ${head.stdout}`)
+      return { checkoutPresent: true, checkoutState: 'unknown', clean: null, errors }
+    }
+  }
+
+  const statusArgs = [
+    'status',
+    '--porcelain=v1',
+    '-z',
+    '--untracked-files=all',
+    '--ignore-submodules=none',
+  ]
+  const status = await runGit(registration.directory, statusArgs)
+  if (status.exitCode !== 0) {
+    errors.push(inventoryGitError('Could not inspect checkout status', statusArgs, status))
+    return { checkoutPresent: true, checkoutState: 'unknown', clean: null, errors }
+  }
+  const clean = status.stdout.length === 0
+  return {
+    checkoutPresent: true,
+    checkoutState: clean ? 'clean' : 'dirty',
+    clean,
+    errors,
+  }
+}
+
+function parseAheadBehind(result: GitResult): { ahead: number; behind: number } | undefined {
+  if (result.exitCode !== 0) return undefined
+  const [behindText, aheadText] = result.stdout.split(/\s+/)
+  const behind = Number.parseInt(behindText || '', 10)
+  const ahead = Number.parseInt(aheadText || '', 10)
+  if (!Number.isSafeInteger(ahead) || ahead < 0 || !Number.isSafeInteger(behind) || behind < 0) {
+    return undefined
+  }
+  return { ahead, behind }
+}
+
+function comparisonRelation(
+  ahead: number,
+  behind: number,
+): Exclude<GitWorktreeComparison['relation'], 'unrelated'> {
+  if (ahead === 0 && behind === 0) return 'same'
+  if (behind === 0) return 'ahead'
+  if (ahead === 0) return 'behind'
+  return 'diverged'
+}
+
+async function inspectWorktreeReachability(options: {
+  projectDirectory: string
+  registration: RegisteredGitWorktree
+  comparison?: { ref: string; head: string }
+}): Promise<{
+  containingBranches: string[] | null
+  reachableFromLocalBranch: boolean | null
+  comparison: GitWorktreeComparison | null
+  errors: string[]
+}> {
+  const { registration } = options
+  if (!registration.head) {
+    return {
+      containingBranches: null,
+      reachableFromLocalBranch: null,
+      comparison: null,
+      errors: [],
+    }
+  }
+
+  const errors: string[] = []
+  const verifyArgs = ['cat-file', '-e', `${registration.head}^{commit}`]
+  const verified = await runGit(options.projectDirectory, verifyArgs)
+  if (verified.exitCode !== 0) {
+    errors.push(inventoryGitError('Registered HEAD is unavailable', verifyArgs, verified))
+    return {
+      containingBranches: null,
+      reachableFromLocalBranch: null,
+      comparison: null,
+      errors,
+    }
+  }
+
+  const containingArgs = [
+    'for-each-ref',
+    '--format=%(refname:short)',
+    `--contains=${registration.head}`,
+    'refs/heads/',
+  ]
+  const containing = await runGit(options.projectDirectory, containingArgs)
+  const containingBranches = containing.exitCode === 0
+    ? containing.stdout.split('\n').map((value) => value.trim()).filter(Boolean)
+    : null
+  if (containing.exitCode !== 0) {
+    errors.push(inventoryGitError('Could not inspect local branch reachability', containingArgs, containing))
+  }
+
+  let comparison: GitWorktreeComparison | null = null
+  if (options.comparison) {
+    const mergeBaseArgs = ['merge-base', options.comparison.head, registration.head]
+    const mergeBase = await runGit(options.projectDirectory, mergeBaseArgs)
+    if (mergeBase.exitCode === 1) {
+      comparison = {
+        ...options.comparison,
+        relation: 'unrelated',
+        ahead: null,
+        behind: null,
+        merged: false,
+        containsComparison: false,
+      }
+    } else if (mergeBase.exitCode !== 0) {
+      errors.push(inventoryGitError('Could not compare worktree HEAD', mergeBaseArgs, mergeBase))
+    } else {
+      const countsArgs = [
+        'rev-list',
+        '--left-right',
+        '--count',
+        `${options.comparison.head}...${registration.head}`,
+      ]
+      const countsResult = await runGit(options.projectDirectory, countsArgs)
+      const counts = parseAheadBehind(countsResult)
+      if (!counts) {
+        errors.push(inventoryGitError('Could not count worktree divergence', countsArgs, countsResult))
+      } else {
+        comparison = {
+          ...options.comparison,
+          relation: comparisonRelation(counts.ahead, counts.behind),
+          ahead: counts.ahead,
+          behind: counts.behind,
+          merged: counts.ahead === 0,
+          containsComparison: counts.behind === 0,
+        }
+      }
+    }
+  }
+
+  return {
+    containingBranches,
+    reachableFromLocalBranch: containingBranches === null ? null : containingBranches.length > 0,
+    comparison,
+    errors,
+  }
+}
+
+export async function listWorktreeInventory(
+  projectDirectory: string,
+  options: GitWorktreeInventoryOptions = {},
+): Promise<GitWorktreeInventoryEntry[]> {
+  const directory = path.resolve(projectDirectory)
+  const registrations = await listRegisteredWorktrees(directory)
+  const mainWorktree = registrations.find((registration) => registration.isMainWorktree)
+  const comparisonRef = options.comparisonRef ?? (
+    mainWorktree?.head ? mainWorktree.branch || mainWorktree.head : undefined
+  )
+  let comparison: { ref: string; head: string } | undefined
+  if (comparisonRef) {
+    const args = ['rev-parse', '--verify', `${comparisonRef}^{commit}`]
+    const resolved = await runGit(directory, args)
+    if (resolved.exitCode !== 0) throw gitError(args, resolved)
+    comparison = { ref: comparisonRef, head: resolved.stdout }
+  }
+  const projectCommonDirectory = await absoluteGitPath(directory, '--git-common-dir')
+
+  return Promise.all(registrations.map(async (registration) => {
+    const [checkout, reachability] = await Promise.all([
+      inspectWorktreeCheckout({ projectCommonDirectory, registration }),
+      inspectWorktreeReachability({
+        projectDirectory: directory,
+        registration,
+        ...(comparison ? { comparison } : {}),
+      }),
+    ])
+    return {
+      ...registration,
+      checkoutPresent: checkout.checkoutPresent,
+      checkoutState: checkout.checkoutState,
+      clean: checkout.clean,
+      containingBranches: reachability.containingBranches,
+      reachableFromLocalBranch: reachability.reachableFromLocalBranch,
+      comparison: reachability.comparison,
+      errors: [...checkout.errors, ...reachability.errors],
+    }
+  }))
 }
 
 export async function inspectMergedWorktreeRemoval(

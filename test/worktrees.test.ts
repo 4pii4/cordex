@@ -10,6 +10,7 @@ import {
   getManagedWorktreeDirectory,
   inspectMergedWorktreeRemoval,
   listRegisteredWorktrees,
+  listWorktreeInventory,
   mergeWorktree,
   removeMergedWorktree,
   resolveBestBaseRef,
@@ -593,6 +594,201 @@ test('active worktree listing spans projects and sorts newest first', () => {
     session('new', new Date(2).toISOString()),
   ])
   assert.deepEqual(result.map((item) => item.discordThreadId), ['new', 'old'])
+})
+
+test('git worktree inventory includes manual checkouts with exact status and divergence', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'cordex-worktree-inventory-'))
+  const linkedDirectory = await mkdtemp(path.join(tmpdir(), 'cordex manual worktree-'))
+  await rm(linkedDirectory, { recursive: true, force: true })
+  try {
+    await git(root, ['init', '-b', 'main'])
+    await git(root, ['config', 'user.email', 'cordex@test.invalid'])
+    await git(root, ['config', 'user.name', 'Cordex Test'])
+    await writeFile(path.join(root, 'README.md'), 'base\n')
+    await git(root, ['add', 'README.md'])
+    await git(root, ['commit', '-m', 'base'])
+    await git(root, ['worktree', 'add', '-b', 'manual-feature', linkedDirectory])
+
+    await writeFile(path.join(linkedDirectory, 'FEATURE.md'), 'feature\n')
+    await git(linkedDirectory, ['add', 'FEATURE.md'])
+    await git(linkedDirectory, ['commit', '-m', 'feature'])
+    await writeFile(path.join(root, 'MAIN.md'), 'main moved\n')
+    await git(root, ['add', 'MAIN.md'])
+    await git(root, ['commit', '-m', 'advance main'])
+
+    const mainHead = await gitOutput(root, ['rev-parse', 'main'])
+    const featureHead = await gitOutput(linkedDirectory, ['rev-parse', 'HEAD'])
+    const inventory = await listWorktreeInventory(root)
+    assert.equal(inventory.length, 2)
+
+    const main = inventory.find((entry) => entry.isMainWorktree)
+    assert.ok(main)
+    assert.equal(main.directory, path.resolve(root))
+    assert.equal(main.head, mainHead)
+    assert.equal(main.branch, 'refs/heads/main')
+    assert.equal(main.detached, false)
+    assert.equal(main.checkoutPresent, true)
+    assert.equal(main.checkoutState, 'clean')
+    assert.equal(main.clean, true)
+    assert.deepEqual(main.comparison, {
+      ref: 'refs/heads/main',
+      head: mainHead,
+      relation: 'same',
+      ahead: 0,
+      behind: 0,
+      merged: true,
+      containsComparison: true,
+    })
+    assert.equal(main.reachableFromLocalBranch, true)
+    assert.ok(main.containingBranches?.includes('main'))
+    assert.deepEqual(main.errors, [])
+
+    const linked = inventory.find((entry) => entry.directory === path.resolve(linkedDirectory))
+    assert.ok(linked)
+    assert.equal(linked.isMainWorktree, false)
+    assert.equal(linked.head, featureHead)
+    assert.equal(linked.branch, 'refs/heads/manual-feature')
+    assert.equal(linked.detached, false)
+    assert.equal(linked.checkoutState, 'clean')
+    assert.equal(linked.clean, true)
+    assert.deepEqual(linked.comparison, {
+      ref: 'refs/heads/main',
+      head: mainHead,
+      relation: 'diverged',
+      ahead: 1,
+      behind: 1,
+      merged: false,
+      containsComparison: false,
+    })
+    assert.deepEqual(linked.containingBranches, ['manual-feature'])
+    assert.equal(linked.reachableFromLocalBranch, true)
+    assert.deepEqual(linked.errors, [])
+
+    await writeFile(path.join(linkedDirectory, 'UNTRACKED.md'), 'dirty\n')
+    const dirty = (await listWorktreeInventory(root)).find(
+      (entry) => entry.directory === path.resolve(linkedDirectory),
+    )
+    assert.ok(dirty)
+    assert.equal(dirty.checkoutState, 'dirty')
+    assert.equal(dirty.clean, false)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+    await rm(linkedDirectory, { recursive: true, force: true })
+  }
+})
+
+test('git worktree inventory preserves detached, locked, and prunable registrations', async () => {
+  const { root, dataRoot, created } = await createWorktreeFixture('inventory merged')
+  const lockedDirectory = path.join(dataRoot, 'locked worktree')
+  const missingDirectory = path.join(dataRoot, 'missing worktree')
+  try {
+    await commitAndMergeFixture(root, created)
+    await git(root, ['branch', 'locked-branch'])
+    await git(root, ['worktree', 'add', lockedDirectory, 'locked-branch'])
+    await git(root, ['worktree', 'lock', '--reason', 'inventory test', lockedDirectory])
+    await git(root, ['branch', 'missing-branch'])
+    await git(root, ['worktree', 'add', missingDirectory, 'missing-branch'])
+    await rm(missingDirectory, { recursive: true, force: true })
+
+    const inventory = await listWorktreeInventory(root)
+    assert.equal(inventory.length, 4)
+
+    const merged = inventory.find((entry) => entry.directory === path.resolve(created.directory))
+    assert.ok(merged)
+    assert.equal(merged.detached, true)
+    assert.equal(merged.branch, undefined)
+    assert.equal(merged.checkoutState, 'clean')
+    assert.equal(merged.clean, true)
+    assert.equal(merged.comparison?.relation, 'same')
+    assert.equal(merged.comparison?.merged, true)
+    assert.equal(merged.reachableFromLocalBranch, true)
+    assert.ok(merged.containingBranches?.includes('main'))
+
+    const locked = inventory.find((entry) => entry.directory === path.resolve(lockedDirectory))
+    assert.ok(locked)
+    assert.equal(locked.locked, true)
+    assert.equal(locked.lockedReason, 'inventory test')
+    assert.equal(locked.checkoutPresent, true)
+    assert.equal(locked.checkoutState, 'clean')
+
+    const missing = inventory.find((entry) => entry.directory === path.resolve(missingDirectory))
+    assert.ok(missing)
+    assert.equal(missing.prunable, true)
+    assert.match(missing.prunableReason || '', /non-existent location/)
+    assert.equal(missing.checkoutPresent, false)
+    assert.equal(missing.checkoutState, 'missing')
+    assert.equal(missing.clean, null)
+    assert.equal(missing.comparison?.relation, 'same')
+    assert.equal(missing.comparison?.merged, true)
+    assert.deepEqual(missing.errors, [])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+    await rm(dataRoot, { recursive: true, force: true })
+  }
+})
+
+test('git worktree inventory marks unrelated histories without invented ahead counts', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'cordex-worktree-inventory-unrelated-'))
+  const linkedDirectory = await mkdtemp(path.join(tmpdir(), 'cordex-worktree-unrelated-'))
+  await rm(linkedDirectory, { recursive: true, force: true })
+  try {
+    await git(root, ['init', '-b', 'main'])
+    await git(root, ['config', 'user.email', 'cordex@test.invalid'])
+    await git(root, ['config', 'user.name', 'Cordex Test'])
+    await writeFile(path.join(root, 'README.md'), 'base\n')
+    await git(root, ['add', 'README.md'])
+    await git(root, ['commit', '-m', 'base'])
+    const emptyTree = await gitOutput(root, ['mktree'])
+    const unrelatedHead = await gitOutput(root, ['commit-tree', emptyTree, '-m', 'unrelated root'])
+    await git(root, ['branch', 'unrelated', unrelatedHead])
+    await git(root, ['worktree', 'add', linkedDirectory, 'unrelated'])
+
+    const entry = (await listWorktreeInventory(root)).find(
+      (candidate) => candidate.directory === path.resolve(linkedDirectory),
+    )
+    assert.ok(entry)
+    assert.deepEqual(entry.comparison, {
+      ref: 'refs/heads/main',
+      head: await gitOutput(root, ['rev-parse', 'main']),
+      relation: 'unrelated',
+      ahead: null,
+      behind: null,
+      merged: false,
+      containsComparison: false,
+    })
+    assert.deepEqual(entry.containingBranches, ['unrelated'])
+    assert.deepEqual(entry.errors, [])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+    await rm(linkedDirectory, { recursive: true, force: true })
+  }
+})
+
+test('git worktree inventory handles an unborn main branch without inventing a HEAD', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'cordex-worktree-inventory-unborn-'))
+  try {
+    await git(root, ['init', '-b', 'main'])
+    const inventory = await listWorktreeInventory(root)
+    assert.equal(inventory.length, 1)
+    assert.deepEqual(inventory[0], {
+      directory: path.resolve(root),
+      branch: 'refs/heads/main',
+      detached: false,
+      bare: false,
+      locked: false,
+      prunable: false,
+      isMainWorktree: true,
+      checkoutPresent: true,
+      checkoutState: 'clean',
+      clean: true,
+      containingBranches: null,
+      reachableFromLocalBranch: null,
+      comparison: null,
+      errors: [],
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
 })
 
 test('merged worktree removal is exact and idempotent', async () => {

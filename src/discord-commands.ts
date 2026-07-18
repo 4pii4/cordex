@@ -281,6 +281,30 @@ export function buildSlashCommands() {
       .setDescription('List Codex skills available in project')
       .setDMPermission(false),
     new SlashCommandBuilder()
+      .setName('skill-toggle')
+      .setDescription('Enable or disable a Codex skill')
+      .addStringOption((option) =>
+        option
+          .setName('skill')
+          .setDescription('Codex skill')
+          .setRequired(true)
+          .setAutocomplete(true),
+      )
+      .addBooleanOption((option) =>
+        option.setName('enabled').setDescription('Desired skill state').setRequired(true),
+      )
+      .setDMPermission(false),
+    new SlashCommandBuilder()
+      .setName('skill-roots')
+      .setDescription('Set runtime-only extra Codex skill discovery roots')
+      .addStringOption((option) =>
+        option
+          .setName('paths')
+          .setDescription('Comma-separated absolute directories; empty clears roots')
+          .setMaxLength(4_000),
+      )
+      .setDMPermission(false),
+    new SlashCommandBuilder()
       .setName('mcp-status')
       .setDescription('List Codex MCP server status')
       .setDMPermission(false),

@@ -30,10 +30,12 @@ test('CLI exposes public help and version commands without requiring configurati
   assert.equal(version.stdout.trim(), await packageVersion())
 })
 
-test('CLI send forwards a prompt and absolute file path to the authenticated daemon', async () => {
+test('CLI send forwards a prompt and repeated absolute file paths to the authenticated daemon', async () => {
   const home = await mkdtemp(path.join(tmpdir(), 'cordex-cli-send-'))
   const attachment = path.join(home, 'context.txt')
+  const secondAttachment = path.join(home, 'failure.log')
   await writeFile(attachment, 'context')
+  await writeFile(secondAttachment, 'failure')
   const receivedRequests: CordexDaemonSendRequest[] = []
   const server = await startCordexDaemonIpc({
     home,
@@ -54,6 +56,8 @@ test('CLI send forwards a prompt and absolute file path to the authenticated dae
         '123456789012345678',
         '--file',
         attachment,
+        '--file',
+        secondAttachment,
         'Review',
         'this',
       ],
@@ -64,7 +68,7 @@ test('CLI send forwards a prompt and absolute file path to the authenticated dae
     assert.equal(received?.target.kind, 'thread')
     assert.equal(received?.target.id, '123456789012345678')
     assert.equal(received?.prompt, 'Review this')
-    assert.equal(received?.filePath, attachment)
+    assert.deepEqual(received?.filePaths, [attachment, secondAttachment])
     assert.match(received?.requestId || '', /^[0-9a-f-]{36}$/)
 
     await execFileAsync(
@@ -91,6 +95,70 @@ test('CLI send forwards a prompt and absolute file path to the authenticated dae
       secondReceived?.prompt,
       '--verbose -v --projects-dir literal --help --version',
     )
+  } finally {
+    await server.close()
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('CLI send rejects invalid or excessive file paths before contacting the daemon', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'cordex-cli-files-'))
+  let requests = 0
+  const server = await startCordexDaemonIpc({
+    home,
+    async onSend(request) {
+      requests++
+      return { threadId: request.target.id, position: 0 }
+    },
+  })
+  try {
+    const missing = path.join(home, 'missing.txt')
+    await assert.rejects(
+      execFileAsync(
+        process.execPath,
+        [
+          '--import',
+          'tsx',
+          'src/cli.ts',
+          'send',
+          '--thread',
+          '123456789012345678',
+          '--file',
+          missing,
+          'Review',
+        ],
+        { cwd: process.cwd(), env: { ...process.env, CORDEX_HOME: home } },
+      ),
+      (error: unknown) => {
+        assert.match((error as { stderr?: string }).stderr || '', /File not found/)
+        return true
+      },
+    )
+
+    const attachment = path.join(home, 'context.txt')
+    await writeFile(attachment, 'context')
+    const repeatedFiles = Array.from({ length: 11 }, () => ['--file', attachment]).flat()
+    await assert.rejects(
+      execFileAsync(
+        process.execPath,
+        [
+          '--import',
+          'tsx',
+          'src/cli.ts',
+          'send',
+          '--thread',
+          '123456789012345678',
+          ...repeatedFiles,
+          'Review',
+        ],
+        { cwd: process.cwd(), env: { ...process.env, CORDEX_HOME: home } },
+      ),
+      (error: unknown) => {
+        assert.match((error as { stderr?: string }).stderr || '', /at most 10 times/)
+        return true
+      },
+    )
+    assert.equal(requests, 0)
   } finally {
     await server.close()
     await rm(home, { recursive: true, force: true })

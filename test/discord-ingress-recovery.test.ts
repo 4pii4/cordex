@@ -100,6 +100,8 @@ type InternalBot = {
 class RecoveryCodex extends EventEmitter {
   readonly started: StartTurnOptions[] = []
   readonly steered: SteerTurnOptions[] = []
+  readonly injected: Array<{ threadId: string; items: unknown[] }> = []
+  readonly events: string[] = []
   runtimeReads = 0
 
   constructor(public runtime: CodexThreadRuntimeState = { status: 'idle' }) {
@@ -112,6 +114,7 @@ class RecoveryCodex extends EventEmitter {
   }
 
   async startTurn(options: StartTurnOptions): Promise<string> {
+    this.events.push('turn')
     this.started.push(options)
     return `recovered-turn-${this.started.length}`
   }
@@ -125,6 +128,11 @@ class RecoveryCodex extends EventEmitter {
   }
 
   async updateThreadSettings(): Promise<void> {}
+
+  async injectThreadItems(threadId: string, items: unknown[]): Promise<void> {
+    this.events.push('inject')
+    this.injected.push({ threadId, items: structuredClone(items) })
+  }
 }
 
 class ResumeRecoveryCodex extends RecoveryCodex {
@@ -645,6 +653,43 @@ test('external unarchive recovers direct input and re-arms blocked queued source
       assert.deepEqual(fixture.state.queues[channel.id], [queued])
       assert.equal(fixture.internal.blockedQueuedSourceThreads.has(channel.id), true)
       assert.equal(fixture.internal.queuedSourceRetryTimers.has(channel.id), true)
+    } finally {
+      clearRunTimers(fixture.internal)
+      fixture.bot.client.destroy()
+    }
+  })
+})
+
+test('leading mentions to another user become passive context without starting a turn', async () => {
+  await withTemporaryHome(async (directory) => {
+    const fixture = makeFixture(directory)
+    const channel = makeChannel(fixture.session)
+    fixture.internal.loadedThreads.add(fixture.session.codexThreadId)
+
+    try {
+      await fixture.internal.handleMessage(makeMessage({
+        id: 'passive-context',
+        content: '<@222222222222222222> the deployment is complete',
+        channel,
+      }))
+
+      assert.equal(fixture.codex.injected.length, 1)
+      assert.equal(fixture.codex.injected[0]?.threadId, fixture.session.codexThreadId)
+      assert.match(
+        JSON.stringify(fixture.codex.injected[0]?.items),
+        /did not request a Cordex response/,
+      )
+      assert.equal(fixture.codex.started.length, 0)
+      assert.equal(fixture.codex.steered.length, 0)
+      assert.deepEqual(channel.sent, [])
+
+      await fixture.internal.handleMessage(makeMessage({
+        id: 'next-real-turn',
+        content: 'Summarize the deployment update.',
+        channel,
+      }))
+      assert.deepEqual(fixture.codex.events, ['inject', 'turn'])
+      assert.equal(fixture.codex.started.length, 1)
     } finally {
       clearRunTimers(fixture.internal)
       fixture.bot.client.destroy()

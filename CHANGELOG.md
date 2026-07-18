@@ -6,6 +6,26 @@ versioning once tagged releases begin.
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-07-19
+
+### Added
+
+- Up to ten repeated `--file` attachments for `cordex send --thread`, with mixed
+  UTF-8 text and image input, aggregate limits, legacy client compatibility, and
+  duplicate-image suppression.
+- Passive Discord conversation context for messages in Cordex threads that begin
+  with a mention of another user, without starting or steering a Codex turn.
+- `/skill-toggle` and `/skill-roots` controls backed by Codex skill configuration.
+- Stable Codex app-server wrappers for thread item injection, hooks, plugins,
+  marketplaces, skill configuration, account logout, and workspace messages.
+
+### Changed
+
+- `/diff` now delivers complete binary-capable patches, using bounded attachments
+  when an inline response would be incomplete.
+- `/worktrees` now inventories main, Cordex-managed, and unlinked Git worktrees with
+  checkout state, branch comparison, reachability, lock, prune, and error details.
+
 ## [0.1.3] - 2026-07-19
 
 ### Added

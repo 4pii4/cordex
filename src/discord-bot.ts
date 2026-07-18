@@ -81,6 +81,7 @@ import {
   type DiscordInputResult,
 } from './discord-input.js'
 import { formatThreadHistory } from './history.js'
+import { readGitDiff } from './git-diff.js'
 import { parseQueueMessage } from './queue.js'
 import {
   buildFileAutocompleteChoices,
@@ -117,6 +118,7 @@ import {
   activeWorktreeSessions,
   createWorktree,
   inspectMergedWorktreeRemoval,
+  listWorktreeInventory,
   mergeWorktree,
   removeMergedWorktree,
   removeWorktree,
@@ -160,6 +162,8 @@ const maxMcpToolApprovalDisclosureChunks = 8
 const pendingContextUsageTtlMs = 5 * 60_000
 const maxPendingContextUsage = 100
 const queuedSourceRetryMaxDelayMs = 60_000
+const discordDiffPartBytes = 8 * 1_024 * 1_024
+const maxDiscordDiffParts = 5
 
 function isRecord(value: unknown): value is JsonObject {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -2359,7 +2363,10 @@ export class CordexDiscordBot {
       )
       return
     }
-    if (interaction.commandName === 'skill' && focused.name === 'skill') {
+    if (
+      (interaction.commandName === 'skill' || interaction.commandName === 'skill-toggle') &&
+      focused.name === 'skill'
+    ) {
       if (!interaction.channel?.isThread()) {
         await interaction.respond([])
         return
@@ -2377,7 +2384,11 @@ export class CordexDiscordBot {
         byName.set(skill.name, matches)
       }
       const choices = [...byName.values()]
-        .flatMap((matches) => matches.length === 1 && matches[0]?.enabled ? [matches[0]] : [])
+        .flatMap((matches) =>
+          matches.length === 1 &&
+            (interaction.commandName === 'skill-toggle' || matches[0]?.enabled)
+            ? [matches[0]!]
+            : [])
         .filter((skill) => skill.name.length <= 100)
         .filter((skill) => [
           skill.name,
@@ -2678,6 +2689,8 @@ export class CordexDiscordBot {
       else if (interaction.commandName === 'cancel-task') await this.handleCancelTaskCommand(interaction)
       else if (interaction.commandName === 'skill') await this.handleSkillCommand(interaction)
       else if (interaction.commandName === 'skills') await this.handleSkillsCommand(interaction)
+      else if (interaction.commandName === 'skill-toggle') await this.handleSkillToggleCommand(interaction)
+      else if (interaction.commandName === 'skill-roots') await this.handleSkillRootsCommand(interaction)
       else if (interaction.commandName === 'mcp-status') await this.handleMcpStatusCommand(interaction)
       else if (interaction.commandName === 'mcp') await this.handleMcpCommand(interaction)
       else if (interaction.commandName === 'mcp-login') await this.handleMcpLoginCommand(interaction)
@@ -4876,19 +4889,51 @@ export class CordexDiscordBot {
       ? this.state.sessions[interaction.channel.id]?.directory || project.directory
       : project.directory
     await interaction.deferReply()
-    const result = await runShellCommand({
-      command: 'git diff HEAD --stat && git diff HEAD',
+    const result = await readGitDiff({
       cwd: directory,
-      maxOutputBytes: 100_000,
+      maxBytes: discordDiffPartBytes * maxDiscordDiffParts,
     })
-    const body = result.output || '(no changes)'
-    await interaction.editReply(formatShellCommandResult({
-      command: 'git diff HEAD',
-      output: body,
-      exitCode: result.exitCode,
-      timedOut: result.timedOut,
-      language: 'diff',
-    }))
+    if (result.tooLarge) {
+      throw new Error(
+        `Git diff exceeds the ${discordDiffPartBytes * maxDiscordDiffParts}-byte Discord delivery limit`,
+      )
+    }
+    if (result.exitCode !== 0 || result.timedOut) {
+      await interaction.editReply(formatShellCommandResult({
+        command: 'git diff --binary HEAD',
+        output: result.stderr || 'Git diff failed',
+        exitCode: result.exitCode,
+        timedOut: result.timedOut,
+      }))
+      return
+    }
+    if (result.patch.length === 0) {
+      await interaction.editReply('No uncommitted changes.')
+      return
+    }
+    if (result.patch.length <= 1_500) {
+      await interaction.editReply(formatShellCommandResult({
+        command: 'git diff --binary HEAD',
+        output: result.patch.toString('utf8'),
+        exitCode: 0,
+        language: 'diff',
+      }))
+      return
+    }
+    const files: Array<{ attachment: Buffer; name: string }> = []
+    for (let offset = 0; offset < result.patch.length; offset += discordDiffPartBytes) {
+      const index = files.length + 1
+      files.push({
+        attachment: result.patch.subarray(offset, offset + discordDiffPartBytes),
+        name: result.patch.length <= discordDiffPartBytes
+          ? 'cordex.diff'
+          : `cordex.part-${String(index).padStart(2, '0')}.diff`,
+      })
+    }
+    await interaction.editReply({
+      content: `Complete git diff attached (${result.patch.length.toLocaleString('en-US')} bytes${files.length > 1 ? ` in ${files.length} parts` : ''}).`,
+      files,
+    })
   }
 
   private async handleScheduleCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -5049,6 +5094,52 @@ export class CordexDiscordBot {
       lines.push(`⚠ ${discordInlineCode(truncate(error.path, 120))} — ${truncate(error.message, 180)}`)
     }
     await this.replyWithChunks(interaction, lines.join('\n') || 'No Codex skills found.')
+  }
+
+  private async handleSkillToggleCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const parentId = this.parentChannelId(interaction.channel)
+    const project = this.requireProject(parentId).project
+    const directory = interaction.channel?.isThread()
+      ? this.state.sessions[interaction.channel.id]?.directory || project.directory
+      : project.directory
+    const skillName = interaction.options.getString('skill', true)
+    const enabled = interaction.options.getBoolean('enabled', true)
+    await interaction.deferReply({ ephemeral: true })
+    const { skills } = await this.directorySkills(directory, {
+      refresh: true,
+      forceReload: true,
+    })
+    const matches = skills.filter((skill) => skill.name === skillName)
+    if (matches.length === 0) throw new Error(`Unknown Codex skill: ${skillName}`)
+    if (matches.length > 1) throw new Error(`Codex skill name is ambiguous: ${skillName}`)
+    const skill = matches[0]!
+    const result = await this.codex.writeSkillConfig({ path: skill.path, enabled })
+    this.invalidateSkillCache()
+    const requested = enabled ? 'enabled' : 'disabled'
+    const effective = result.effectiveEnabled ? 'enabled' : 'disabled'
+    await interaction.editReply(
+      `Codex skill **${this.skillDisplayName(skill)}** ${requested}.` +
+      (effective !== requested
+        ? ` Effective state remains **${effective}** because another config layer overrides it.`
+        : ''),
+    )
+  }
+
+  private async handleSkillRootsCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const rawPaths = interaction.options.getString('paths') || ''
+    const requested = [...new Set(
+      rawPaths.split(',').map((value) => value.trim()).filter(Boolean),
+    )]
+    if (requested.length > 25) throw new Error('Specify at most 25 skill roots')
+    await interaction.deferReply({ ephemeral: true })
+    const roots = await Promise.all(requested.map((value) => assertDirectory(value)))
+    await this.codex.setSkillsExtraRoots(roots)
+    this.invalidateSkillCache()
+    await interaction.editReply(
+      roots.length > 0
+        ? `Runtime Codex skill roots set:\n${roots.map((root) => `• \`${root}\``).join('\n')}`
+        : 'Runtime Codex skill roots cleared.',
+    )
   }
 
   private async handleMcpStatusCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -5400,14 +5491,60 @@ export class CordexDiscordBot {
   }
 
   private async handleWorktreesCommand(interaction: ChatInputCommandInteraction): Promise<void> {
-    const sessions = activeWorktreeSessions(Object.values(this.state.sessions))
-    const lines = sessions.map((session) => {
-      const worktree = session.worktree
-      if (!worktree) return ''
-      const project = this.config.projects[session.parentChannelId]
-      return `• <#${session.discordThreadId}> — **${project?.name || path.basename(worktree.projectDirectory)}** — \`${worktree.branch}\`\n  \`${worktree.directory}\``
-    })
-    await this.replyWithChunks(interaction, lines.join('\n') || 'No active worktree sessions.')
+    await interaction.deferReply()
+    const managedByDirectory = new Map(
+      activeWorktreeSessions(Object.values(this.state.sessions)).flatMap((session) =>
+        session.worktree
+          ? [[path.resolve(session.worktree.directory), session] as const]
+          : []),
+    )
+    const projects = new Map<string, { name: string; channels: string[] }>()
+    for (const { channelId, project } of projectMappings(this.config)) {
+      const directory = path.resolve(project.directory)
+      const existing = projects.get(directory)
+      if (existing) existing.channels.push(channelId)
+      else projects.set(directory, {
+        name: project.name || path.basename(directory),
+        channels: [channelId],
+      })
+    }
+
+    const lines: string[] = []
+    for (const [directory, project] of projects) {
+      let inventory
+      try {
+        inventory = await listWorktreeInventory(directory)
+      } catch (error) {
+        lines.push(`• **${project.name}** — unavailable: ${truncate(errorText(error), 300)}`)
+        continue
+      }
+      for (const entry of inventory) {
+        const managed = managedByDirectory.get(path.resolve(entry.directory))
+        const branch = entry.branch?.replace(/^refs\/heads\//, '') || 'detached'
+        const owner = entry.isMainWorktree
+          ? 'main checkout'
+          : managed
+            ? `<#${managed.discordThreadId}>`
+            : 'unlinked worktree'
+        const status = [
+          entry.checkoutState,
+          entry.locked ? `locked${entry.lockedReason ? `: ${entry.lockedReason}` : ''}` : '',
+          entry.prunable ? `prunable${entry.prunableReason ? `: ${entry.prunableReason}` : ''}` : '',
+          entry.comparison
+            ? `${entry.comparison.relation} vs ${entry.comparison.ref}` +
+              (entry.comparison.ahead !== null && entry.comparison.behind !== null
+                ? ` (+${entry.comparison.ahead}/-${entry.comparison.behind})`
+                : '')
+            : '',
+          entry.reachableFromLocalBranch === false ? 'unreachable from local branches' : '',
+        ].filter(Boolean).join(' · ')
+        lines.push(
+          `• **${project.name}** — ${owner} — \`${branch}\`\n  \`${entry.directory}\`\n  ${status || 'status unavailable'}` +
+          (entry.errors.length > 0 ? `\n  ⚠ ${truncate(entry.errors.join('; '), 500)}` : ''),
+        )
+      }
+    }
+    await this.replyWithChunks(interaction, lines.join('\n') || 'No Git worktrees found.')
   }
 
   private async handleMergeWorktreeCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -6188,23 +6325,21 @@ export class CordexDiscordBot {
     const queued = interaction.channel?.isThread()
       ? this.queuedPromptsFor(interaction.channel.id).length
       : 0
-    await interaction.reply({
-      content: [
-        `Project: ${project ? `\`${project.directory}\`` : 'not configured'}`,
-        `Session: ${session ? `\`${session.codexThreadId}\`` : 'none'}`,
-        `Turn: ${session?.activeTurnId ? `active (\`${session.activeTurnId}\`)` : 'idle'}`,
-        `Mode: ${session?.mode || 'default'}`,
-        `Model: ${formatModelLabel(session?.model || this.state.channelModels[parentId] || this.config.defaultModel || 'Codex default', session?.effort || this.state.channelEfforts[parentId] || this.config.defaultEffort || 'default')}`,
-        `Fast mode: ${(session?.fastMode ?? this.state.channelFastMode[parentId] ?? false) ? 'on' : 'off'}`,
-        `YOLO mode: ${(session?.yoloMode ?? this.state.channelYoloMode[parentId] ?? false) ? 'on' : 'off'}`,
-        `Auto worktrees: ${this.state.channelAutoWorktrees[parentId] ? 'enabled' : 'disabled'}`,
-        `Extra roots: ${session?.workspaceRoots?.length || 0}`,
-        `Permissions: ${session?.permissions || this.config.sandbox}`,
-        `Verbosity: ${this.state.channelVerbosity[parentId] || defaultVerbosity}`,
-        `Queue: ${queued}`,
-      ].join('\n'),
-      ephemeral: true,
-    })
+    const lines = [
+      `Project: ${project ? `\`${project.directory}\`` : 'not configured'}`,
+      `Session: ${session ? `\`${session.codexThreadId}\`` : 'none'}`,
+      `Turn: ${session?.activeTurnId ? `active (\`${session.activeTurnId}\`)` : 'idle'}`,
+      `Mode: ${session?.mode || 'default'}`,
+      `Model: ${formatModelLabel(session?.model || this.state.channelModels[parentId] || this.config.defaultModel || 'Codex default', session?.effort || this.state.channelEfforts[parentId] || this.config.defaultEffort || 'default')}`,
+      `Fast mode: ${(session?.fastMode ?? this.state.channelFastMode[parentId] ?? false) ? 'on' : 'off'}`,
+      `YOLO mode: ${(session?.yoloMode ?? this.state.channelYoloMode[parentId] ?? false) ? 'on' : 'off'}`,
+      `Auto worktrees: ${this.state.channelAutoWorktrees[parentId] ? 'enabled' : 'disabled'}`,
+      `Extra roots: ${session?.workspaceRoots?.length || 0}`,
+      `Permissions: ${session?.permissions || this.config.sandbox}`,
+      `Verbosity: ${this.state.channelVerbosity[parentId] || defaultVerbosity}`,
+      `Queue: ${queued}`,
+    ]
+    await interaction.reply({ content: lines.join('\n'), ephemeral: true })
   }
 
   private async handleMessage(message: DiscordMessage): Promise<void> {
@@ -6244,6 +6379,13 @@ export class CordexDiscordBot {
         return
       }
       if (message.channel.isThread()) {
+        const leadingMention = message.content.match(/^\s*<@!?(\d+)>/)
+        if (leadingMention && leadingMention[1] !== this.client.user?.id) {
+          const session = this.state.sessions[message.channel.id]
+          if (!session) return
+          await this.injectPassiveDiscordContext(session, message)
+          return
+        }
         await this.processPrompt(message.channel, parentId, message)
         return
       }
@@ -6274,6 +6416,39 @@ export class CordexDiscordBot {
       if (message.channel.isThread()) await message.channel.send(content).catch(() => undefined)
       else await message.reply(content).catch(() => undefined)
     }
+  }
+
+  private async injectPassiveDiscordContext(
+    session: SessionState,
+    message: DiscordMessage,
+  ): Promise<void> {
+    await this.ensureSessionLoaded(session)
+    const built = await this.buildInput(message)
+    const textContent = built.input
+      .flatMap((item) => item.type === 'text' ? [item.text] : [])
+      .join('\n\n')
+      .trim()
+    const attachmentNames = [...message.attachments.values()]
+      .map((attachment) => attachment.name)
+      .filter((name): name is string => Boolean(name))
+    const body = textContent || message.content.trim() || '(attachment-only message)'
+    const attachmentNote = attachmentNames.length > 0
+      ? `\n\nAttachments referenced in Discord: ${attachmentNames.join(', ')}`
+      : ''
+    await this.codex.injectThreadItems(session.codexThreadId, [{
+      type: 'message',
+      role: 'user',
+      content: [{
+        type: 'input_text',
+        text: [
+          `Discord conversation context from ${message.author.displayName} (${message.author.id}).`,
+          'This message was addressed to another user and did not request a Cordex response.',
+          '',
+          `${body}${attachmentNote}`,
+        ].join('\n'),
+      }],
+    }])
+    await this.pruneAttachmentCache().catch(() => undefined)
   }
 
   private async buildInput(
