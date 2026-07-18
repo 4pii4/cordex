@@ -57,6 +57,7 @@ test('Discord action buttons resolve once and return selection to Codex', async 
         parentChannelId: 'parent-1',
         directory: process.cwd(),
         codexThreadId: 'codex-thread-1',
+        activeTurnId: 'turn-1',
         updatedAt: '2026-07-16T00:00:00.000Z',
       },
     },
@@ -89,6 +90,7 @@ test('Discord action buttons resolve once and return selection to Codex', async 
     session: state.sessions['discord-thread-1'],
     channel,
     model: 'fixture-model',
+    turnId: 'turn-1',
     startedAt: Date.now(),
     agentMessages: new Map(),
     agentText: new Map(),
@@ -180,6 +182,33 @@ test('Discord action buttons resolve once and return selection to Codex', async 
     assert.deepEqual(edits.at(-1), {
       content: '**Action Required**\n_Buttons dismissed._',
       components: [],
+    })
+
+    const sentBeforeStale = sent.length
+    await internal.handleServerRequest({
+      ...request,
+      id: 79,
+      params: { ...request.params, turnId: 'stale-turn' },
+    })
+    assert.equal(sent.length, sentBeforeStale)
+    assert.deepEqual(codex.responses.at(-1), {
+      id: 79,
+      result: {
+        contentItems: [{ type: 'inputText', text: 'Discord turn is no longer active.' }],
+        success: false,
+      },
+    })
+
+    internal.runs.delete('codex-thread-1')
+    delete state.sessions['discord-thread-1']?.activeTurnId
+    await internal.handleServerRequest({ ...request, id: 80 })
+    assert.equal(sent.length, sentBeforeStale)
+    assert.deepEqual(codex.responses.at(-1), {
+      id: 80,
+      result: {
+        contentItems: [{ type: 'inputText', text: 'Discord turn is no longer active.' }],
+        success: false,
+      },
     })
   } finally {
     clearInterval(typingTimer)

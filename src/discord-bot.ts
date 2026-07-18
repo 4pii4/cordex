@@ -14,12 +14,14 @@ import {
   TextInputBuilder,
   TextInputStyle,
   ModalBuilder,
+  Partials,
   ThreadAutoArchiveDuration,
   type AutocompleteInteraction,
   type ButtonInteraction,
   type ChatInputCommandInteraction,
   type Message as DiscordMessage,
   type ModalSubmitInteraction,
+  type PartialMessage,
   type StringSelectMenuInteraction,
   type TextChannel,
   type ThreadChannel,
@@ -39,6 +41,11 @@ import {
 } from './channel-management.js'
 import {
   CodexAppServer,
+  type CodexAppServerReadyEvent,
+  type CodexAppServerRestartEvent,
+  type CodexSkillMetadata,
+  type CodexSkillsListEntry,
+  type CodexThreadRuntimeState,
   type CodexSubagentThread,
   type ReviewTarget,
 } from './codex-app-server.js'
@@ -50,6 +57,7 @@ import {
   type ActionButtonColor,
   type ActionButtonOption,
 } from './action-buttons.js'
+import { parseBtwMessage } from './btw.js'
 import { buildSlashCommands } from './discord-commands.js'
 import {
   formatCompletedToolItem,
@@ -60,9 +68,20 @@ import {
   formatShellCommandResult,
   splitMarkdownForDiscord,
 } from './discord-output.js'
-import { isUnknownDiscordChannelError } from './discord-errors.js'
+import { isUnknownDiscordChannelError, isUnknownDiscordMessageError } from './discord-errors.js'
+import {
+  createDiscordOutboxEntries,
+  discordOutboxOutputKey,
+  ensureDiscordOutboxState,
+  rememberDiscordOutboxDeliveredKey,
+} from './discord-outbox.js'
+import {
+  buildDiscordInput,
+  pruneDiscordAttachmentCache,
+  type DiscordInputResult,
+} from './discord-input.js'
 import { formatThreadHistory } from './history.js'
-import { editQueuedPrompt, parseQueueMessage } from './queue.js'
+import { parseQueueMessage } from './queue.js'
 import {
   buildFileAutocompleteChoices,
   parseFileAutocomplete,
@@ -80,7 +99,8 @@ import {
 } from './projects.js'
 import { runShellCommand } from './shell.js'
 import { KeyedSerialQueue } from './serial.js'
-import { filterScheduledTasks, TaskScheduler } from './scheduler.js'
+import { normalizeThreadTitle } from './thread-title.js'
+import { filterScheduledTasks, scheduledTaskDeliveryId, TaskScheduler } from './scheduler.js'
 import {
   activeWorktreeSessions,
   createWorktree,
@@ -103,9 +123,11 @@ import {
 import { userHasAccess } from './access.js'
 import type {
   CodexModel,
+  CodexThreadSummary,
   CordexConfig,
   CordexState,
   JsonObject,
+  JsonValue,
   QueuedPrompt,
   ReasoningEffort,
   ServerNotification,
@@ -116,10 +138,13 @@ import type {
   VerbosityLevel,
 } from './types.js'
 
-const imageExtensions = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp'])
+type ResumeThreadChoice = CodexThreadSummary & { archived?: boolean }
+
 const actionButtonTtlMs = 24 * 60 * 60_000
+const defaultMcpElicitationTimeoutMinutes = 10
 const pendingContextUsageTtlMs = 5 * 60_000
 const maxPendingContextUsage = 100
+const queuedSourceRetryMaxDelayMs = 60_000
 
 function isRecord(value: unknown): value is JsonObject {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -127,6 +152,18 @@ function isRecord(value: unknown): value is JsonObject {
 
 function text(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined
+}
+
+function reasoningEffort(value: unknown): ReasoningEffort | undefined {
+  return value === 'minimal' ||
+    value === 'low' ||
+    value === 'medium' ||
+    value === 'high' ||
+    value === 'xhigh' ||
+    value === 'max' ||
+    value === 'ultra'
+    ? value
+    : undefined
 }
 
 function truncate(value: string, limit: number): string {
@@ -164,13 +201,6 @@ function actionButtonStyle(color: ActionButtonColor): ButtonStyle {
   return ButtonStyle.Secondary
 }
 
-async function sendCompleteBlock(channel: ThreadChannel, value: string): Promise<void> {
-  const rendered = formatAssistantText(value)
-  for (const chunk of splitMarkdownForDiscord(rendered, 1_900)) {
-    await channel.send({ content: chunk, allowedMentions: { parse: [] } })
-  }
-}
-
 type ActiveRun = {
   session: SessionState
   channel: ThreadChannel
@@ -182,12 +212,42 @@ type ActiveRun = {
   agentText: Map<string, string>
   typingTimer: NodeJS.Timeout
   contextPercent?: number
+  lastError?: string
 }
+
+type InitialSessionLocation = {
+  directory: string
+  worktree?: CreatedWorktree
+  workspaceRoots?: string[]
+}
+
+const ephemeralChatCommands = new Set([
+  'account-usage',
+  'auth-status',
+  'last-sessions',
+  'login',
+  'mcp',
+  'mcp-login',
+  'mcp-status',
+  'rate-limits',
+  'session-id',
+  'status',
+])
 
 type PendingApproval = {
   request: ServerRequest
+  channel: ThreadChannel
   message: DiscordMessage
+  choices: ApprovalChoice[]
+  timeout: NodeJS.Timeout
   userId?: string
+}
+
+type ApprovalChoice = {
+  label: string
+  style: ButtonStyle
+  result: JsonObject
+  confirmation: string
 }
 
 type PendingActionButtons = {
@@ -217,6 +277,12 @@ type PendingUserInput = {
   timeout?: NodeJS.Timeout
 }
 
+type PendingRequestControl = {
+  kind: 'approval' | 'userInput' | 'actionButtons'
+  key: string
+  threadId?: string
+}
+
 export class CordexDiscordBot {
   readonly client: Client
   private readonly runs = new Map<string, ActiveRun>()
@@ -226,18 +292,73 @@ export class CordexDiscordBot {
     update: ContextUsageUpdate
     expiresAt: number
   }>()
+  private readonly goalStatusAnnouncements = new Map<string, string>()
   private readonly loadedThreads = new Set<string>()
   private readonly approvals = new Map<string, PendingApproval>()
   private readonly pendingActionButtons = new Map<string, PendingActionButtons>()
   private readonly pendingUserInputs = new Map<string, PendingUserInput>()
+  private readonly pendingRequestControls = new Map<string, PendingRequestControl>()
+  private readonly pendingTurnStarts = new Set<string>()
+  private readonly abortRequestedThreads = new Set<string>()
   private readonly codexEventQueue = new KeyedSerialQueue()
+  private readonly codexLifecycleQueue = new KeyedSerialQueue()
+  private readonly discordIngressQueue = new KeyedSerialQueue()
+  private readonly promptQueue = new KeyedSerialQueue()
+  private readonly attachmentCacheQueue = new KeyedSerialQueue()
+  private readonly discordOutboxStateQueue = new KeyedSerialQueue()
+  private readonly discordOutboxDeliveryQueue = new KeyedSerialQueue()
   private readonly resumeQueue = new KeyedSerialQueue()
+  private readonly titleQueue = new KeyedSerialQueue()
+  private readonly expectedDiscordTitles = new Map<string, string>()
+  private readonly expectedCodexTitles = new Map<string, string>()
+  private readonly recentDiscordTitleEchoes = new Map<string, Map<string, number>>()
+  private readonly recentCodexTitleEchoes = new Map<string, Map<string, number>>()
+  private readonly pendingCodexTitles = new Map<string, string>()
+  private readonly pendingDiscordTitles = new Map<string, string>()
+  private readonly pendingCodexTitleVerifications = new Map<string, string>()
+  private readonly pendingDiscordTitleVerifications = new Map<string, string>()
+  private readonly titleVerificationRetryTimers = new Map<string, NodeJS.Timeout>()
+  private readonly titleVerificationRetryAttempts = new Map<string, number>()
+  private readonly pendingTitleVerificationSources = new Map<string, 'codex' | 'discord'>()
+  private readonly preserveArchivedUntilResume = new Set<string>()
+  private readonly expectedArchiveNotifications = new Map<
+    string,
+    { kind: 'archived' | 'unarchived'; expiresAt: number }
+  >()
   private readonly mcpConfigQueue = new KeyedSerialQueue()
   private readonly projectMutationQueue = new KeyedSerialQueue()
+  // Reserve inherited worktree directories while a child session is being created.
+  // The reservation closes the gap between selecting a source session and persisting
+  // the new session, so merge cannot detach the checkout in between.
+  private readonly pendingSessionDirectoryReservations = new Map<string, number>()
   private readonly removingProjects = new Set<string>()
+  private readonly blockedQueuedSourceThreads = new Set<string>()
+  private readonly queuedSourceRetryTimers = new Map<string, NodeJS.Timeout>()
+  private readonly queuedSourceRetryAttempts = new Map<string, number>()
+  private readonly deletedDiscordThreads = new Set<string>()
+  private readonly unlinkedCodexSessionChannels = new Set<string>()
+  private readonly pendingCodexNotifications = new Set<Promise<void>>()
+  private readonly pendingCodexDeletionCleanups = new Set<Promise<void>>()
+  private readonly archivingDiscordThreads = new Set<string>()
+  private readonly deletedThreadInterruptedTurns = new Map<string, Set<string>>()
+  private readonly restartAffectedChannels = new Set<string>()
   private readonly projectCandidates = new Map<string, { directory: string; expiresAt: number }>()
   private readonly scheduler: TaskScheduler
+  private codexGeneration = 0
+  private codexRecoveryGeneration = 0
+  private codexRecoveryPromise: Promise<void> | undefined
+  private resolveCodexRecovery: (() => void) | undefined
+  private latestCodexReset: Promise<void> = Promise.resolve()
+  private latestCodexResetGeneration = -1
+  private ingressReady: Promise<void> = Promise.resolve()
+  private releaseIngressReady: (() => void) | undefined
+  private stopping = false
   private modelCache: { expiresAt: number; models: CodexModel[] } | undefined
+  private skillCacheGeneration = 0
+  private readonly skillCache = new Map<
+    string,
+    { expiresAt: number; entries: CodexSkillsListEntry[] }
+  >()
 
   constructor(
     private readonly config: CordexConfig,
@@ -245,6 +366,7 @@ export class CordexDiscordBot {
     private readonly codex: CodexAppServer,
     private readonly options: { verbose?: boolean } = {},
   ) {
+    ensureDiscordOutboxState(this.state)
     this.scheduler = new TaskScheduler(
       this.state.tasks,
       (task) => this.runScheduledTask(task),
@@ -256,48 +378,203 @@ export class CordexDiscordBot {
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
       ],
+      partials: [Partials.Channel, Partials.Message],
     })
     this.client.on(Events.MessageCreate, (message) => {
-      void this.handleMessage(message)
+      void this.discordIngressQueue.run(message.channel.id, async () => {
+        await this.waitForIngressReady()
+        await this.handleMessage(message)
+      })
+        .catch((error: unknown) => {
+          console.error(`Failed to handle Discord message: ${errorText(error)}`)
+        })
     })
     this.client.on(Events.MessageUpdate, (_oldMessage, message) => {
-      void this.handleQueuedMessageUpdate(message)
+      void this.discordIngressQueue.run(
+        message.channel.id,
+        async () => {
+          await this.waitForIngressReady()
+          let resolved: DiscordMessage
+          if (message.partial) {
+            try {
+              resolved = await (message as unknown as PartialMessage).fetch()
+            } catch (error) {
+              if (isUnknownDiscordMessageError(error)) {
+                await this.handleQueuedMessageDelete(message.id)
+                return
+              }
+              throw error
+            }
+          } else {
+            resolved = message
+          }
+          if (resolved.editedTimestamp === null) return
+          await this.handleQueuedMessageUpdate(resolved)
+        },
+      ).catch((error: unknown) => {
+        console.error(`Failed to handle Discord message update: ${errorText(error)}`)
+      })
     })
     this.client.on(Events.MessageDelete, (message) => {
-      void this.handleQueuedMessageDelete(message.id)
+      void this.discordIngressQueue.run(
+        message.channel.id,
+        async () => {
+          await this.waitForIngressReady()
+          await this.handleQueuedMessageDelete(message.id)
+        },
+      ).catch((error: unknown) => {
+        console.error(`Failed to handle Discord message deletion: ${errorText(error)}`)
+      })
     })
     this.client.on(Events.ChannelDelete, (channel) => {
-      void this.handleChannelDelete(channel.id)
+      void this.discordIngressQueue.run(channel.id, () => this.handleChannelDelete(channel.id))
+        .catch((error: unknown) => {
+          console.error(`Failed to handle Discord channel deletion: ${errorText(error)}`)
+        })
     })
     this.client.on(Events.ThreadDelete, (thread) => {
-      void this.handleThreadDelete(thread.id)
+      this.clearQueuedSourceBlock(thread.id)
+      this.unlinkedCodexSessionChannels.delete(thread.id)
+      this.expectedDiscordTitles.delete(thread.id)
+      this.recentDiscordTitleEchoes.delete(thread.id)
+      this.pendingDiscordTitles.delete(thread.id)
+      this.pendingDiscordTitleVerifications.delete(thread.id)
+      const session = this.state.sessions[thread.id]
+      if (session) {
+        this.clearTitleVerificationState(session.codexThreadId, [thread.id])
+        this.expectedCodexTitles.delete(session.codexThreadId)
+        this.pendingCodexTitles.delete(session.codexThreadId)
+        this.recentCodexTitleEchoes.delete(session.codexThreadId)
+      }
+      const firstDeletion = !this.deletedDiscordThreads.has(thread.id)
+      this.deletedDiscordThreads.add(thread.id)
+      const interruption = firstDeletion
+        ? this.interruptDeletedThreadTurn(thread.id)
+        : Promise.resolve()
+      void this.discordIngressQueue.run(
+        thread.id,
+        () => this.handleThreadDelete(thread.id, interruption),
+      )
+        .catch((error: unknown) => {
+          console.error(`Failed to handle Discord thread deletion: ${errorText(error)}`)
+        })
+    })
+    this.client.on(Events.ThreadUpdate, (oldThread, newThread) => {
+      if (oldThread.name === newThread.name) return
+      void this.discordIngressQueue.run(
+        newThread.id,
+        () => this.handleDiscordThreadTitleUpdate(newThread, oldThread.name),
+      ).catch((error: unknown) => {
+        console.error(`Failed to synchronize Discord thread title: ${errorText(error)}`)
+      })
     })
     this.client.on(Events.InteractionCreate, (interaction) => {
       if (interaction.isAutocomplete()) void this.handleAutocomplete(interaction)
-      else if (interaction.isChatInputCommand()) void this.handleCommand(interaction)
-      else if (interaction.isButton()) void this.handleButton(interaction)
-      else if (interaction.isStringSelectMenu()) {
-        if (interaction.customId.startsWith('fork-subagent:')) {
-          void this.handleForkSubagentSelect(interaction)
-        } else {
-          void this.handleUserInputSelect(interaction)
+      else if (interaction.isChatInputCommand()) {
+        if (interaction.commandName === 'abort') {
+          void this.handlePriorityCommand(interaction).catch((error: unknown) => {
+            console.error(`Failed to handle Discord abort command: ${errorText(error)}`)
+          })
+        }
+        else {
+          void this.handleQueuedCommand(interaction)
+            .catch((error: unknown) => {
+              console.error(`Failed to handle Discord command: ${errorText(error)}`)
+            })
         }
       }
-      else if (interaction.isModalSubmit()) void this.handleUserInputModal(interaction)
+      else if (interaction.isButton()) {
+        void this.handleButton(interaction).catch((error: unknown) => {
+          console.error(`Failed to handle Discord button: ${errorText(error)}`)
+        })
+      }
+      else if (interaction.isStringSelectMenu()) {
+        if (interaction.customId.startsWith('fork-subagent:')) {
+          void this.handleForkSubagentSelect(interaction).catch((error: unknown) => {
+            console.error(`Failed to handle Discord selection: ${errorText(error)}`)
+          })
+        } else {
+          void this.handleUserInputSelect(interaction).catch((error: unknown) => {
+            console.error(`Failed to handle Discord selection: ${errorText(error)}`)
+          })
+        }
+      }
+      else if (interaction.isModalSubmit()) {
+        void this.handleUserInputModal(interaction).catch((error: unknown) => {
+          console.error(`Failed to handle Discord modal: ${errorText(error)}`)
+        })
+      }
     })
     this.codex.on('notification', (notification: ServerNotification) => {
       this.logVerbose('notification', notification)
-      void this.enqueueNotification(notification).catch((error: unknown) => {
-        console.error(`Failed to handle Codex notification: ${errorText(error)}`)
-      })
+      const generation = this.codexGeneration
+      const handling = this.enqueueNotification(notification, generation)
+        .catch((error: unknown) => {
+          console.error(`Failed to handle Codex notification: ${errorText(error)}`)
+        })
+      this.pendingCodexNotifications.add(handling)
+      void handling.finally(() => this.pendingCodexNotifications.delete(handling))
     })
     this.codex.on('serverRequest', (request: ServerRequest) => {
       this.logVerbose('server request', request)
-      void this.enqueueServerRequest(request).catch((error: unknown) => {
+      const generation = this.codexGeneration
+      void this.enqueueServerRequest(request, generation).catch((error: unknown) => {
         console.error(`Failed to handle Codex server request: ${errorText(error)}`)
       })
     })
     this.codex.on('protocolError', (error: Error) => console.error(error.message))
+    this.codex.on('childFailure', () => {
+      this.codexGeneration += 1
+      this.beginCodexRecovery(this.codexLifecycleGeneration())
+    })
+    this.codex.on('restarting', (event: CodexAppServerRestartEvent) => {
+      const generation = event.generation ?? this.codexLifecycleGeneration()
+      this.beginCodexRecovery(generation)
+      const reset = this.onCodexRestarting(event, generation)
+      this.latestCodexReset = reset
+      this.latestCodexResetGeneration = generation
+      void reset.catch((error: unknown) => {
+        console.error(`Failed to reset Cordex state after app-server exit: ${errorText(error)}`)
+      })
+    })
+    this.codex.on('ready', (event: CodexAppServerReadyEvent) => {
+      if (!event.restartAttempt) return
+      const generation = event.generation ?? this.codexLifecycleGeneration()
+      this.beginCodexRecovery(generation)
+      const reset = this.latestCodexReset
+      void this.codexLifecycleQueue.run('app-server', async () => {
+        await reset
+        if (generation !== this.codexLifecycleGeneration()) return
+        await this.onCodexRecovered(generation)
+      })
+        .catch((error: unknown) => {
+          console.error(`Failed to recover Cordex sessions after app-server restart: ${errorText(error)}`)
+        })
+        .finally(() => this.finishCodexRecovery(generation))
+    })
+    this.codex.on('failed', (error: Error) => {
+      const generation = this.codexLifecycleGeneration()
+      this.beginCodexRecovery(generation)
+      const reset = this.latestCodexResetGeneration === generation
+        ? this.latestCodexReset
+        : this.onCodexRestarting({
+            generation,
+            attempt: 0,
+            delayMs: 0,
+            error,
+          }, generation, false)
+      this.latestCodexReset = reset
+      this.latestCodexResetGeneration = generation
+      void this.codexLifecycleQueue.run('app-server', async () => {
+        await reset
+        if (generation !== this.codexLifecycleGeneration()) return
+        await this.onCodexRecoveryFailed(error)
+      })
+        .catch((recoveryError: unknown) => {
+          console.error(`Failed to report terminal app-server failure: ${errorText(recoveryError)}`)
+        })
+        .finally(() => this.finishCodexRecovery(generation))
+    })
     this.codex.on('stderr', (chunk: string) => {
       if (this.options.verbose || /\b(error|panic|fatal)\b/i.test(chunk)) {
         console.error(`[codex stderr] ${chunk.trim()}`)
@@ -310,48 +587,917 @@ export class CordexDiscordBot {
     console.error(`[cordex ${label}] ${JSON.stringify(value)}`)
   }
 
-  async start(): Promise<void> {
-    await this.registerCommands()
-    await this.client.login(this.config.token)
+  private respondToCodex(request: ServerRequest, result: unknown): boolean {
     try {
-      await withManagementLock(async () => {
-        await this.refreshProjectsFromDisk()
-        await this.pruneDeletedProjectMappings()
-        await this.pruneOrphanedState()
-        const guild = await this.client.guilds.fetch(this.config.guildId)
-        const root = await ensureRootChannel({
-          guild,
-          config: this.config,
-          ...(this.client.user?.username ? { botName: this.client.user.username } : {}),
+      const respondTo = (this.codex as CodexAppServer & {
+        respondTo?: (request: ServerRequest, result: unknown) => void
+      }).respondTo
+      if (respondTo) respondTo.call(this.codex, request, result)
+      else this.codex.respond(request.id, result)
+      return true
+    } catch (error) {
+      this.logVerbose('stale server response ignored', {
+        requestId: request.id,
+        method: request.method,
+        error: errorText(error),
+      })
+      return false
+    }
+  }
+
+  private beginCodexRecovery(generation: number): void {
+    this.codexRecoveryGeneration = generation
+    if (this.codexRecoveryPromise) return
+    this.codexRecoveryPromise = new Promise<void>((resolve) => {
+      this.resolveCodexRecovery = resolve
+    })
+  }
+
+  private codexLifecycleGeneration(): number {
+    const generation = (this.codex as CodexAppServer & { generation?: number }).generation
+    return typeof generation === 'number' ? generation : this.codexGeneration
+  }
+
+  private finishCodexRecovery(generation: number): void {
+    if (generation !== this.codexRecoveryGeneration) return
+    this.resolveCodexRecovery?.()
+    this.resolveCodexRecovery = undefined
+    this.codexRecoveryPromise = undefined
+  }
+
+  private async waitForCodexRecovery(): Promise<void> {
+    while (this.codexRecoveryPromise) await this.codexRecoveryPromise
+  }
+
+  private beginIngressBarrier(): void {
+    if (this.releaseIngressReady) return
+    this.ingressReady = new Promise<void>((resolve) => {
+      this.releaseIngressReady = resolve
+    })
+  }
+
+  private finishIngressBarrier(): void {
+    this.releaseIngressReady?.()
+    this.releaseIngressReady = undefined
+    this.ingressReady = Promise.resolve()
+  }
+
+  private async waitForIngressReady(): Promise<void> {
+    await this.ingressReady
+    if (this.stopping) throw new Error('Cordex is stopping')
+  }
+
+  // State mutations wait for both startup and Codex restart recovery.
+  private async waitForMutationIngressReady(): Promise<void> {
+    await this.waitForIngressReady()
+    await this.waitForCodexRecovery()
+    if (this.stopping) throw new Error('Cordex is stopping')
+  }
+
+  private async pruneAttachmentCache(): Promise<void> {
+    await this.attachmentCacheQueue.run('attachments', async () => {
+      const protectedPaths = Object.values(this.state.queues).flatMap((queue) =>
+        queue.flatMap((prompt) => prompt.input.flatMap((item) =>
+          item.type === 'localImage' ? [item.path] : [])))
+      await pruneDiscordAttachmentCache({ protectedPaths })
+    })
+  }
+
+  private preserveDiscordTitleEchoesAcrossRestart(): void {
+    for (const [discordThreadId, title] of this.expectedDiscordTitles) {
+      this.rememberTitleEcho(this.recentDiscordTitleEchoes, discordThreadId, title)
+    }
+    this.expectedDiscordTitles.clear()
+  }
+
+  private async onCodexRestarting(
+    event: CodexAppServerRestartEvent,
+    generation = this.codexLifecycleGeneration(),
+    announceRestart = true,
+  ): Promise<void> {
+    this.logVerbose('app-server restarting', {
+      attempt: event.attempt,
+      delayMs: event.delayMs,
+      error: event.error.message,
+    })
+    this.loadedThreads.clear()
+    this.preserveDiscordTitleEchoesAcrossRestart()
+    this.expectedCodexTitles.clear()
+    this.recentCodexTitleEchoes.clear()
+    this.invalidateSkillCache()
+    for (const timer of this.titleVerificationRetryTimers.values()) clearTimeout(timer)
+    this.titleVerificationRetryTimers.clear()
+    this.expectedArchiveNotifications.clear()
+    this.pendingTurnStarts.clear()
+    const sessionsByThread = new Map<string, SessionState[]>()
+    for (const session of Object.values(this.state.sessions)) {
+      const sessions = sessionsByThread.get(session.codexThreadId) || []
+      sessions.push(session)
+      sessionsByThread.set(session.codexThreadId, sessions)
+    }
+    const threadIds = new Set([...sessionsByThread.keys(), ...this.runs.keys()])
+    const interruptedRuns: ActiveRun[] = []
+    await Promise.all(Array.from(threadIds, (threadId) => this.codexEventQueue.run(threadId, async () => {
+      const run = this.runs.get(threadId)
+      if (run) {
+        clearInterval(run.typingTimer)
+        this.runs.delete(threadId)
+        interruptedRuns.push(run)
+        this.restartAffectedChannels.add(run.channel.id)
+      }
+      const sessions = sessionsByThread.get(threadId) || []
+      for (const session of sessions) {
+        if (session.activeTurnId) this.restartAffectedChannels.add(session.discordThreadId)
+        delete session.activeTurnId
+        session.updatedAt = new Date().toISOString()
+        await this.dismissPendingControlsForChannel(
+          session.discordThreadId,
+          '_Codex runtime restarted._',
+        )
+      }
+    })))
+    await saveState(this.state)
+    if (announceRestart && generation === this.codexLifecycleGeneration()) {
+      await Promise.all(interruptedRuns.map((run) => run.channel.send(
+        `⚠ Codex runtime stopped unexpectedly and is restarting (attempt ${event.attempt}). The interrupted turn was ended.`,
+      ).catch(() => undefined)))
+    }
+  }
+
+  private async onCodexRecovered(generation = this.codexLifecycleGeneration()): Promise<void> {
+    await this.recoverDiscordOutbox()
+    if (generation !== this.codexLifecycleGeneration()) return
+    await this.resumeActiveGoalSessions(generation)
+    if (generation !== this.codexLifecycleGeneration()) return
+    await this.reconcileSessionTitles(generation)
+    if (generation !== this.codexLifecycleGeneration()) return
+    for (const session of Object.values(this.state.sessions)) {
+      if (generation !== this.codexLifecycleGeneration()) return
+      if (session.archived) continue
+      if ((this.state.queues[session.discordThreadId]?.length || 0) === 0) continue
+      const channel = await this.client.channels.fetch(session.discordThreadId).catch(() => undefined)
+      if (generation !== this.codexLifecycleGeneration()) return
+      if (channel?.isThread()) {
+        await this.recoverPersistedPrompts(session, channel, false).catch((error: unknown) => {
+          this.logVerbose('persisted prompt recovery after app-server restart failed', {
+            threadId: session.codexThreadId,
+            error: errorText(error),
+          })
         })
-        if (root) {
-          try {
-            await saveManagedConfig(this.config)
-          } catch (error) {
-            if (root.created) {
-              delete this.config.projects[root.textChannel.id]
-              await root.textChannel.delete('Cordex root mapping could not be saved').catch(() => undefined)
+      }
+    }
+    if (generation !== this.codexLifecycleGeneration()) return
+    const affectedChannels = [...this.restartAffectedChannels]
+    this.restartAffectedChannels.clear()
+    await Promise.all(affectedChannels.map(async (channelId) => {
+      const channel = await this.client.channels.fetch(channelId).catch(() => undefined)
+      if (channel?.isThread()) await channel.send('✓ Codex runtime recovered.').catch(() => undefined)
+    }))
+  }
+
+  private async onCodexRecoveryFailed(error: Error): Promise<void> {
+    const affectedChannels = [...this.restartAffectedChannels]
+    this.restartAffectedChannels.clear()
+    await Promise.all(affectedChannels.map(async (channelId) => {
+      const channel = await this.client.channels.fetch(channelId).catch(() => undefined)
+      if (channel?.isThread()) {
+        await channel.send(`⨯ Codex runtime recovery failed: ${truncate(error.message, 1_750)}`)
+          .catch(() => undefined)
+      }
+    }))
+  }
+
+  async start(): Promise<void> {
+    this.stopping = false
+    this.beginIngressBarrier()
+    let started = false
+    try {
+      await this.pruneAttachmentCache().catch((error: unknown) => {
+        console.error(`Failed to prune Discord attachment cache: ${errorText(error)}`)
+      })
+      await this.registerCommands()
+      await this.client.login(this.config.token)
+      try {
+        await withManagementLock(async () => {
+          await this.refreshProjectsFromDisk()
+          await this.pruneDeletedProjectMappings()
+          await this.pruneOrphanedState()
+          const guild = await this.client.guilds.fetch(this.config.guildId)
+          const root = await ensureRootChannel({
+            guild,
+            config: this.config,
+            ...(this.client.user?.username ? { botName: this.client.user.username } : {}),
+          })
+          if (root) {
+            try {
+              await saveManagedConfig(this.config)
+            } catch (error) {
+              if (root.created) {
+                delete this.config.projects[root.textChannel.id]
+                await root.textChannel.delete('Cordex root mapping could not be saved').catch(() => undefined)
+              }
+              throw error
             }
-            throw error
+            if (root.created) {
+              await this.sendRootWelcome(root.textChannel).catch((error: unknown) => {
+                console.error(`Failed to send Cordex root welcome: ${errorText(error)}`)
+              })
+            }
           }
-          if (root.created) {
-            await this.sendRootWelcome(root.textChannel).catch((error: unknown) => {
-              console.error(`Failed to send Cordex root welcome: ${errorText(error)}`)
-            })
-          }
+        })
+      } catch (error) {
+        throw new Error(`Cordex channel setup failed: ${errorText(error)}`, { cause: error })
+      }
+      await this.recoverDiscordOutbox()
+      await this.reconcilePersistedQueuedSources()
+      await this.resumeActiveGoalSessions()
+      await this.reconcileSessionTitles()
+      await this.recoverPersistedPromptQueues()
+      this.scheduler.start()
+      started = true
+    } finally {
+      if (!started) {
+        this.stopping = true
+        this.clearAllQueuedSourceRetries()
+      }
+      this.finishIngressBarrier()
+    }
+  }
+
+  private async recoverPersistedPromptQueues(): Promise<void> {
+    for (const session of Object.values(this.state.sessions)) {
+      if (session.archived || (this.state.queues[session.discordThreadId]?.length || 0) === 0) {
+        continue
+      }
+      const channel = await this.client.channels.fetch(session.discordThreadId).catch(() => undefined)
+      if (!channel?.isThread()) continue
+      await this.recoverPersistedPrompts(session, channel).catch((error: unknown) => {
+        this.logVerbose('persisted prompt startup recovery failed', {
+          threadId: session.codexThreadId,
+          error: errorText(error),
+        })
+      })
+    }
+  }
+
+  private async updateDiscordOutbox(
+    update: (
+      outbox: NonNullable<CordexState['discordOutbox']>,
+      deliveredKeys: NonNullable<CordexState['discordOutboxDeliveredKeys']>,
+    ) => boolean,
+  ): Promise<boolean> {
+    return this.discordOutboxStateQueue.run('state', async () => {
+      const { outbox, deliveredKeys } = ensureDiscordOutboxState(this.state)
+      const previousOutbox = [...outbox]
+      const previousDeliveredKeys = [...deliveredKeys]
+      if (!update(outbox, deliveredKeys)) return false
+      try {
+        await saveState(this.state)
+      } catch (error) {
+        outbox.splice(0, outbox.length, ...previousOutbox)
+        deliveredKeys.splice(0, deliveredKeys.length, ...previousDeliveredKeys)
+        throw error
+      }
+      return true
+    })
+  }
+
+  private async persistDiscordOutput(entries: ReturnType<typeof createDiscordOutboxEntries>): Promise<void> {
+    const outputKey = entries[0] ? discordOutboxOutputKey(entries[0]) : undefined
+    if (!outputKey) return
+    await this.updateDiscordOutbox((outbox, deliveredKeys) => {
+      const pending = new Set(outbox.map((entry) => entry.key))
+      const delivered = new Set(deliveredKeys)
+      if (
+        delivered.has(outputKey) ||
+        outbox.some((entry) => discordOutboxOutputKey(entry) === outputKey)
+      ) return false
+      let changed = false
+      for (const entry of entries) {
+        if (pending.has(entry.key) || delivered.has(entry.key)) continue
+        outbox.push(entry)
+        pending.add(entry.key)
+        changed = true
+      }
+      return changed
+    })
+  }
+
+  private async acknowledgeDiscordOutput(key: string): Promise<void> {
+    await this.updateDiscordOutbox((outbox, deliveredKeys) => {
+      const index = outbox.findIndex((entry) => entry.key === key)
+      if (index < 0) return false
+      const entry = outbox[index]
+      if (!entry) return false
+      const outputKey = discordOutboxOutputKey(entry)
+      outbox.splice(index, 1)
+      rememberDiscordOutboxDeliveredKey(deliveredKeys, key)
+      if (!outbox.some((candidate) => discordOutboxOutputKey(candidate) === outputKey)) {
+        rememberDiscordOutboxDeliveredKey(deliveredKeys, outputKey)
+      }
+      return true
+    })
+  }
+
+  private async drainDiscordOutbox(channel: ThreadChannel): Promise<void> {
+    await this.discordOutboxDeliveryQueue.run(channel.id, async () => {
+      while (true) {
+        const entry = this.state.discordOutbox?.find(
+          (candidate) => candidate.discordThreadId === channel.id,
+        )
+        if (!entry) return
+        await channel.send({
+          content: entry.content,
+          allowedMentions: { parse: [] },
+          nonce: entry.nonce,
+          enforceNonce: true,
+        })
+        await this.acknowledgeDiscordOutput(entry.key)
+      }
+    })
+  }
+
+  private async stageDurableDiscordOutput(options: {
+    channel: ThreadChannel
+    codexThreadId: string
+    turnId: string
+    itemKey: string
+    value: string
+    format?: boolean
+  }): Promise<void> {
+    const rendered = options.format === false ? options.value : formatAssistantText(options.value)
+    const chunks = splitMarkdownForDiscord(rendered, 1_900)
+    await this.persistDiscordOutput(createDiscordOutboxEntries({
+      discordThreadId: options.channel.id,
+      codexThreadId: options.codexThreadId,
+      turnId: options.turnId,
+      itemKey: options.itemKey,
+      chunks,
+    }))
+  }
+
+  private async sendDurableDiscordOutput(options: {
+    channel: ThreadChannel
+    codexThreadId: string
+    turnId: string
+    itemKey: string
+    value: string
+    format?: boolean
+  }): Promise<void> {
+    await this.stageDurableDiscordOutput(options)
+    await this.drainDiscordOutbox(options.channel)
+  }
+
+  private async recoverDiscordOutbox(): Promise<void> {
+    const threadIds = [...new Set(
+      (this.state.discordOutbox || []).map((entry) => entry.discordThreadId),
+    )]
+    for (const discordThreadId of threadIds) {
+      const channel = await this.client.channels.fetch(discordThreadId).catch(() => undefined)
+      if (!channel?.isThread()) continue
+      await this.drainDiscordOutbox(channel).catch((error: unknown) => {
+        this.logVerbose('Discord outbox recovery failed', {
+          discordThreadId,
+          error: errorText(error),
+        })
+      })
+    }
+  }
+
+  private clearQueuedSourceBlock(threadId: string): void {
+    this.blockedQueuedSourceThreads.delete(threadId)
+    this.queuedSourceRetryAttempts.delete(threadId)
+    const timer = this.queuedSourceRetryTimers.get(threadId)
+    if (timer) clearTimeout(timer)
+    this.queuedSourceRetryTimers.delete(threadId)
+  }
+
+  private clearAllQueuedSourceRetries(): void {
+    for (const timer of this.queuedSourceRetryTimers.values()) clearTimeout(timer)
+    this.queuedSourceRetryTimers.clear()
+    this.queuedSourceRetryAttempts.clear()
+    this.blockedQueuedSourceThreads.clear()
+  }
+
+  private markQueuedSourceBlocked(threadId: string): void {
+    this.blockedQueuedSourceThreads.add(threadId)
+    this.scheduleQueuedSourceRetry(threadId)
+  }
+
+  private scheduleQueuedSourceRetry(threadId: string): void {
+    const session = this.state.sessions[threadId]
+    if (
+      this.stopping ||
+      this.queuedSourceRetryTimers.has(threadId) ||
+      !this.blockedQueuedSourceThreads.has(threadId) ||
+      !session ||
+      session.archived ||
+      this.deletedDiscordThreads.has(threadId)
+    ) return
+    const attempt = this.queuedSourceRetryAttempts.get(threadId) || 0
+    const delayMs = Math.min(queuedSourceRetryMaxDelayMs, 1_000 * 2 ** Math.min(attempt, 6))
+    this.queuedSourceRetryAttempts.set(threadId, attempt + 1)
+    const timer = setTimeout(() => {
+      this.queuedSourceRetryTimers.delete(threadId)
+      void this.retryBlockedQueuedSourceThread(threadId).catch((error: unknown) => {
+        this.logVerbose('queued source retry failed', {
+          discordThreadId: threadId,
+          error: errorText(error),
+        })
+      }).finally(() => {
+        if (this.blockedQueuedSourceThreads.has(threadId)) {
+          this.scheduleQueuedSourceRetry(threadId)
         }
       })
-    } catch (error) {
-      throw new Error(`Cordex channel setup failed: ${errorText(error)}`, { cause: error })
+    }, delayMs)
+    timer.unref()
+    this.queuedSourceRetryTimers.set(threadId, timer)
+  }
+
+  private async retryBlockedQueuedSourceThread(threadId: string): Promise<void> {
+    if (this.stopping || !this.blockedQueuedSourceThreads.has(threadId)) return
+    const session = this.state.sessions[threadId]
+    if (!session || this.deletedDiscordThreads.has(threadId)) {
+      this.clearQueuedSourceBlock(threadId)
+      return
     }
-    this.scheduler.start()
+    if (session.archived) return
+    let channel: ThreadChannel | undefined
+    try {
+      const fetched = await this.client.channels.fetch(threadId, { force: true })
+      if (fetched?.isThread()) channel = fetched
+    } catch (error) {
+      if (isUnknownDiscordChannelError(error)) {
+        this.clearQueuedSourceBlock(threadId)
+        return
+      }
+      this.markQueuedSourceBlocked(threadId)
+      this.logVerbose('queued source channel retry failed', {
+        threadId: session.codexThreadId,
+        error: errorText(error),
+      })
+      return
+    }
+    if (!channel) {
+      this.markQueuedSourceBlocked(threadId)
+      this.logVerbose('queued source channel retry returned no thread', {
+        threadId: session.codexThreadId,
+      })
+      return
+    }
+    await this.promptQueue.run(threadId, () =>
+      this.reconcilePersistedQueuedSourcesUnlocked(session, channel))
+    if (this.blockedQueuedSourceThreads.has(threadId)) return
+    await this.recoverPersistedPrompts(session, channel)
+  }
+
+  private async reconcilePersistedQueuedSourcesUnlocked(
+    session: SessionState,
+    channel: ThreadChannel,
+  ): Promise<void> {
+    const current = this.state.sessions[channel.id]
+    if (current?.codexThreadId !== session.codexThreadId) {
+      this.clearQueuedSourceBlock(channel.id)
+      return
+    }
+    const queue = this.queueFor(channel.id)
+    const originalQueue = [...queue]
+    let changed = false
+    let blocked = false
+    for (const prompt of [...queue]) {
+      if (
+        this.promptDeliveryKind(prompt) !== 'queued' ||
+        !prompt.sourceMessageId
+      ) continue
+      let message: DiscordMessage
+      try {
+        message = await channel.messages.fetch(prompt.sourceMessageId)
+      } catch (error) {
+        if (isUnknownDiscordMessageError(error)) {
+          const index = queue.indexOf(prompt)
+          if (index >= 0) queue.splice(index, 1)
+          changed = true
+        } else {
+          blocked = true
+          this.logVerbose('queued source message reconciliation failed', {
+            threadId: session.codexThreadId,
+            messageId: prompt.sourceMessageId,
+            error: errorText(error),
+          })
+        }
+        continue
+      }
+      const parsed = parseQueueMessage(message.content)
+      if (!parsed.queued) {
+        const index = queue.indexOf(prompt)
+        if (index >= 0) queue.splice(index, 1)
+        changed = true
+        continue
+      }
+      let input: UserInput[]
+      try {
+        const built = await this.buildInput(message, parsed.text)
+        const retryableFeedback = built.feedback.filter((item) =>
+          item.retryable === true ||
+          item.code === 'attachment-download-failed' ||
+          item.code === 'image-storage-failed')
+        if (retryableFeedback.length > 0) {
+          throw new Error(
+            retryableFeedback.map((item) => item.message).join(' '),
+          )
+        }
+        if (built.input.length === 0) {
+          const index = queue.indexOf(prompt)
+          if (index >= 0) queue.splice(index, 1)
+          changed = true
+          continue
+        }
+        input = built.input
+      } catch (error) {
+        blocked = true
+        this.logVerbose('queued source input rebuild failed', {
+          threadId: session.codexThreadId,
+          messageId: prompt.sourceMessageId,
+          error: errorText(error),
+        })
+        continue
+      }
+      const index = queue.indexOf(prompt)
+      if (index < 0) continue
+      queue[index] = {
+        ...prompt,
+        input: [
+          ...prompt.input.filter((item) => item.type === 'skill'),
+          ...input,
+        ],
+        displayText: parsed.text || '(attachment)',
+        deliveryKind: 'queued',
+      }
+      changed = true
+    }
+    if (changed) {
+      try {
+        await saveState(this.state)
+      } catch (error) {
+        queue.splice(0, queue.length, ...originalQueue)
+        this.markQueuedSourceBlocked(channel.id)
+        await this.pruneAttachmentCache().catch(() => undefined)
+        throw error
+      }
+    }
+    if (blocked) this.markQueuedSourceBlocked(channel.id)
+    else this.clearQueuedSourceBlock(channel.id)
+  }
+
+  private async reconcilePersistedQueuedSources(): Promise<void> {
+    for (const session of Object.values(this.state.sessions)) {
+      const queue = this.state.queues[session.discordThreadId]
+      if (!queue?.some((prompt) =>
+        this.promptDeliveryKind(prompt) === 'queued' && prompt.sourceMessageId)) continue
+      let channel: ThreadChannel | undefined
+      try {
+        const fetched = await this.client.channels.fetch(session.discordThreadId, { force: true })
+        if (fetched?.isThread()) channel = fetched
+      } catch (error) {
+        if (isUnknownDiscordChannelError(error)) continue
+        this.markQueuedSourceBlocked(session.discordThreadId)
+        this.logVerbose('queued source channel reconciliation failed', {
+          threadId: session.codexThreadId,
+          error: errorText(error),
+        })
+        continue
+      }
+      if (!channel) {
+        this.markQueuedSourceBlocked(session.discordThreadId)
+        this.logVerbose('queued source channel is unavailable during reconciliation', {
+          threadId: session.codexThreadId,
+        })
+        continue
+      }
+      await this.promptQueue.run(channel.id, () =>
+        this.reconcilePersistedQueuedSourcesUnlocked(session, channel))
+    }
+    await this.pruneAttachmentCache().catch((error: unknown) => {
+      this.logVerbose('attachment cache prune after queued source reconciliation failed', {
+        error: errorText(error),
+      })
+    })
+  }
+
+  private async reconcileSessionTitles(expectedGeneration?: number): Promise<void> {
+    for (const session of Object.values(this.state.sessions)) {
+      if (
+        expectedGeneration !== undefined &&
+        expectedGeneration !== this.codexLifecycleGeneration()
+      ) return
+      if (session.archived) continue
+      await this.retryPendingSessionTitle(session)
+      if (
+        this.pendingDiscordTitleVerifications.has(session.discordThreadId) ||
+        this.pendingCodexTitleVerifications.has(session.codexThreadId)
+      ) continue
+      const channel = await this.client.channels.fetch(session.discordThreadId).catch(() => undefined)
+      if (!channel?.isThread()) continue
+      const title = this.pendingDiscordTitles.get(session.discordThreadId) ||
+        this.pendingCodexTitles.get(session.codexThreadId) ||
+        channel.name
+      await this.synchronizeThreadTitle(session, channel, title)
+        .catch((error: unknown) => {
+          this.logVerbose('session title reconciliation failed', {
+            threadId: session.codexThreadId,
+            error: errorText(error),
+          })
+        })
+    }
+  }
+
+  private clearTitleVerificationRetry(threadId: string, resetAttempts = true): void {
+    const timer = this.titleVerificationRetryTimers.get(threadId)
+    if (timer) clearTimeout(timer)
+    this.titleVerificationRetryTimers.delete(threadId)
+    if (resetAttempts) this.titleVerificationRetryAttempts.delete(threadId)
+  }
+
+  private clearTitleVerificationState(
+    threadId: string,
+    discordThreadIds: Iterable<string> = [],
+  ): void {
+    this.clearTitleVerificationRetry(threadId)
+    this.pendingCodexTitleVerifications.delete(threadId)
+    this.pendingTitleVerificationSources.delete(threadId)
+    for (const discordThreadId of discordThreadIds) {
+      this.pendingDiscordTitleVerifications.delete(discordThreadId)
+    }
+  }
+
+  private deferDiscordTitleVerification(session: SessionState, title: string): void {
+    const previous = this.pendingDiscordTitleVerifications.get(session.discordThreadId)
+    this.pendingDiscordTitleVerifications.set(session.discordThreadId, title)
+    if (previous !== title || !this.pendingTitleVerificationSources.has(session.codexThreadId)) {
+      this.pendingTitleVerificationSources.set(session.codexThreadId, 'discord')
+    }
+    this.rememberTitleEcho(
+      this.recentDiscordTitleEchoes,
+      session.discordThreadId,
+      title,
+    )
+    this.scheduleTitleVerificationRetry(session)
+  }
+
+  private deferCodexTitleVerification(session: SessionState, title: string): void {
+    const previous = this.pendingCodexTitleVerifications.get(session.codexThreadId)
+    this.pendingCodexTitleVerifications.set(session.codexThreadId, title)
+    if (previous !== title || !this.pendingTitleVerificationSources.has(session.codexThreadId)) {
+      this.pendingTitleVerificationSources.set(session.codexThreadId, 'codex')
+    }
+    this.rememberTitleEcho(
+      this.recentCodexTitleEchoes,
+      session.codexThreadId,
+      title,
+    )
+    this.scheduleTitleVerificationRetry(session)
+  }
+
+  private scheduleTitleVerificationRetry(session: SessionState): void {
+    const threadId = session.codexThreadId
+    if (this.stopping) return
+    if (this.titleVerificationRetryTimers.has(threadId)) return
+    const attempt = this.titleVerificationRetryAttempts.get(threadId) || 0
+    const delayMs = Math.min(500 * (2 ** Math.min(attempt, 6)), 30_000)
+    this.titleVerificationRetryAttempts.set(threadId, Math.min(attempt + 1, 6))
+    const timer = setTimeout(() => {
+      this.titleVerificationRetryTimers.delete(threadId)
+      const current = this.state.sessions[session.discordThreadId]
+      if (
+        current?.codexThreadId !== threadId ||
+        (current.archived && !this.archivingDiscordThreads.has(session.discordThreadId)) ||
+        this.deletedDiscordThreads.has(session.discordThreadId)
+      ) {
+        this.clearTitleVerificationState(threadId, [session.discordThreadId])
+        return
+      }
+      if (this.archivingDiscordThreads.has(session.discordThreadId)) {
+        this.scheduleTitleVerificationRetry(current)
+        return
+      }
+      void this.retryPendingSessionTitle(current).catch((error: unknown) => {
+        this.logVerbose('deferred title verification failed', {
+          threadId,
+          error: errorText(error),
+        })
+      })
+    }, delayMs)
+    timer.unref()
+    this.titleVerificationRetryTimers.set(threadId, timer)
+  }
+
+  private finishTitleVerificationAttempt(session: SessionState): void {
+    if (this.stopping) return
+    if (
+      this.pendingDiscordTitleVerifications.has(session.discordThreadId) ||
+      this.pendingCodexTitleVerifications.has(session.codexThreadId)
+    ) {
+      this.scheduleTitleVerificationRetry(session)
+      return
+    }
+    this.clearTitleVerificationRetry(session.codexThreadId)
+  }
+
+  private async retryPendingSessionTitle(session: SessionState): Promise<void> {
+    if (this.stopping) return
+    this.clearTitleVerificationRetry(session.codexThreadId, false)
+    await this.titleQueue.run(session.codexThreadId, async () => {
+      let current = this.state.sessions[session.discordThreadId]
+      if (
+        current?.codexThreadId !== session.codexThreadId ||
+        current.archived ||
+        this.archivingDiscordThreads.has(session.discordThreadId) ||
+        this.deletedDiscordThreads.has(session.discordThreadId)
+      ) {
+        if (this.archivingDiscordThreads.has(session.discordThreadId)) return
+        this.clearTitleVerificationState(session.codexThreadId, [session.discordThreadId])
+        return
+      }
+
+      const fetchThreadChannel = async (): Promise<ThreadChannel | undefined> => {
+        const fetched = await this.client.channels.fetch(session.discordThreadId)
+          .catch(() => undefined)
+        return fetched?.isThread() ? fetched : undefined
+      }
+      const discordCandidate = this.pendingDiscordTitleVerifications.get(current.discordThreadId)
+      const codexCandidate = this.pendingCodexTitleVerifications.get(current.codexThreadId)
+      const recordedSource = this.pendingTitleVerificationSources.get(current.codexThreadId)
+      const preferredSource = discordCandidate !== undefined && codexCandidate !== undefined
+        ? recordedSource || 'codex'
+        : discordCandidate !== undefined
+          ? 'discord'
+          : codexCandidate !== undefined
+            ? 'codex'
+            : undefined
+      let authoritativeDiscord: ThreadChannel | undefined
+      let authoritativeCodex: Awaited<ReturnType<CodexAppServer['getThreadSummary']>> | undefined
+
+      if (preferredSource === 'discord' && discordCandidate !== undefined) {
+        const fetched = await this.client.channels.fetch(session.discordThreadId, { force: true })
+          .catch(() => undefined)
+        authoritativeDiscord = fetched?.isThread() ? fetched : undefined
+        if (!authoritativeDiscord?.isThread()) {
+          this.rememberTitleEcho(
+            this.recentDiscordTitleEchoes,
+            current.discordThreadId,
+            discordCandidate,
+          )
+          return
+        }
+      }
+
+      if (preferredSource === 'codex' && codexCandidate !== undefined) {
+        authoritativeCodex = await this.codex.getThreadSummary(current.codexThreadId)
+          .catch(() => undefined)
+        if (authoritativeCodex?.name === undefined) {
+          this.rememberTitleEcho(
+            this.recentCodexTitleEchoes,
+            current.codexThreadId,
+            codexCandidate,
+          )
+          return
+        }
+      }
+
+      current = this.state.sessions[session.discordThreadId]
+      if (
+        !current ||
+        current.codexThreadId !== session.codexThreadId ||
+        current.archived ||
+        this.archivingDiscordThreads.has(session.discordThreadId) ||
+        this.deletedDiscordThreads.has(session.discordThreadId)
+      ) return
+      if (
+        (discordCandidate !== undefined &&
+          this.pendingDiscordTitleVerifications.get(current.discordThreadId) !== discordCandidate) ||
+        (codexCandidate !== undefined &&
+          this.pendingCodexTitleVerifications.get(current.codexThreadId) !== codexCandidate)
+      ) return
+
+      let channel = authoritativeDiscord
+      if (!channel && (preferredSource === 'codex' || this.pendingDiscordTitles.has(current.discordThreadId) || this.pendingCodexTitles.has(current.codexThreadId))) {
+        channel = await fetchThreadChannel()
+      }
+
+      const title = preferredSource === 'discord' && authoritativeDiscord
+        ? normalizeThreadTitle(authoritativeDiscord.name)
+        : preferredSource === 'codex' && authoritativeCodex?.name !== undefined
+          ? normalizeThreadTitle(authoritativeCodex.name)
+          : undefined
+
+      if (title !== undefined && (discordCandidate !== undefined || codexCandidate !== undefined)) {
+        if (!channel) return
+        const latest = this.state.sessions[session.discordThreadId]
+        if (
+          latest?.codexThreadId !== session.codexThreadId ||
+          latest.archived ||
+          this.archivingDiscordThreads.has(session.discordThreadId) ||
+          this.deletedDiscordThreads.has(session.discordThreadId) ||
+          (discordCandidate !== undefined &&
+            this.pendingDiscordTitleVerifications.get(latest.discordThreadId) !== discordCandidate) ||
+          (codexCandidate !== undefined &&
+            this.pendingCodexTitleVerifications.get(latest.codexThreadId) !== codexCandidate)
+        ) return
+        current = latest
+        const codexWrite = preferredSource !== 'codex' || authoritativeCodex?.name !== title
+        const discordWrite = channel.name !== title
+        await this.synchronizeThreadTitleUnlocked(current, channel, title, {
+          codex: codexWrite,
+          discord: discordWrite,
+          rollbackCodexOnDiscordFailure: false,
+        })
+        if (discordCandidate !== undefined) {
+          if (title === discordCandidate) {
+            this.discardExpectedTitle(
+              this.expectedDiscordTitles,
+              this.recentDiscordTitleEchoes,
+              current.discordThreadId,
+            )
+          } else {
+            this.rememberTitleEcho(
+              this.recentDiscordTitleEchoes,
+              current.discordThreadId,
+              discordCandidate,
+            )
+          }
+          if (this.pendingDiscordTitleVerifications.get(current.discordThreadId) === discordCandidate) {
+            this.pendingDiscordTitleVerifications.delete(current.discordThreadId)
+          }
+        }
+        if (codexCandidate !== undefined) {
+          if (title === codexCandidate) {
+            this.discardExpectedTitle(
+              this.expectedCodexTitles,
+              this.recentCodexTitleEchoes,
+              current.codexThreadId,
+            )
+          } else {
+            this.rememberTitleEcho(
+              this.recentCodexTitleEchoes,
+              current.codexThreadId,
+              codexCandidate,
+            )
+          }
+          if (this.pendingCodexTitleVerifications.get(current.codexThreadId) === codexCandidate) {
+            this.pendingCodexTitleVerifications.delete(current.codexThreadId)
+          }
+        }
+        if (
+          !this.pendingDiscordTitleVerifications.has(current.discordThreadId) &&
+          !this.pendingCodexTitleVerifications.has(current.codexThreadId)
+        ) this.pendingTitleVerificationSources.delete(current.codexThreadId)
+      }
+
+      const pendingTitle = this.pendingDiscordTitles.get(current.discordThreadId) ||
+        this.pendingCodexTitles.get(current.codexThreadId)
+      if (!pendingTitle) return
+      channel ||= await fetchThreadChannel()
+      if (!channel) return
+      const latest = this.state.sessions[session.discordThreadId]
+      if (
+        latest?.codexThreadId !== session.codexThreadId ||
+        latest.archived ||
+        this.archivingDiscordThreads.has(session.discordThreadId) ||
+        this.deletedDiscordThreads.has(session.discordThreadId)
+      ) return
+      current = latest
+      await this.synchronizeThreadTitleUnlocked(current, channel, pendingTitle)
+    }).catch((error: unknown) => {
+      this.logVerbose('pending title retry failed', {
+        threadId: session.codexThreadId,
+        error: errorText(error),
+      })
+    })
+    this.finishTitleVerificationAttempt(session)
   }
 
   async stop(): Promise<void> {
-    this.scheduler.stop()
+    this.stopping = true
+    this.finishIngressBarrier()
+    await this.scheduler.stopAndDrain()
+    for (const timer of this.titleVerificationRetryTimers.values()) clearTimeout(timer)
+    this.titleVerificationRetryTimers.clear()
+    this.titleVerificationRetryAttempts.clear()
+    this.pendingCodexTitleVerifications.clear()
+    this.pendingDiscordTitleVerifications.clear()
+    this.pendingTitleVerificationSources.clear()
+    this.clearAllQueuedSourceRetries()
+    this.invalidateSkillCache()
     for (const run of this.runs.values()) clearInterval(run.typingTimer)
-    this.client.destroy()
     await this.codex.close()
+    while (this.pendingCodexNotifications.size > 0) {
+      await Promise.all([...this.pendingCodexNotifications])
+    }
+    while (this.pendingCodexDeletionCleanups.size > 0) {
+      await Promise.all([...this.pendingCodexDeletionCleanups])
+    }
+    this.unlinkedCodexSessionChannels.clear()
+    this.client.destroy()
   }
 
   private async registerCommands(): Promise<void> {
@@ -450,19 +1596,34 @@ export class CordexDiscordBot {
       }
     }
     for (const [threadId, session] of Object.entries(this.state.sessions)) {
-      if (mappedChannels.has(session.parentChannelId)) continue
-      let parentExists = true
-      try {
-        parentExists = (await this.client.channels.fetch(session.parentChannelId)) !== null
-      } catch (error) {
-        if (isUnknownDiscordChannelError(error)) parentExists = false
-        else continue
+      let validThread = mappedChannels.has(session.parentChannelId)
+      if (validThread) {
+        try {
+          const channel = await this.client.channels.fetch(threadId)
+          validThread = Boolean(
+            channel?.isThread() &&
+            channel.guildId === this.config.guildId &&
+            channel.parentId === session.parentChannelId,
+          )
+        } catch (error) {
+          if (isUnknownDiscordChannelError(error)) validThread = false
+          else {
+            console.error(`Could not verify session thread ${threadId}: ${errorText(error)}`)
+            continue
+          }
+        }
       }
-      if (parentExists) continue
+      if (validThread) continue
+      this.deletedDiscordThreads.add(threadId)
+      await this.interruptRuntimeTurn(session).catch(() => undefined)
       await this.codex.archiveThread(session.codexThreadId).catch(() => undefined)
       this.loadedThreads.delete(session.codexThreadId)
+      this.clearQueuedSourceBlock(threadId)
+      this.unlinkedCodexSessionChannels.delete(threadId)
       delete this.state.sessions[threadId]
-      delete this.state.queues[threadId]
+      await this.promptQueue.run(threadId, async () => {
+        delete this.state.queues[threadId]
+      })
       for (const [taskId, task] of Object.entries(this.state.tasks)) {
         if (task.threadId !== threadId) continue
         this.scheduler.cancel(taskId)
@@ -480,6 +1641,23 @@ export class CordexDiscordBot {
     return userHasAccess(this.config, member.id, guild.id, guild.ownerId, member.roles.cache.keys())
   }
 
+  private interactionMemberAllowed(
+    interaction:
+      | ChatInputCommandInteraction
+      | ButtonInteraction
+      | StringSelectMenuInteraction
+      | ModalSubmitInteraction,
+  ): boolean | undefined {
+    if (this.config.allowAllUsers || this.config.allowedUserIds?.includes(interaction.user.id)) {
+      return true
+    }
+    const guild = interaction.guild
+    const member = interaction.member
+    if (!guild || !member) return undefined
+    const roleIds = Array.isArray(member.roles) ? member.roles : member.roles.cache.keys()
+    return userHasAccess(this.config, interaction.user.id, guild.id, guild.ownerId, roleIds)
+  }
+
   private async requireAccess(
     interaction:
       | ChatInputCommandInteraction
@@ -494,7 +1672,8 @@ export class CordexDiscordBot {
       }).catch(() => undefined)
       return false
     }
-    if (await this.memberAllowed(interaction.user.id)) return true
+    const cachedAccess = this.interactionMemberAllowed(interaction)
+    if (cachedAccess ?? await this.memberAllowed(interaction.user.id)) return true
     await interaction.reply({ content: 'Missing Cordex permission.', ephemeral: true }).catch(() => undefined)
     return false
   }
@@ -605,6 +1784,42 @@ export class CordexDiscordBot {
       )
       return
     }
+    if (interaction.commandName === 'skill' && focused.name === 'skill') {
+      if (!interaction.channel?.isThread()) {
+        await interaction.respond([])
+        return
+      }
+      const session = this.state.sessions[interaction.channel.id]
+      if (!session || session.archived) {
+        await interaction.respond([])
+        return
+      }
+      const { skills } = await this.directorySkills(session.directory).catch(() => ({ skills: [] }))
+      const byName = new Map<string, CodexSkillMetadata[]>()
+      for (const skill of skills) {
+        const matches = byName.get(skill.name) || []
+        matches.push(skill)
+        byName.set(skill.name, matches)
+      }
+      const choices = [...byName.values()]
+        .flatMap((matches) => matches.length === 1 && matches[0]?.enabled ? [matches[0]] : [])
+        .filter((skill) => skill.name.length <= 100)
+        .filter((skill) => [
+          skill.name,
+          this.skillDisplayName(skill),
+          skill.shortDescription || '',
+          skill.interface?.shortDescription || '',
+          skill.description,
+        ].join(' ').toLowerCase().includes(query))
+        .sort((left, right) => this.skillDisplayName(left).localeCompare(this.skillDisplayName(right)))
+        .slice(0, 25)
+        .map((skill) => ({
+          name: truncate(`${this.skillDisplayName(skill)} (${skill.scope})`, 100),
+          value: skill.name,
+        }))
+      await interaction.respond(choices)
+      return
+    }
     if (interaction.commandName === 'resume') {
       const parentId = this.parentChannelId(interaction.channel)
       const project = parentId ? this.config.projects[parentId] : undefined
@@ -613,7 +1828,10 @@ export class CordexDiscordBot {
         : []
       await interaction.respond(
         threads.slice(0, 25).map((thread) => ({
-          name: truncate(thread.name || thread.preview || thread.id, 100),
+          name: truncate(
+            `${thread.name || thread.preview || thread.id}${thread.archived ? ' (Archived)' : ''}`,
+            100,
+          ),
           value: thread.id,
         })),
       )
@@ -659,26 +1877,117 @@ export class CordexDiscordBot {
     return models
   }
 
+  private invalidateSkillCache(): void {
+    this.skillCacheGeneration += 1
+    this.skillCache.clear()
+  }
+
+  private async listDirectorySkillEntries(
+    directory: string,
+    options: { refresh?: boolean; forceReload?: boolean } = {},
+  ): Promise<CodexSkillsListEntry[]> {
+    const cwd = path.resolve(directory)
+    const cached = this.skillCache.get(cwd)
+    if (!options.refresh && cached && cached.expiresAt > Date.now()) return cached.entries
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const generation = this.skillCacheGeneration
+      const entries = await this.codex.listSkills({
+        cwds: [cwd],
+        forceReload: options.forceReload === true,
+      })
+      if (generation !== this.skillCacheGeneration) continue
+      this.skillCache.set(cwd, { entries, expiresAt: Date.now() + 60_000 })
+      return entries
+    }
+    throw new Error('Codex skill metadata changed during refresh; try again')
+  }
+
+  private skillsForDirectory(
+    directory: string,
+    entries: CodexSkillsListEntry[],
+  ): { skills: CodexSkillMetadata[]; errors: CodexSkillsListEntry['errors'] } {
+    const cwd = path.resolve(directory)
+    const matching = entries.filter((entry) => path.resolve(entry.cwd) === cwd)
+    const effective = matching
+    const skills = new Map<string, CodexSkillMetadata>()
+    for (const skill of effective.flatMap((entry) => entry.skills)) {
+      const key = `${skill.name}\0${path.resolve(cwd, skill.path)}`
+      if (!skills.has(key)) skills.set(key, skill)
+    }
+    return {
+      skills: [...skills.values()],
+      errors: effective.flatMap((entry) => entry.errors),
+    }
+  }
+
+  private async directorySkills(
+    directory: string,
+    options: { refresh?: boolean; forceReload?: boolean } = {},
+  ): Promise<{ skills: CodexSkillMetadata[]; errors: CodexSkillsListEntry['errors'] }> {
+    return this.skillsForDirectory(
+      directory,
+      await this.listDirectorySkillEntries(directory, options),
+    )
+  }
+
+  private skillDisplayName(skill: CodexSkillMetadata): string {
+    return skill.interface?.displayName || skill.name
+  }
+
   private async listProjectThreads(
     parentChannelId: string,
     projectDirectory: string,
     searchTerm?: string,
     limit = 20,
-  ) {
+  ): Promise<ResumeThreadChoice[]> {
     const directories = new Set([
       path.resolve(projectDirectory),
       ...Object.values(this.state.sessions)
         .filter((session) => session.parentChannelId === parentChannelId)
         .map((session) => path.resolve(session.directory)),
     ])
-    const threads = await this.codex.listThreads({
+    const listOptions = {
       ...(searchTerm ? { searchTerm } : {}),
       limit: 100,
-    })
-    const linked = new Set(Object.values(this.state.sessions).map((session) => session.codexThreadId))
-    return threads
-      .filter((thread) => directories.has(path.resolve(thread.cwd)))
-      .filter((thread) => !linked.has(thread.id))
+    }
+    const [activeThreads, archivedThreads] = await Promise.all([
+      this.codex.listThreads(listOptions),
+      this.codex.listThreads({ ...listOptions, archived: true }),
+    ])
+    const linked = new Map(
+      Object.values(this.state.sessions).map((session) => [session.codexThreadId, session]),
+    )
+    const choices = new Map<string, ResumeThreadChoice>()
+    for (const thread of activeThreads) {
+      if (!directories.has(path.resolve(thread.cwd)) || linked.has(thread.id)) continue
+      choices.set(thread.id, thread)
+    }
+    for (const thread of archivedThreads) {
+      if (!directories.has(path.resolve(thread.cwd))) continue
+      choices.set(thread.id, { ...thread, archived: true })
+    }
+    for (const session of linked.values()) {
+      if (
+        !session.archived ||
+        session.parentChannelId !== parentChannelId ||
+        !directories.has(path.resolve(session.directory)) ||
+        choices.has(session.codexThreadId)
+      ) continue
+      const channel = this.client.channels.cache.get(session.discordThreadId)
+      const name = channel?.isThread() ? channel.name : undefined
+      const searchable = `${name || ''} ${session.codexThreadId} ${session.directory}`.toLowerCase()
+      if (searchTerm && !searchable.includes(searchTerm.toLowerCase())) continue
+      choices.set(session.codexThreadId, {
+        id: session.codexThreadId,
+        preview: '',
+        ...(name ? { name } : {}),
+        cwd: session.directory,
+        updatedAt: Date.parse(session.updatedAt) / 1_000 || 0,
+        archived: true,
+      })
+    }
+    return [...choices.values()]
+      .sort((left, right) => right.updatedAt - left.updatedAt)
       .slice(0, limit)
   }
 
@@ -692,8 +2001,70 @@ export class CordexDiscordBot {
     return threads.filter((thread) => directories.has(path.resolve(thread.cwd))).slice(0, limit)
   }
 
-  private async handleCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+  private deferredCommandInteraction(
+    interaction: ChatInputCommandInteraction,
+  ): ChatInputCommandInteraction {
+    return new Proxy(interaction, {
+      get: (target, property) => {
+        if (property === 'deferReply') return async () => undefined
+        if (property === 'reply') {
+          return async (payload: unknown) => {
+            if (target.replied) return target.followUp(payload as never)
+            if (typeof payload === 'string') return target.editReply(payload)
+            if (!isRecord(payload)) return target.editReply(payload as never)
+            const {
+              ephemeral: _ephemeral,
+              fetchReply: _fetchReply,
+              withResponse: _withResponse,
+              ...editable
+            } = payload
+            return target.editReply(editable)
+          }
+        }
+        const value = Reflect.get(target, property, target)
+        return typeof value === 'function' ? value.bind(target) : value
+      },
+    })
+  }
+
+  private async handleQueuedCommand(
+    interaction: ChatInputCommandInteraction,
+  ): Promise<void> {
+    const acknowledgment = this.requireAccess(interaction).then(async (allowed) => {
+      if (!allowed) return false
+      if (ephemeralChatCommands.has(interaction.commandName)) {
+        await interaction.deferReply({ ephemeral: true })
+      } else {
+        await interaction.deferReply()
+      }
+      return true
+    })
+    await this.discordIngressQueue.run(interaction.channelId, async () => {
+      if (!(await acknowledgment)) return
+      await this.waitForMutationIngressReady()
+      const deferredInteraction = this.deferredCommandInteraction(interaction)
+      if (this.deletedDiscordThreads.has(interaction.channelId)) {
+        await deferredInteraction.reply({ content: '⨯ Discord thread was deleted.' })
+        return
+      }
+      await this.handleCommand(deferredInteraction, true)
+    })
+  }
+
+  private async handlePriorityCommand(
+    interaction: ChatInputCommandInteraction,
+  ): Promise<void> {
     if (!(await this.requireAccess(interaction))) return
+    await interaction.deferReply()
+    await this.waitForMutationIngressReady()
+    await this.handleCommand(this.deferredCommandInteraction(interaction), true)
+  }
+
+  private async handleCommand(
+    interaction: ChatInputCommandInteraction,
+    accessGranted = false,
+  ): Promise<void> {
+    if (!accessGranted && !(await this.requireAccess(interaction))) return
     await this.refreshProjectsSafely().catch((error: unknown) => {
       console.error(`Could not refresh project mappings: ${errorText(error)}`)
     })
@@ -717,6 +2088,7 @@ export class CordexDiscordBot {
       else if (interaction.commandName === 'yolo') await this.handleYoloCommand(interaction)
       else if (interaction.commandName === 'new-session') await this.handleNewSessionCommand(interaction)
       else if (interaction.commandName === 'resume') await this.handleResumeCommand(interaction)
+      else if (interaction.commandName === 'rename') await this.handleRenameCommand(interaction)
       else if (interaction.commandName === 'fork') await this.handleForkCommand(interaction)
       else if (interaction.commandName === 'fork-subagent') await this.handleForkSubagentCommand(interaction)
       else if (interaction.commandName === 'btw') await this.handleBtwCommand(interaction)
@@ -729,6 +2101,7 @@ export class CordexDiscordBot {
       else if (interaction.commandName === 'schedule') await this.handleScheduleCommand(interaction)
       else if (interaction.commandName === 'tasks') await this.handleTasksCommand(interaction)
       else if (interaction.commandName === 'cancel-task') await this.handleCancelTaskCommand(interaction)
+      else if (interaction.commandName === 'skill') await this.handleSkillCommand(interaction)
       else if (interaction.commandName === 'skills') await this.handleSkillsCommand(interaction)
       else if (interaction.commandName === 'mcp-status') await this.handleMcpStatusCommand(interaction)
       else if (interaction.commandName === 'mcp') await this.handleMcpCommand(interaction)
@@ -873,9 +2246,11 @@ export class CordexDiscordBot {
       ([, session]) => session.parentChannelId === channelId,
     )
     for (const [threadId, session] of sessions) {
-      const archiveCodex = this.codex.archiveThread(session.codexThreadId)
-      if (strict) await archiveCodex
-      else await archiveCodex.catch(() => undefined)
+      if (!session.archived) {
+        const archiveCodex = this.codex.archiveThread(session.codexThreadId)
+        if (strict) await archiveCodex
+        else await archiveCodex.catch(() => undefined)
+      }
       this.loadedThreads.delete(session.codexThreadId)
       const channel = await this.client.channels.fetch(threadId).catch(() => undefined)
       if (channel?.isThread()) {
@@ -896,8 +2271,11 @@ export class CordexDiscordBot {
           ([, session]) => session.parentChannelId === channelId,
         )
     if (!project && sessions.length === 0) return 0
-    for (const [, session] of sessions) {
+    for (const [discordThreadId, session] of sessions) {
       this.loadedThreads.delete(session.codexThreadId)
+      this.clearTitleVerificationState(session.codexThreadId, [discordThreadId])
+      this.clearQueuedSourceBlock(discordThreadId)
+      this.unlinkedCodexSessionChannels.delete(discordThreadId)
     }
     const removed = removeProjectChannelData(this.config, this.state, channelId)
     for (const taskId of removed.taskIds) this.scheduler.cancel(taskId)
@@ -916,22 +2294,60 @@ export class CordexDiscordBot {
       })
   }
 
-  private async handleThreadDelete(threadId: string): Promise<void> {
+  private async handleThreadDelete(
+    threadId: string,
+    interruption: Promise<void>,
+  ): Promise<void> {
     const session = this.state.sessions[threadId]
     if (!session) return
+    await this.dismissPendingControlsForChannel(threadId, '_Thread deleted._')
+    await interruption
+    await this.interruptDeletedRuntimeTurn(threadId, session).catch((error: unknown) => {
+      this.logVerbose('deleted thread final interruption failed', {
+        threadId: session.codexThreadId,
+        error: errorText(error),
+      })
+    })
+    this.abortRequestedThreads.delete(session.codexThreadId)
     await this.codex.archiveThread(session.codexThreadId).catch(() => undefined)
     this.loadedThreads.delete(session.codexThreadId)
     const run = this.runs.get(session.codexThreadId)
     if (run) clearInterval(run.typingTimer)
     this.runs.delete(session.codexThreadId)
     delete this.state.sessions[threadId]
-    delete this.state.queues[threadId]
+    await this.promptQueue.run(threadId, async () => {
+      delete this.state.queues[threadId]
+    })
     for (const [taskId, task] of Object.entries(this.state.tasks)) {
       if (task.threadId !== threadId) continue
       this.scheduler.cancel(taskId)
       delete this.state.tasks[taskId]
     }
+    this.deletedThreadInterruptedTurns.delete(threadId)
+    this.clearQueuedSourceBlock(threadId)
+    this.unlinkedCodexSessionChannels.delete(threadId)
     await saveState(this.state)
+  }
+
+  private interruptDeletedThreadTurn(threadId: string): Promise<void> {
+    const session = this.state.sessions[threadId]
+    if (!session) return Promise.resolve()
+    const turnId = this.runs.get(session.codexThreadId)?.turnId || session.activeTurnId
+    if (!turnId) return Promise.resolve()
+    return this.interruptDeletedTurn(threadId, session.codexThreadId, turnId)
+      .catch(() => undefined)
+  }
+
+  private async interruptDeletedTurn(
+    discordThreadId: string,
+    codexThreadId: string,
+    turnId: string,
+  ): Promise<void> {
+    if (this.deletedThreadInterruptedTurns.get(discordThreadId)?.has(turnId)) return
+    await this.codex.interruptTurn(codexThreadId, turnId)
+    const interrupted = this.deletedThreadInterruptedTurns.get(discordThreadId) || new Set<string>()
+    interrupted.add(turnId)
+    this.deletedThreadInterruptedTurns.set(discordThreadId, interrupted)
   }
 
   private async handleRemoveProjectCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -1040,6 +2456,76 @@ export class CordexDiscordBot {
     return [...new Set([path.resolve(session.directory), ...session.workspaceRoots.map((root) => path.resolve(root))])]
   }
 
+  private async ensureSessionLoaded(session: SessionState): Promise<void> {
+    await this.resumeQueue.run(session.codexThreadId, async () => {
+      await this.codexEventQueue.run(session.codexThreadId, async () => {
+        if (this.loadedThreads.has(session.codexThreadId)) {
+          await this.retryPendingSessionTitle(session)
+          return
+        }
+        if (session.archived) throw new Error('Session is archived; run /resume first')
+        const runtimeRoots = this.runtimeWorkspaceRoots(session)
+        const serviceTier = await this.serviceTierForFastMode(
+          session.model || this.config.defaultModel,
+          session.fastMode,
+        )
+        const resumed = await this.codex.resumeThread({
+          threadId: session.codexThreadId,
+          cwd: session.directory,
+          ...(session.model ? { model: session.model } : {}),
+          ...(serviceTier !== undefined ? { serviceTier } : {}),
+          ...(runtimeRoots ? { runtimeWorkspaceRoots: runtimeRoots } : {}),
+          ...(!session.yoloMode && session.permissions
+            ? { permissions: session.permissions }
+            : { sandbox: session.yoloMode ? 'danger-full-access' as const : this.config.sandbox }),
+          approvalPolicy: session.yoloMode ? 'never' : this.config.approvalPolicy,
+        })
+        if (session.effort && resumed.effort !== session.effort) {
+          await this.codex.updateThreadSettings({
+            threadId: session.codexThreadId,
+            effort: session.effort,
+          })
+        }
+        this.loadedThreads.add(session.codexThreadId)
+        await this.retryPendingSessionTitle(session)
+      })
+    })
+  }
+
+  private async resumeActiveGoalSessions(expectedGeneration?: number): Promise<void> {
+    const checked = new Set<string>()
+    for (const session of Object.values(this.state.sessions)) {
+      if (
+        expectedGeneration !== undefined &&
+        expectedGeneration !== this.codexLifecycleGeneration()
+      ) return
+      if (session.archived || checked.has(session.codexThreadId)) continue
+      checked.add(session.codexThreadId)
+      try {
+        const goal = await this.codex.getThreadGoal(session.codexThreadId)
+        if (
+          expectedGeneration !== undefined &&
+          expectedGeneration !== this.codexLifecycleGeneration()
+        ) return
+        if (goal?.status === 'active') {
+          await this.ensureSessionLoaded(session)
+          if (
+            expectedGeneration !== undefined &&
+            expectedGeneration !== this.codexLifecycleGeneration()
+          ) return
+        }
+      } catch (error) {
+        if (
+          expectedGeneration !== undefined &&
+          expectedGeneration !== this.codexLifecycleGeneration()
+        ) return
+        console.error(
+          `Failed to resume active goal for Codex thread ${session.codexThreadId}: ${errorText(error)}`,
+        )
+      }
+    }
+  }
+
   private async handleAddDirCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     const { session } = this.requireThreadSession(interaction)
     const requested = interaction.options.getString('directory')?.trim() || '*'
@@ -1050,11 +2536,20 @@ export class CordexDiscordBot {
       await interaction.reply({ content: 'Session directory is already accessible.' })
       return
     }
+    const previousRoots = session.workspaceRoots ? [...session.workspaceRoots] : undefined
+    const previousUpdatedAt = session.updatedAt
     const roots = new Set((session.workspaceRoots || []).map((root) => path.resolve(root)))
     roots.add(path.resolve(directory))
     session.workspaceRoots = [...roots]
     session.updatedAt = new Date().toISOString()
-    await saveState(this.state)
+    try {
+      await saveState(this.state)
+    } catch (error) {
+      if (previousRoots === undefined) delete session.workspaceRoots
+      else session.workspaceRoots = previousRoots
+      session.updatedAt = previousUpdatedAt
+      throw error
+    }
     await interaction.reply({
       content: requested === '*'
         ? `All external directories allowed${session.activeTurnId ? ' beginning with the next turn' : ''}.`
@@ -1091,10 +2586,27 @@ export class CordexDiscordBot {
     }
     if (!session) throw new Error('Selecting a permission profile requires a Cordex thread')
     if (profile === 'default') {
-      await this.codex.updateThreadSettings({ threadId: session.codexThreadId, permissions: null })
+      const previous = session.permissions
+      const previousUpdatedAt = session.updatedAt
       delete session.permissions
       session.updatedAt = new Date().toISOString()
-      await saveState(this.state)
+      try {
+        await saveState(this.state)
+      } catch (error) {
+        if (previous === undefined) delete session.permissions
+        else session.permissions = previous
+        session.updatedAt = previousUpdatedAt
+        throw error
+      }
+      try {
+        await this.codex.updateThreadSettings({ threadId: session.codexThreadId, permissions: null })
+      } catch (error) {
+        if (previous === undefined) delete session.permissions
+        else session.permissions = previous
+        session.updatedAt = previousUpdatedAt
+        await saveState(this.state)
+        throw error
+      }
       await interaction.editReply(`Permission override cleared. Using \`${this.config.sandbox}\`.`)
       return
     }
@@ -1108,10 +2620,27 @@ export class CordexDiscordBot {
       await interaction.editReply(`Permission profile is not allowed: \`${profile}\`.`)
       return
     }
-    await this.codex.updateThreadSettings({ threadId: session.codexThreadId, permissions: profile })
+    const previous = session.permissions
+    const previousUpdatedAt = session.updatedAt
     session.permissions = profile
     session.updatedAt = new Date().toISOString()
-    await saveState(this.state)
+    try {
+      await saveState(this.state)
+    } catch (error) {
+      if (previous === undefined) delete session.permissions
+      else session.permissions = previous
+      session.updatedAt = previousUpdatedAt
+      throw error
+    }
+    try {
+      await this.codex.updateThreadSettings({ threadId: session.codexThreadId, permissions: profile })
+    } catch (error) {
+      if (previous === undefined) delete session.permissions
+      else session.permissions = previous
+      session.updatedAt = previousUpdatedAt
+      await saveState(this.state)
+      throw error
+    }
     await interaction.editReply(`Permission profile: \`${profile}\`.`)
   }
 
@@ -1131,24 +2660,206 @@ export class CordexDiscordBot {
       await interaction.reply({ content: `**Current model:** \`${formatModelLabel(resolvedModel, resolvedEffort)}\`` })
       return
     }
-    if (scope === 'session') {
-      if (!session) throw new Error('Session scope requires a Cordex thread')
-      if (model) {
-        session.model = model
-        this.clearContextUsage(session, true)
+    if (scope === 'session' && !session) throw new Error('Session scope requires a Cordex thread')
+    const currentModel = scope === 'channel'
+      ? this.state.channelModels[parentId] || this.config.defaultModel
+      : session?.model || this.state.channelModels[parentId] || this.config.defaultModel
+    const currentEffort = scope === 'channel'
+      ? this.state.channelEfforts[parentId] || this.config.defaultEffort
+      : session?.effort || this.state.channelEfforts[parentId] || this.config.defaultEffort
+    const resolved = await this.resolveModelSettings({
+      ...(model ? { model } : {}),
+      ...(effort ? { effort } : {}),
+      ...(currentModel ? { currentModel } : {}),
+      ...(currentEffort ? { currentEffort } : {}),
+    })
+    let nextServiceTier: string | null | undefined
+    if (model) {
+      if (scope === 'channel') {
+        await this.serviceTierForFastMode(
+          resolved.model,
+          this.state.channelFastMode[parentId],
+          true,
+        )
       }
-      if (effort) session.effort = effort
-      session.updatedAt = new Date().toISOString()
-    } else {
-      if (model) this.state.channelModels[parentId] = model
-      if (effort) this.state.channelEfforts[parentId] = effort
+      if (session) {
+        nextServiceTier = await this.serviceTierForFastMode(
+          resolved.model,
+          session.fastMode ?? this.state.channelFastMode[parentId],
+          true,
+        )
+      }
     }
-    await saveState(this.state)
-    const effectiveModel = model || session?.model || this.state.channelModels[parentId] || this.config.defaultModel || 'Codex default'
-    const effectiveEffort = effort || session?.effort || this.state.channelEfforts[parentId] || this.config.defaultEffort || 'default'
+    const previousSession = session
+      ? {
+          model: session.model,
+          effort: session.effort,
+          contextTokens: session.contextTokens,
+          contextWindow: session.contextWindow,
+          updatedAt: session.updatedAt,
+        }
+      : undefined
+    const previousChannelModel = this.state.channelModels[parentId]
+    const previousChannelEffort = this.state.channelEfforts[parentId]
+    const hadChannelModel = Object.hasOwn(this.state.channelModels, parentId)
+    const hadChannelEffort = Object.hasOwn(this.state.channelEfforts, parentId)
+    const replayWasBlocked = session
+      ? this.contextReplayBlocked.has(session.codexThreadId)
+      : false
+    const previousPendingUsage = session
+      ? this.pendingContextUsage.get(session.codexThreadId)
+      : undefined
+    const restorePrevious = () => {
+      if (session && previousSession) {
+        if (previousSession.model === undefined) delete session.model
+        else session.model = previousSession.model
+        if (previousSession.effort === undefined) delete session.effort
+        else session.effort = previousSession.effort
+        if (previousSession.contextTokens === undefined) delete session.contextTokens
+        else session.contextTokens = previousSession.contextTokens
+        if (previousSession.contextWindow === undefined) delete session.contextWindow
+        else session.contextWindow = previousSession.contextWindow
+        session.updatedAt = previousSession.updatedAt
+        if (replayWasBlocked) this.contextReplayBlocked.add(session.codexThreadId)
+        else this.contextReplayBlocked.delete(session.codexThreadId)
+        if (previousPendingUsage) {
+          this.pendingContextUsage.set(session.codexThreadId, previousPendingUsage)
+        } else {
+          this.pendingContextUsage.delete(session.codexThreadId)
+        }
+      }
+      if (hadChannelModel) this.state.channelModels[parentId] = previousChannelModel!
+      else delete this.state.channelModels[parentId]
+      if (hadChannelEffort) this.state.channelEfforts[parentId] = previousChannelEffort!
+      else delete this.state.channelEfforts[parentId]
+    }
+    try {
+      if (scope === 'session') {
+        if (model) session!.model = resolved.model!
+        if (resolved.effort) session!.effort = resolved.effort
+        if (model && model !== previousSession?.model) this.clearContextUsage(session!, true)
+        session!.updatedAt = new Date().toISOString()
+      } else {
+        if (model) this.state.channelModels[parentId] = resolved.model!
+        if (resolved.effort) this.state.channelEfforts[parentId] = resolved.effort
+        if (session) {
+          if (model) session.model = resolved.model!
+          if (resolved.effort) session.effort = resolved.effort
+          if (model && model !== previousSession?.model) this.clearContextUsage(session, true)
+          session.updatedAt = new Date().toISOString()
+        }
+      }
+      await saveState(this.state)
+    } catch (error) {
+      restorePrevious()
+      throw error
+    }
+    if (session && (model || effort)) {
+      try {
+        await this.codex.updateThreadSettings({
+          threadId: session.codexThreadId,
+          ...(model ? { model: resolved.model } : {}),
+          ...(resolved.effort ? { effort: resolved.effort } : {}),
+          ...(nextServiceTier !== undefined ? { serviceTier: nextServiceTier } : {}),
+        })
+      } catch (error) {
+        restorePrevious()
+        await saveState(this.state)
+        throw error
+      }
+    }
+    const effectiveModel = resolved.model || session?.model || this.state.channelModels[parentId] || this.config.defaultModel || 'Codex default'
+    const effectiveEffort = resolved.effort || session?.effort || this.state.channelEfforts[parentId] || this.config.defaultEffort || 'default'
     await interaction.reply({
       content: `Model set for this ${scope}:\n**${formatModelLabel(effectiveModel, effectiveEffort)}**`,
     })
+  }
+
+  private async resolveModelSettings(options: {
+    model?: string
+    effort?: ReasoningEffort
+    currentModel?: string
+    currentEffort?: ReasoningEffort
+  }): Promise<{ model?: string; effort?: ReasoningEffort }> {
+    const selectedModel = options.model || options.currentModel
+    const models = await this.getModels().catch(() => [])
+    const catalogEntry = selectedModel
+      ? models.find((entry) => entry.model === selectedModel || entry.id === selectedModel)
+      : undefined
+    if (options.model && models.length > 0 && !catalogEntry) {
+      throw new Error(`Unknown Codex model: ${options.model}`)
+    }
+    const supported = catalogEntry?.supportedReasoningEfforts
+    const supportedEfforts = supported ? new Set(supported.map((entry) => entry.reasoningEffort)) : undefined
+    if (options.effort && supportedEfforts && !supportedEfforts.has(options.effort)) {
+      throw new Error(`Model ${catalogEntry?.displayName || selectedModel} does not support effort ${options.effort}`)
+    }
+    let effort = options.effort || options.currentEffort
+    if (effort && supportedEfforts && !supportedEfforts.has(effort)) {
+      effort = catalogEntry?.defaultReasoningEffort
+    }
+    return {
+      ...(selectedModel ? { model: catalogEntry?.model || selectedModel } : {}),
+      ...(effort ? { effort } : {}),
+    }
+  }
+
+  private async serviceTierForFastMode(
+    model: string | undefined,
+    fastMode: boolean | undefined,
+    strict = false,
+  ): Promise<string | null | undefined> {
+    if (fastMode === undefined) return undefined
+    if (!fastMode) return null
+    const models = await this.getModels().catch(() => [])
+    const catalogEntry = model
+      ? models.find((entry) => entry.model === model || entry.id === model)
+      : models.find((entry) => entry.isDefault)
+    if (!catalogEntry || catalogEntry.serviceTiers === undefined) return 'fast'
+    const tier = this.fastServiceTier(catalogEntry)
+    if (tier) return tier.id
+    if (strict) {
+      throw new Error(`Model ${catalogEntry.displayName} does not support Fast mode`)
+    }
+    return null
+  }
+
+  private fastServiceTier(
+    catalogEntry: CodexModel,
+  ): NonNullable<CodexModel['serviceTiers']>[number] | undefined {
+    const tiers = catalogEntry.serviceTiers
+    if (!tiers) return undefined
+    return tiers.find((entry) => entry.id === 'priority') ||
+      tiers.find((entry) => entry.id === 'fast') ||
+      tiers.find((entry) => this.serviceTierLooksFast(entry))
+  }
+
+  private serviceTierLooksFast(tier: { id: string; name: string }): boolean {
+    return /fast|priority/i.test(`${tier.id} ${tier.name}`)
+  }
+
+  private serviceTierIsFast(
+    model: string | undefined,
+    serviceTier: string | null,
+    models: CodexModel[],
+  ): boolean {
+    if (serviceTier === null) return false
+    const catalogEntry = model
+      ? models.find((entry) => entry.model === model || entry.id === model)
+      : models.find((entry) => entry.isDefault)
+    if (catalogEntry?.serviceTiers !== undefined) {
+      const selectedTier = catalogEntry.serviceTiers.find((entry) => entry.id === serviceTier)
+      return selectedTier ? this.serviceTierLooksFast(selectedTier) : false
+    }
+    return this.serviceTierLooksFast({ id: serviceTier, name: '' })
+  }
+
+  private async fastModeForServiceTier(
+    model: string | undefined,
+    serviceTier: string | null,
+  ): Promise<boolean> {
+    const models = await this.getModels().catch(() => [])
+    return this.serviceTierIsFast(model, serviceTier, models)
   }
 
   private async handleModelVariantCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -1158,17 +2869,51 @@ export class CordexDiscordBot {
     const session = interaction.channel?.isThread()
       ? this.state.sessions[interaction.channel.id]
       : undefined
+    const model = session?.model || this.state.channelModels[parentId] || this.config.defaultModel
+    const resolved = await this.resolveModelSettings({
+      ...(model ? { currentModel: model } : {}),
+      currentEffort: effort,
+      effort,
+    })
     if (session) {
-      session.effort = effort
+      const previousEffort = session.effort
+      const previousUpdatedAt = session.updatedAt
+      session.effort = resolved.effort || effort
       session.updatedAt = new Date().toISOString()
-      await this.codex.updateThreadSettings({ threadId: session.codexThreadId, effort })
+      try {
+        await saveState(this.state)
+      } catch (error) {
+        if (previousEffort === undefined) delete session.effort
+        else session.effort = previousEffort
+        session.updatedAt = previousUpdatedAt
+        throw error
+      }
+      try {
+        await this.codex.updateThreadSettings({
+          threadId: session.codexThreadId,
+          effort: resolved.effort || effort,
+        })
+      } catch (error) {
+        if (previousEffort === undefined) delete session.effort
+        else session.effort = previousEffort
+        session.updatedAt = previousUpdatedAt
+        await saveState(this.state)
+        throw error
+      }
     } else {
-      this.state.channelEfforts[parentId] = effort
+      const previousEffort = this.state.channelEfforts[parentId]
+      const hadPrevious = Object.hasOwn(this.state.channelEfforts, parentId)
+      this.state.channelEfforts[parentId] = resolved.effort || effort
+      try {
+        await saveState(this.state)
+      } catch (error) {
+        if (hadPrevious) this.state.channelEfforts[parentId] = previousEffort!
+        else delete this.state.channelEfforts[parentId]
+        throw error
+      }
     }
-    await saveState(this.state)
-    const model = session?.model || this.state.channelModels[parentId] || this.config.defaultModel || 'Codex default'
     await interaction.reply({
-      content: `Model set for this ${session ? 'session' : 'channel'}:\n**${formatModelLabel(model, effort)}**`,
+      content: `Model set for this ${session ? 'session' : 'channel'}:\n**${formatModelLabel(model || 'Codex default', resolved.effort || effort)}**`,
     })
   }
 
@@ -1180,22 +2925,92 @@ export class CordexDiscordBot {
       : undefined
     if (session) {
       const fallback = this.state.channelModels[parentId] || this.config.defaultModel
-      if (fallback) session.model = fallback
+      const resolved = await this.resolveModelSettings({
+        ...(fallback ? { model: fallback } : {}),
+        ...(session.effort ? { currentEffort: session.effort } : {}),
+      })
+      const serviceTier = await this.serviceTierForFastMode(
+        resolved.model || fallback,
+        session.fastMode ?? this.state.channelFastMode[parentId],
+        true,
+      )
+      const previous = {
+        model: session.model,
+        effort: session.effort,
+        contextTokens: session.contextTokens,
+        contextWindow: session.contextWindow,
+        updatedAt: session.updatedAt,
+      }
+      const replayWasBlocked = this.contextReplayBlocked.has(session.codexThreadId)
+      const previousPendingUsage = this.pendingContextUsage.get(session.codexThreadId)
+      if (fallback) session.model = resolved.model || fallback
       else delete session.model
+      if (resolved.effort) session.effort = resolved.effort
+      else delete session.effort
       this.clearContextUsage(session, true)
       session.updatedAt = new Date().toISOString()
-      await this.codex.updateThreadSettings({
-        threadId: session.codexThreadId,
-        model: fallback || null,
-      })
-      await saveState(this.state)
+      try {
+        await saveState(this.state)
+      } catch (error) {
+        if (previous.model === undefined) delete session.model
+        else session.model = previous.model
+        if (previous.effort === undefined) delete session.effort
+        else session.effort = previous.effort
+        if (previous.contextTokens === undefined) delete session.contextTokens
+        else session.contextTokens = previous.contextTokens
+        if (previous.contextWindow === undefined) delete session.contextWindow
+        else session.contextWindow = previous.contextWindow
+        session.updatedAt = previous.updatedAt
+        if (replayWasBlocked) this.contextReplayBlocked.add(session.codexThreadId)
+        else this.contextReplayBlocked.delete(session.codexThreadId)
+        if (previousPendingUsage) {
+          this.pendingContextUsage.set(session.codexThreadId, previousPendingUsage)
+        } else {
+          this.pendingContextUsage.delete(session.codexThreadId)
+        }
+        throw error
+      }
+      try {
+        await this.codex.updateThreadSettings({
+          threadId: session.codexThreadId,
+          model: fallback || null,
+          ...(resolved.effort ? { effort: resolved.effort } : {}),
+          ...(serviceTier !== undefined ? { serviceTier } : {}),
+        })
+      } catch (error) {
+        if (previous.model === undefined) delete session.model
+        else session.model = previous.model
+        if (previous.effort === undefined) delete session.effort
+        else session.effort = previous.effort
+        if (previous.contextTokens === undefined) delete session.contextTokens
+        else session.contextTokens = previous.contextTokens
+        if (previous.contextWindow === undefined) delete session.contextWindow
+        else session.contextWindow = previous.contextWindow
+        session.updatedAt = previous.updatedAt
+        if (replayWasBlocked) this.contextReplayBlocked.add(session.codexThreadId)
+        else this.contextReplayBlocked.delete(session.codexThreadId)
+        if (previousPendingUsage) {
+          this.pendingContextUsage.set(session.codexThreadId, previousPendingUsage)
+        } else {
+          this.pendingContextUsage.delete(session.codexThreadId)
+        }
+        await saveState(this.state)
+        throw error
+      }
       await interaction.reply({
         content: `Session model override removed. Using **${formatModelLabel(fallback || 'Codex default', session.effort || this.state.channelEfforts[parentId] || this.config.defaultEffort || 'default')}**.`,
       })
       return
     }
+    const previous = this.state.channelModels[parentId]
+    const hadPrevious = Object.hasOwn(this.state.channelModels, parentId)
     delete this.state.channelModels[parentId]
-    await saveState(this.state)
+    try {
+      await saveState(this.state)
+    } catch (error) {
+      if (hadPrevious) this.state.channelModels[parentId] = previous!
+      throw error
+    }
     await interaction.reply({
       content: `Channel model override removed. Using **${formatModelLabel(this.config.defaultModel || 'Codex default', this.config.defaultEffort || 'default')}**.`,
     })
@@ -1208,9 +3023,18 @@ export class CordexDiscordBot {
       await interaction.reply({ content: `Mode: **${session.mode || 'default'}**` })
       return
     }
+    const previousMode = session.mode
+    const previousUpdatedAt = session.updatedAt
     session.mode = mode
     session.updatedAt = new Date().toISOString()
-    await saveState(this.state)
+    try {
+      await saveState(this.state)
+    } catch (error) {
+      if (previousMode === undefined) delete session.mode
+      else session.mode = previousMode
+      session.updatedAt = previousUpdatedAt
+      throw error
+    }
     await interaction.reply({ content: `Mode: **${mode}**. Applies next turn.` })
   }
 
@@ -1228,17 +3052,45 @@ export class CordexDiscordBot {
       return
     }
     const next = action === 'on'
+    const model = session?.model || this.state.channelModels[parentId] || this.config.defaultModel
+    const serviceTier = await this.serviceTierForFastMode(model, next, true)
     if (session) {
+      const previous = session.fastMode
+      const previousUpdatedAt = session.updatedAt
       session.fastMode = next
       session.updatedAt = new Date().toISOString()
-      await this.codex.updateThreadSettings({
-        threadId: session.codexThreadId,
-        serviceTier: next ? 'fast' : null,
-      })
+      try {
+        await saveState(this.state)
+      } catch (error) {
+        if (previous === undefined) delete session.fastMode
+        else session.fastMode = previous
+        session.updatedAt = previousUpdatedAt
+        throw error
+      }
+      try {
+        await this.codex.updateThreadSettings({
+          threadId: session.codexThreadId,
+          serviceTier: serviceTier ?? null,
+        })
+      } catch (error) {
+        if (previous === undefined) delete session.fastMode
+        else session.fastMode = previous
+        session.updatedAt = previousUpdatedAt
+        await saveState(this.state)
+        throw error
+      }
     } else {
+      const previous = this.state.channelFastMode[parentId]
+      const hadPrevious = Object.hasOwn(this.state.channelFastMode, parentId)
       this.state.channelFastMode[parentId] = next
+      try {
+        await saveState(this.state)
+      } catch (error) {
+        if (hadPrevious) this.state.channelFastMode[parentId] = previous!
+        else delete this.state.channelFastMode[parentId]
+        throw error
+      }
     }
-    await saveState(this.state)
     await interaction.reply(`Fast mode: **${next ? 'on' : 'off'}** (${session ? 'session' : 'channel'}).`)
   }
 
@@ -1257,34 +3109,58 @@ export class CordexDiscordBot {
     }
     const next = action === 'on'
     if (session) {
+      const previous = session.yoloMode
+      const previousUpdatedAt = session.updatedAt
       session.yoloMode = next
       session.updatedAt = new Date().toISOString()
-      if (next) {
-        if (session.permissions) {
-          await this.codex.updateThreadSettings({ threadId: session.codexThreadId, permissions: null })
+      try {
+        await saveState(this.state)
+      } catch (error) {
+        if (previous === undefined) delete session.yoloMode
+        else session.yoloMode = previous
+        session.updatedAt = previousUpdatedAt
+        throw error
+      }
+      try {
+        if (next) {
+          await this.codex.updateThreadSettings({
+            threadId: session.codexThreadId,
+            ...(session.permissions ? { permissions: null } : {}),
+            sandbox: 'danger-full-access',
+            approvalPolicy: 'never',
+          })
+        } else if (session.permissions) {
+          await this.codex.updateThreadSettings({
+            threadId: session.codexThreadId,
+            permissions: session.permissions,
+            approvalPolicy: this.config.approvalPolicy,
+          })
+        } else {
+          await this.codex.updateThreadSettings({
+            threadId: session.codexThreadId,
+            sandbox: this.config.sandbox,
+            approvalPolicy: this.config.approvalPolicy,
+          })
         }
-        await this.codex.updateThreadSettings({
-          threadId: session.codexThreadId,
-          sandbox: 'danger-full-access',
-          approvalPolicy: 'never',
-        })
-      } else if (session.permissions) {
-        await this.codex.updateThreadSettings({
-          threadId: session.codexThreadId,
-          permissions: session.permissions,
-          approvalPolicy: this.config.approvalPolicy,
-        })
-      } else {
-        await this.codex.updateThreadSettings({
-          threadId: session.codexThreadId,
-          sandbox: this.config.sandbox,
-          approvalPolicy: this.config.approvalPolicy,
-        })
+      } catch (error) {
+        if (previous === undefined) delete session.yoloMode
+        else session.yoloMode = previous
+        session.updatedAt = previousUpdatedAt
+        await saveState(this.state)
+        throw error
       }
     } else {
+      const previous = this.state.channelYoloMode[parentId]
+      const hadPrevious = Object.hasOwn(this.state.channelYoloMode, parentId)
       this.state.channelYoloMode[parentId] = next
+      try {
+        await saveState(this.state)
+      } catch (error) {
+        if (hadPrevious) this.state.channelYoloMode[parentId] = previous!
+        else delete this.state.channelYoloMode[parentId]
+        throw error
+      }
     }
-    await saveState(this.state)
     await interaction.reply(
       `YOLO mode: **${next ? 'on' : 'off'}** (${session ? 'session' : 'channel'}).${next ? '\nApprovals disabled; sandbox set to danger-full-access.' : ''}`,
     )
@@ -1307,7 +3183,7 @@ export class CordexDiscordBot {
       throw new Error('Project parent must be a text channel')
     }
     const thread = await parent.threads.create({
-      name: truncate(options.name.replace(/\s+/g, ' ').trim() || 'Cordex session', 80),
+      name: normalizeThreadTitle(options.name),
       autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
       reason: 'Start Cordex session',
     })
@@ -1393,15 +3269,50 @@ export class CordexDiscordBot {
     const { parentChannelId, project } = this.requireProject(this.parentChannelId(interaction.channel))
     const prompt = interaction.options.getString('prompt', true)
     const requestedFiles = interaction.options.getString('files')
-    const files = requestedFiles ? await resolveProjectFiles(project.directory, requestedFiles) : []
     await interaction.deferReply()
-    const worktree = await this.createAutomaticWorktree(parentChannelId, prompt)
+    const sourceThreadId = interaction.channel?.isThread() ? interaction.channel.id : undefined
+    let reservedDirectory: string | undefined
+    const inherited = sourceThreadId
+      ? await this.projectMutationQueue.run(`channel:${parentChannelId}`, async () => {
+          await this.refreshProjectsSafely()
+          if (this.removingProjects.has(parentChannelId)) throw new Error('Project is being removed')
+          const sourceSession = this.state.sessions[sourceThreadId]
+          if (!sourceSession) return undefined
+          const directory = path.resolve(sourceSession.directory)
+          this.pendingSessionDirectoryReservations.set(
+            directory,
+            (this.pendingSessionDirectoryReservations.get(directory) || 0) + 1,
+          )
+          reservedDirectory = directory
+          return {
+            directory: sourceSession.directory,
+            workspaceRoots: sourceSession.workspaceRoots ? [...sourceSession.workspaceRoots] : undefined,
+            worktree: Boolean(sourceSession.worktree && !sourceSession.worktree.merged),
+          }
+        })
+      : undefined
+    const directory = inherited?.directory || project.directory
+    let worktree: CreatedWorktree | undefined
     let thread: ThreadChannel | undefined
     try {
+      const files = requestedFiles ? await resolveProjectFiles(directory, requestedFiles) : []
+      worktree = inherited
+        ? undefined
+        : await this.createAutomaticWorktree(parentChannelId, prompt)
+      const initialLocation: InitialSessionLocation | undefined = inherited
+        ? {
+            directory,
+            ...(inherited.workspaceRoots?.length
+              ? { workspaceRoots: inherited.workspaceRoots }
+              : {}),
+          }
+        : worktree
+          ? { directory: worktree.directory, worktree }
+          : undefined
       if (this.removingProjects.has(parentChannelId)) throw new Error('Project is being removed')
       thread = await this.createSessionThread({
         parentChannelId,
-        name: `${worktree ? '⬦ ' : ''}${prompt}`,
+        name: `${worktree || inherited?.worktree ? '⬦ ' : ''}${prompt}`,
         userId: interaction.user.id,
       })
       await this.dispatchInput(
@@ -1415,10 +3326,10 @@ export class CordexDiscordBot {
           text_elements: [],
         }],
         interaction.id,
-        worktree,
+        initialLocation,
       )
       await interaction.editReply(
-        `Session started: ${thread}${worktree ? `\nWorktree: \`${worktree.branch}\`` : ''}${files.length ? `\nFiles: ${files.map((file) => `\`${file}\``).join(', ')}` : ''}`,
+        `Session started: ${thread}${worktree ? `\nWorktree: \`${worktree.branch}\`` : inherited?.worktree ? `\nDirectory: \`${directory}\`` : ''}${files.length ? `\nFiles: ${files.map((file) => `\`${file}\``).join(', ')}` : ''}`,
       )
     } catch (error) {
       if (worktree && (!thread || !this.state.sessions[thread.id])) {
@@ -1428,6 +3339,12 @@ export class CordexDiscordBot {
         await thread.delete('Cordex session could not be started').catch(() => undefined)
       }
       throw error
+    } finally {
+      if (reservedDirectory) {
+        const reservations = this.pendingSessionDirectoryReservations.get(reservedDirectory) || 0
+        if (reservations <= 1) this.pendingSessionDirectoryReservations.delete(reservedDirectory)
+        else this.pendingSessionDirectoryReservations.set(reservedDirectory, reservations - 1)
+      }
     }
   }
 
@@ -1435,100 +3352,271 @@ export class CordexDiscordBot {
     const { parentChannelId, project } = this.requireProject(this.parentChannelId(interaction.channel))
     const codexThreadId = interaction.options.getString('session', true)
     await interaction.deferReply()
+    let queueDrain: { session: SessionState; channel: ThreadChannel } | undefined
+    let resumeReply: string | undefined
     await this.resumeQueue.run(codexThreadId, async () => {
-      const knownEntry = Object.entries(this.state.sessions).find(
-        ([, session]) => session.codexThreadId === codexThreadId,
-      )
-      const knownSession = knownEntry?.[1]
-      if (knownEntry) {
-        let existingChannel
-        try {
-          existingChannel = await this.client.channels.fetch(knownEntry[0])
-        } catch (error) {
-          if (!isUnknownDiscordChannelError(error)) throw error
+      await this.codexEventQueue.run(codexThreadId, async () => {
+        const knownEntry = Object.entries(this.state.sessions).find(
+          ([, session]) => session.codexThreadId === codexThreadId,
+        )
+        const knownSession = knownEntry?.[1]
+        let existingChannel: ThreadChannel | undefined
+        if (knownEntry) {
+          try {
+            const channel = await this.client.channels.fetch(knownEntry[0])
+            if (channel?.isThread()) existingChannel = channel
+          } catch (error) {
+            if (!isUnknownDiscordChannelError(error)) throw error
+          }
+          if (
+            existingChannel &&
+            knownSession &&
+            !knownSession.archived &&
+            this.loadedThreads.has(codexThreadId)
+          ) {
+            await saveState(this.state)
+            if (existingChannel.archived) {
+              await existingChannel.setArchived(false, 'Resume existing Cordex session')
+            }
+            await existingChannel.members.add(interaction.user.id).catch(() => undefined)
+            queueDrain = { session: knownSession, channel: existingChannel }
+            resumeReply = `Session is already linked: ${existingChannel}`
+            return
+          }
         }
-        if (existingChannel?.isThread()) {
-          if (existingChannel.archived) await existingChannel.setArchived(false, 'Resume existing Cordex session')
+
+        const targetParentChannelId = knownSession && this.config.projects[knownSession.parentChannelId]
+          ? knownSession.parentChannelId
+          : parentChannelId
+        const directory = knownSession?.directory || project.directory
+        const model = knownSession?.model ||
+          this.state.channelModels[targetParentChannelId] ||
+          this.config.defaultModel
+        const effort = knownSession?.effort ||
+          this.state.channelEfforts[targetParentChannelId] ||
+          this.config.defaultEffort
+        const fastMode = knownSession?.fastMode ?? this.state.channelFastMode[targetParentChannelId]
+        const yoloMode = knownSession?.yoloMode ??
+          this.state.channelYoloMode[targetParentChannelId] ??
+          false
+        const runtimeRoots = knownSession ? this.runtimeWorkspaceRoots(knownSession) : undefined
+        const serviceTier = await this.serviceTierForFastMode(model, fastMode)
+        const resumeOptions = {
+          threadId: codexThreadId,
+          includeTurns: true,
+          cwd: directory,
+          ...(model ? { model } : {}),
+          ...(serviceTier !== undefined ? { serviceTier } : {}),
+          ...(runtimeRoots ? { runtimeWorkspaceRoots: runtimeRoots } : {}),
+          ...(!yoloMode && knownSession?.permissions
+            ? { permissions: knownSession.permissions }
+            : { sandbox: yoloMode ? 'danger-full-access' as const : this.config.sandbox }),
+          approvalPolicy: yoloMode ? 'never' as const : this.config.approvalPolicy,
+        }
+
+        let resumed
+        if (knownSession?.archived) {
+          this.preserveArchivedUntilResume.add(codexThreadId)
+          let unarchiveError: unknown
+          try {
+            await this.codex.unarchiveThread(codexThreadId)
+            this.expectArchiveNotification(codexThreadId, 'unarchived')
+          } catch (error) {
+            unarchiveError = error
+          }
+          try {
+            resumed = await this.codex.resumeThread(resumeOptions)
+          } catch (error) {
+            throw unarchiveError || error
+          }
+        } else {
+          try {
+            resumed = await this.codex.resumeThread(resumeOptions)
+          } catch (error) {
+            if (!/archived.*unarchive|session .* is archived/i.test(errorText(error))) throw error
+            if (knownSession) {
+              knownSession.archived = true
+              knownSession.updatedAt = new Date().toISOString()
+              this.preserveArchivedUntilResume.add(codexThreadId)
+              await saveState(this.state)
+            }
+            await this.codex.unarchiveThread(codexThreadId)
+            this.expectArchiveNotification(codexThreadId, 'unarchived')
+            resumed = await this.codex.resumeThread(resumeOptions)
+          }
+        }
+
+        if (effort && resumed.effort !== effort) {
+          await this.codex.updateThreadSettings({ threadId: codexThreadId, effort })
+        }
+
+        const modelTransition = model !== undefined &&
+          resumed.model !== undefined &&
+          model !== resumed.model
+        const resumedFastMode = resumed.serviceTier !== undefined
+          ? await this.fastModeForServiceTier(resumed.model || model, resumed.serviceTier)
+          : fastMode
+        const replayWasBlocked = this.contextReplayBlocked.has(codexThreadId)
+        const pendingUsage = this.pendingContextUsage.get(codexThreadId)
+        if (modelTransition) {
+          this.contextReplayBlocked.add(codexThreadId)
+          this.pendingContextUsage.delete(codexThreadId)
+        } else {
+          this.contextReplayBlocked.delete(codexThreadId)
+        }
+
+        if (knownSession && existingChannel) {
+          const previousSession = structuredClone(knownSession)
+          const resumedModel = resumed.model || model
+          if (resumedModel) knownSession.model = resumedModel
+          const resumedEffort = effort || resumed.effort
+          if (resumedEffort) knownSession.effort = resumedEffort
+          if (resumedFastMode !== undefined) knownSession.fastMode = resumedFastMode
+          knownSession.yoloMode = yoloMode
+          delete knownSession.archived
+          knownSession.updatedAt = new Date().toISOString()
+          if (modelTransition) {
+            delete knownSession.contextTokens
+            delete knownSession.contextWindow
+          }
+          if (!modelTransition) this.hydratePendingContextUsage(knownSession)
+          this.loadedThreads.add(codexThreadId)
+          try {
+            await saveState(this.state)
+          } catch (error) {
+            this.restoreSessionState(knownSession, previousSession)
+            this.loadedThreads.delete(codexThreadId)
+            if (replayWasBlocked) this.contextReplayBlocked.add(codexThreadId)
+            else this.contextReplayBlocked.delete(codexThreadId)
+            if (pendingUsage) this.pendingContextUsage.set(codexThreadId, pendingUsage)
+            else this.pendingContextUsage.delete(codexThreadId)
+            if (previousSession.archived) this.preserveArchivedUntilResume.add(codexThreadId)
+            throw error
+          }
+          this.preserveArchivedUntilResume.delete(codexThreadId)
+          if (existingChannel.archived) {
+            await existingChannel.setArchived(false, 'Resume existing Cordex session')
+          }
+          await this.synchronizeThreadTitle(
+            knownSession,
+            existingChannel,
+            resumed.name || existingChannel.name,
+          ).catch((error: unknown) => {
+            this.logVerbose('resume title synchronization failed', {
+              threadId: codexThreadId,
+              error: errorText(error),
+            })
+            void existingChannel.send(
+              '⚠ Session title synchronization failed; Cordex will retry on the next load.',
+            ).catch(() => undefined)
+          })
           await existingChannel.members.add(interaction.user.id).catch(() => undefined)
-          await interaction.editReply(`Session is already linked: ${existingChannel}`)
+          queueDrain = { session: knownSession, channel: existingChannel }
+          resumeReply = `Session resumed: ${existingChannel}`
           return
         }
-        delete this.state.sessions[knownEntry[0]]
-        delete this.state.queues[knownEntry[0]]
-        for (const [taskId, task] of Object.entries(this.state.tasks)) {
-          if (task.threadId !== knownEntry[0]) continue
-          this.scheduler.cancel(taskId)
-          delete this.state.tasks[taskId]
-        }
-        await saveState(this.state)
-      }
-      const directory = knownSession?.directory || project.directory
-      const model = this.state.channelModels[parentChannelId] || knownSession?.model || this.config.defaultModel
-      const fastMode = knownSession?.fastMode ?? this.state.channelFastMode[parentChannelId]
-      const yoloMode = knownSession?.yoloMode ?? this.state.channelYoloMode[parentChannelId] ?? false
-      const runtimeRoots = knownSession ? this.runtimeWorkspaceRoots(knownSession) : undefined
-      const resumed = await this.codex.resumeThread({
-        threadId: codexThreadId,
-        includeTurns: true,
-        cwd: directory,
-        ...(model ? { model } : {}),
-        ...(fastMode !== undefined ? { serviceTier: fastMode ? 'fast' : null } : {}),
-        ...(runtimeRoots ? { runtimeWorkspaceRoots: runtimeRoots } : {}),
-        ...(!yoloMode && knownSession?.permissions
-          ? { permissions: knownSession.permissions }
-          : { sandbox: yoloMode ? 'danger-full-access' as const : this.config.sandbox }),
-        approvalPolicy: yoloMode ? 'never' : this.config.approvalPolicy,
-      })
-      const modelTransition = model !== undefined && model !== resumed.model
-      const thread = await this.createSessionThread({
-        parentChannelId,
-        name: `${knownSession?.worktree && !knownSession.worktree.merged ? '⬦ ' : ''}Resume: ${resumed.name || resumed.preview || codexThreadId.slice(0, 12)}`,
-        userId: interaction.user.id,
-      })
-      const session = this.buildNewSessionState({
-        discordThreadId: thread.id,
-        parentChannelId,
-        directory,
-        codexThreadId,
-        ...(model || resumed.model ? { model: model || resumed.model } : {}),
-      })
-      if (knownSession?.worktree) session.worktree = { ...knownSession.worktree }
-      if (knownSession?.workspaceRoots) session.workspaceRoots = [...knownSession.workspaceRoots]
-      if (knownSession?.permissions) session.permissions = knownSession.permissions
-      if (fastMode !== undefined) session.fastMode = fastMode
-      session.yoloMode = yoloMode
-      if (
-        !modelTransition &&
-        knownSession?.contextTokens !== undefined &&
-        session.model === knownSession.model
-      ) {
-        applyContextUsage(session, {
-          contextTokens: knownSession.contextTokens,
-          contextWindow: knownSession.contextWindow ?? null,
+
+        const thread = await this.createSessionThread({
+          parentChannelId: targetParentChannelId,
+          name: `${knownSession?.worktree && !knownSession.worktree.merged ? '⬦ ' : ''}${resumed.name || resumed.preview || codexThreadId.slice(0, 12)}`,
+          userId: interaction.user.id,
         })
-      }
-      if (modelTransition) {
-        this.contextReplayBlocked.add(codexThreadId)
-        this.pendingContextUsage.delete(codexThreadId)
-      } else {
-        this.contextReplayBlocked.delete(codexThreadId)
-      }
-      this.state.sessions[thread.id] = session
-      if (!modelTransition) this.hydratePendingContextUsage(session)
-      this.loadedThreads.add(codexThreadId)
-      await saveState(this.state)
-      await thread.send(`Resumed Codex session \`${codexThreadId}\`.`)
-      try {
-        for (const historyChunk of formatThreadHistory(resumed.turns, {
-          verbosity: this.state.channelVerbosity[parentChannelId] || defaultVerbosity,
-        })) {
-          await thread.send({ content: historyChunk, allowedMentions: { parse: [] } })
+        const session = this.buildNewSessionState({
+          discordThreadId: thread.id,
+          parentChannelId: targetParentChannelId,
+          directory,
+          codexThreadId,
+          ...(resumed.model || model ? { model: resumed.model || model } : {}),
+        })
+        const resumedEffort = effort || resumed.effort
+        if (resumedEffort) session.effort = resumedEffort
+        if (knownSession?.mode) session.mode = knownSession.mode
+        if (knownSession?.worktree) session.worktree = { ...knownSession.worktree }
+        if (knownSession?.workspaceRoots) session.workspaceRoots = [...knownSession.workspaceRoots]
+        if (knownSession?.permissions) session.permissions = knownSession.permissions
+        if (resumedFastMode !== undefined) session.fastMode = resumedFastMode
+        session.yoloMode = yoloMode
+        if (
+          !modelTransition &&
+          knownSession?.contextTokens !== undefined &&
+          session.model === knownSession.model
+        ) {
+          applyContextUsage(session, {
+            contextTokens: knownSession.contextTokens,
+            contextWindow: knownSession.contextWindow ?? null,
+          })
         }
-      } catch (error) {
-        await thread.send(`⨯ History replay failed: ${truncate(errorText(error), 1_800)}`).catch(() => undefined)
-      }
-      await interaction.editReply(`Session resumed: ${thread}`)
+        const previousQueue = knownEntry ? this.state.queues[knownEntry[0]] : undefined
+        const migratedTasks = knownEntry
+          ? Object.values(this.state.tasks).filter((task) => task.threadId === knownEntry[0])
+          : []
+        if (knownEntry) {
+          delete this.state.sessions[knownEntry[0]]
+          const queued = this.state.queues[knownEntry[0]]
+          if (queued) {
+            const migrated = queued.filter((prompt) =>
+              this.promptDeliveryKind(prompt) === 'direct' || !prompt.sourceMessageId)
+            if (migrated.length > 0) this.state.queues[thread.id] = migrated
+            delete this.state.queues[knownEntry[0]]
+          }
+          for (const task of migratedTasks) task.threadId = thread.id
+        }
+        this.state.sessions[thread.id] = session
+        if (!modelTransition) this.hydratePendingContextUsage(session)
+        this.loadedThreads.add(codexThreadId)
+        try {
+          await saveState(this.state)
+        } catch (error) {
+          delete this.state.sessions[thread.id]
+          delete this.state.queues[thread.id]
+          if (knownEntry && knownSession) {
+            this.state.sessions[knownEntry[0]] = knownSession
+            if (previousQueue) this.state.queues[knownEntry[0]] = previousQueue
+            for (const task of migratedTasks) task.threadId = knownEntry[0]
+          }
+          this.loadedThreads.delete(codexThreadId)
+          if (replayWasBlocked) this.contextReplayBlocked.add(codexThreadId)
+          else this.contextReplayBlocked.delete(codexThreadId)
+          if (pendingUsage) this.pendingContextUsage.set(codexThreadId, pendingUsage)
+          else this.pendingContextUsage.delete(codexThreadId)
+          if (knownSession?.archived) this.preserveArchivedUntilResume.add(codexThreadId)
+          await thread.delete('Cordex resume state could not be saved').catch(() => undefined)
+          throw error
+        }
+        if (knownEntry) this.clearQueuedSourceBlock(knownEntry[0])
+        this.preserveArchivedUntilResume.delete(codexThreadId)
+        await this.synchronizeCodexThreadTitle(codexThreadId, thread.name).catch((error: unknown) => {
+          this.logVerbose('resume title synchronization failed', {
+            threadId: codexThreadId,
+            error: errorText(error),
+          })
+          void thread.send(
+            '⚠ Session title synchronization failed; Cordex will retry on the next load.',
+          ).catch(() => undefined)
+        })
+        await thread.send(`Resumed Codex session \`${codexThreadId}\`.`)
+        try {
+          for (const historyChunk of formatThreadHistory(resumed.turns, {
+            verbosity: this.state.channelVerbosity[targetParentChannelId] || defaultVerbosity,
+          })) {
+            await thread.send({ content: historyChunk, allowedMentions: { parse: [] } })
+          }
+        } catch (error) {
+          await thread.send(`⨯ History replay failed: ${truncate(errorText(error), 1_800)}`).catch(() => undefined)
+        }
+        queueDrain = { session, channel: thread }
+        resumeReply = `Session resumed: ${thread}`
+      })
     })
+    if (queueDrain && (this.state.queues[queueDrain.session.discordThreadId]?.length || 0) > 0) {
+      await this.recoverPersistedPrompts(queueDrain.session, queueDrain.channel).catch((error: unknown) => {
+        this.logVerbose('resumed prompt recovery failed', {
+          threadId: queueDrain?.session.codexThreadId,
+          error: errorText(error),
+        })
+      })
+    }
+    if (resumeReply) await interaction.editReply(resumeReply)
   }
 
   private requireThreadSession(interaction: ChatInputCommandInteraction): {
@@ -1541,6 +3629,274 @@ export class CordexDiscordBot {
     return { channel: interaction.channel, session }
   }
 
+  private restoreSessionState(target: SessionState, snapshot: SessionState): void {
+    const mutable = target as unknown as Record<string, unknown>
+    for (const key of Object.keys(mutable)) delete mutable[key]
+    Object.assign(target, structuredClone(snapshot))
+  }
+
+  private consumeExpectedTitle(
+    expectations: Map<string, string>,
+    recent: Map<string, Map<string, number>>,
+    key: string,
+    title: string,
+  ): 'expected' | 'recent' | 'none' {
+    const expected = expectations.get(key)
+    if (expected === title) {
+      expectations.delete(key)
+      this.rememberTitleEcho(recent, key, title)
+      return 'expected'
+    }
+    const echoes = recent.get(key)
+    const expiresAt = echoes?.get(title)
+    if (expiresAt !== undefined) {
+      echoes?.delete(title)
+      if (echoes?.size === 0) recent.delete(key)
+      if (expiresAt > Date.now()) return 'recent'
+    }
+    if (expected !== undefined) {
+      expectations.delete(key)
+      this.rememberTitleEcho(recent, key, expected)
+    }
+    return 'none'
+  }
+
+  private rememberTitleEcho(
+    recent: Map<string, Map<string, number>>,
+    key: string,
+    title: string,
+  ): void {
+    const echoes = recent.get(key) || new Map<string, number>()
+    const now = Date.now()
+    for (const [value, expiresAt] of echoes) {
+      if (expiresAt <= now) echoes.delete(value)
+    }
+    echoes.set(title, now + 30_000)
+    recent.set(key, echoes)
+  }
+
+  private expectTitle(
+    expectations: Map<string, string>,
+    recent: Map<string, Map<string, number>>,
+    key: string,
+    title: string,
+  ): void {
+    const previous = expectations.get(key)
+    if (previous !== undefined && previous !== title) {
+      this.rememberTitleEcho(recent, key, previous)
+    }
+    expectations.set(key, title)
+  }
+
+  private discardExpectedTitle(
+    expectations: Map<string, string>,
+    recent: Map<string, Map<string, number>>,
+    key: string,
+  ): void {
+    const expected = expectations.get(key)
+    if (expected === undefined) return
+    expectations.delete(key)
+    this.rememberTitleEcho(recent, key, expected)
+  }
+
+  private async writeDiscordThreadTitle(channel: ThreadChannel, title: string): Promise<void> {
+    if (channel.name === title) {
+      this.pendingDiscordTitles.delete(channel.id)
+      return
+    }
+    this.expectTitle(
+      this.expectedDiscordTitles,
+      this.recentDiscordTitleEchoes,
+      channel.id,
+      title,
+    )
+    try {
+      await channel.setName(title, 'Synchronize Cordex session title')
+      this.pendingDiscordTitles.delete(channel.id)
+    } catch (error) {
+      if (this.expectedDiscordTitles.get(channel.id) === title) {
+        this.expectedDiscordTitles.delete(channel.id)
+      }
+      throw error
+    }
+  }
+
+  private async writeCodexThreadTitle(threadId: string, title: string): Promise<void> {
+    this.expectTitle(
+      this.expectedCodexTitles,
+      this.recentCodexTitleEchoes,
+      threadId,
+      title,
+    )
+    try {
+      await this.codex.setThreadName(threadId, title)
+      this.pendingCodexTitles.delete(threadId)
+    } catch (error) {
+      if (this.expectedCodexTitles.get(threadId) === title) {
+        this.expectedCodexTitles.delete(threadId)
+      }
+      throw error
+    }
+  }
+
+  private async synchronizeThreadTitleUnlocked(
+    session: SessionState,
+    channel: ThreadChannel,
+    value: string,
+    options: {
+      codex?: boolean
+      discord?: boolean
+      previousTitle?: string
+      rollbackCodexOnDiscordFailure?: boolean
+    } = {},
+  ): Promise<string> {
+    const title = normalizeThreadTitle(value)
+    const previousTitle = normalizeThreadTitle(options.previousTitle ?? channel.name)
+    let codexWritten = false
+    if (options.codex === false) this.pendingCodexTitles.delete(session.codexThreadId)
+    if (options.codex !== false) {
+      try {
+        await this.writeCodexThreadTitle(session.codexThreadId, title)
+        codexWritten = true
+      } catch (error) {
+        this.pendingCodexTitles.set(session.codexThreadId, title)
+        throw error
+      }
+    }
+    if (options.discord === false) this.pendingDiscordTitles.delete(channel.id)
+    if (options.discord !== false) {
+      try {
+        await this.writeDiscordThreadTitle(channel, title)
+      } catch (firstError) {
+        try {
+          await this.writeDiscordThreadTitle(channel, title)
+        } catch (secondError) {
+          if (codexWritten && options.rollbackCodexOnDiscordFailure !== false) {
+            this.expectedCodexTitles.delete(session.codexThreadId)
+            try {
+              await this.writeCodexThreadTitle(session.codexThreadId, previousTitle)
+            } catch (rollbackError) {
+              this.pendingCodexTitles.set(session.codexThreadId, previousTitle)
+              this.logVerbose('title compensation failed', {
+                threadId: session.codexThreadId,
+                error: errorText(rollbackError),
+              })
+            }
+          } else {
+            this.pendingDiscordTitles.set(channel.id, title)
+          }
+          throw secondError || firstError
+        }
+      }
+    }
+    return title
+  }
+
+  private async synchronizeThreadTitle(
+    session: SessionState,
+    channel: ThreadChannel,
+    value: string,
+  ): Promise<string> {
+    return this.titleQueue.run(session.codexThreadId, async () => {
+      const current = this.state.sessions[channel.id]
+      if (
+        current?.codexThreadId !== session.codexThreadId ||
+        current.archived ||
+        this.deletedDiscordThreads.has(channel.id)
+      ) {
+        throw new Error('Session is no longer available for rename')
+      }
+      return this.synchronizeThreadTitleUnlocked(current, channel, value)
+    })
+  }
+
+  private async synchronizeCodexThreadTitle(threadId: string, value: string): Promise<string> {
+    const title = normalizeThreadTitle(value)
+    let lastError: unknown
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await this.titleQueue.run(threadId, () => this.writeCodexThreadTitle(threadId, title))
+        return title
+      } catch (error) {
+        lastError = error
+      }
+    }
+    this.pendingCodexTitles.set(threadId, title)
+    throw lastError instanceof Error ? lastError : new Error(String(lastError))
+  }
+
+  private async handleDiscordThreadTitleUpdate(
+    channel: ThreadChannel,
+    previousName?: string,
+  ): Promise<void> {
+    if (this.stopping) return
+    const title = normalizeThreadTitle(channel.name)
+    const session = this.state.sessions[channel.id]
+    if (!session || session.archived || this.deletedDiscordThreads.has(channel.id)) return
+    await this.titleQueue.run(session.codexThreadId, async () => {
+      const current = this.state.sessions[channel.id]
+      if (
+        current?.codexThreadId !== session.codexThreadId ||
+        current.archived ||
+        this.deletedDiscordThreads.has(channel.id)
+      ) return
+      if (this.pendingDiscordTitleVerifications.has(channel.id)) {
+        this.deferDiscordTitleVerification(current, title)
+        return
+      }
+      const echo = this.consumeExpectedTitle(
+        this.expectedDiscordTitles,
+        this.recentDiscordTitleEchoes,
+        channel.id,
+        title,
+      )
+      if (echo === 'expected') return
+      let authoritativeChannel = channel
+      let authoritativeTitle = title
+      if (echo === 'recent') {
+        const authoritative = await this.client.channels.fetch(channel.id, { force: true })
+          .catch(() => undefined)
+        if (!authoritative?.isThread()) {
+          this.deferDiscordTitleVerification(current, title)
+          return
+        }
+        const latest = this.state.sessions[channel.id]
+        if (
+          latest?.codexThreadId !== current.codexThreadId ||
+          latest.archived ||
+          this.deletedDiscordThreads.has(channel.id)
+        ) return
+        authoritativeTitle = normalizeThreadTitle(authoritative.name)
+        if (authoritativeTitle === title) {
+          this.discardExpectedTitle(
+            this.expectedDiscordTitles,
+            this.recentDiscordTitleEchoes,
+            channel.id,
+          )
+        } else {
+          this.rememberTitleEcho(this.recentDiscordTitleEchoes, channel.id, title)
+          return
+        }
+        authoritativeChannel = authoritative
+      }
+      await this.synchronizeThreadTitleUnlocked(current, authoritativeChannel, authoritativeTitle, {
+        discord: authoritativeChannel.name !== authoritativeTitle,
+        rollbackCodexOnDiscordFailure: false,
+        ...(previousName !== undefined ? { previousTitle: previousName } : {}),
+      })
+    })
+  }
+
+  private async handleRenameCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const { channel, session } = this.requireThreadSession(interaction)
+    const title = await this.synchronizeThreadTitle(
+      session,
+      channel,
+      interaction.options.getString('name', true),
+    )
+    await interaction.reply(`Session renamed to **${escapeInlineMarkdown(title)}**.`)
+  }
+
   private async forkSession(options: {
     source: SessionState
     sourceThreadId?: string
@@ -1551,13 +3907,15 @@ export class CordexDiscordBot {
     const runtimeRoots = this.runtimeWorkspaceRoots(options.source)
     const isSubagentFork = options.sourceThreadId !== undefined
     const yoloMode = options.source.yoloMode === true
+    const serviceTier = await this.serviceTierForFastMode(
+      options.source.model || this.config.defaultModel,
+      options.source.fastMode,
+    )
     const forked = await this.codex.forkThread({
       threadId: options.sourceThreadId || options.source.codexThreadId,
       cwd: options.source.directory,
       ...(!isSubagentFork && options.source.model ? { model: options.source.model } : {}),
-      ...(options.source.fastMode !== undefined
-        ? { serviceTier: options.source.fastMode ? 'fast' : null }
-        : {}),
+      ...(serviceTier !== undefined ? { serviceTier } : {}),
       ...(runtimeRoots ? { runtimeWorkspaceRoots: runtimeRoots } : {}),
       ...(!yoloMode && options.source.permissions
         ? { permissions: options.source.permissions }
@@ -1595,6 +3953,15 @@ export class CordexDiscordBot {
     if (!modelTransition) this.hydratePendingContextUsage(session)
     this.loadedThreads.add(forked.threadId)
     await saveState(this.state)
+    await this.synchronizeCodexThreadTitle(forked.threadId, thread.name).catch((error: unknown) => {
+      this.logVerbose('fork title synchronization failed', {
+        threadId: forked.threadId,
+        error: errorText(error),
+      })
+      void thread.send(
+        '⚠ Session title synchronization failed; Cordex will retry on the next load.',
+      ).catch(() => undefined)
+    })
     return { thread, session }
   }
 
@@ -1665,16 +4032,22 @@ export class CordexDiscordBot {
       return
     }
     await interaction.deferReply()
-    const selected = (await this.codex.listSubagentThreads(session.codexThreadId))
+    await this.waitForMutationIngressReady()
+    const currentSession = this.state.sessions[interaction.channel.id]
+    if (!currentSession || currentSession.codexThreadId !== expectedParentThreadId) {
+      await interaction.editReply('This subagent list is stale. Run /fork-subagent again.')
+      return
+    }
+    const selected = (await this.codex.listSubagentThreads(currentSession.codexThreadId))
       .find((subagent) => subagent.threadId === childThreadId)
     if (!selected) {
       await interaction.editReply('Selected subagent is no longer available.')
       return
     }
     const forked = await this.forkSession({
-      source: session,
+      source: currentSession,
       sourceThreadId: selected.threadId,
-      parentChannelId: session.parentChannelId,
+      parentChannelId: currentSession.parentChannelId,
       name: `Fork: ${this.subagentLabel(selected)}`,
       userId: interaction.user.id,
     })
@@ -1740,23 +4113,27 @@ export class CordexDiscordBot {
     const { session } = this.requireThreadSession(interaction)
     const objective = interaction.options.getString('objective')?.trim()
     const tokenBudget = interaction.options.getInteger('token-budget') ?? undefined
-    const status = (interaction.options.getString('status') || 'active') as 'active' | 'paused' | 'blocked' | 'complete'
+    const status = interaction.options.getString('status') as
+      'active' | 'paused' | 'blocked' | 'complete' | null
     await interaction.deferReply()
     let goal
-    if (objective) {
-      goal = await this.codex.setThreadGoal(session.codexThreadId, objective, tokenBudget, status)
-    } else if (tokenBudget !== undefined || interaction.options.getString('status')) {
-      const existing = await this.codex.getThreadGoal(session.codexThreadId)
-      if (!existing) throw new Error('No thread goal is set; provide an objective')
-      goal = await this.codex.setThreadGoal(
-        session.codexThreadId,
-        existing.objective,
-        tokenBudget ?? existing.tokenBudget,
-        status,
-      )
+    let mutated = false
+    if (objective || tokenBudget !== undefined || status) {
+      mutated = true
+      if (!objective) {
+        const existing = await this.codex.getThreadGoal(session.codexThreadId)
+        if (!existing) throw new Error('No thread goal is set; provide an objective')
+      }
+      goal = await this.codex.setThreadGoal(session.codexThreadId, {
+        ...(objective ? { objective } : {}),
+        ...(tokenBudget !== undefined ? { tokenBudget } : {}),
+        ...(status ? { status } : {}),
+      })
     } else {
-      goal = await this.codex.getThreadGoal(session.codexThreadId)
+      const existing = await this.codex.getThreadGoal(session.codexThreadId)
+      goal = existing
     }
+    if (mutated && goal?.status === 'active') await this.ensureSessionLoaded(session)
     await interaction.editReply(goal ? this.formatGoal(goal) : 'No thread goal is set.')
   }
 
@@ -1769,14 +4146,83 @@ export class CordexDiscordBot {
 
   private async handleArchiveCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     const { channel, session } = this.requireThreadSession(interaction)
-    if (session.activeTurnId) throw new Error('Wait for active turn or run /abort first')
     await interaction.deferReply()
-    await this.codex.archiveThread(session.codexThreadId)
-    delete this.state.sessions[channel.id]
-    delete this.state.queues[channel.id]
-    await saveState(this.state)
-    await channel.setArchived(true, 'Archived by Cordex user')
-    await interaction.editReply('Session archived.')
+    if (session.archived) {
+      await saveState(this.state)
+      if (!channel.archived) await channel.setArchived(true, 'Archived by Cordex user')
+      await interaction.editReply('Session is already archived.')
+      return
+    }
+
+    await this.promptQueue.run(channel.id, async () => {
+      if (session.activeTurnId || this.runs.has(session.codexThreadId)) {
+        throw new Error('Wait for active turn or run /abort first')
+      }
+      if (this.pendingTurnStarts.has(session.codexThreadId)) {
+        throw new Error('Wait for the pending turn start or run /abort first')
+      }
+      if (this.queuedPromptsFor(channel.id).length > 0) {
+        throw new Error('Clear queued prompts before archiving')
+      }
+      if ((this.state.queues[channel.id] || []).some(
+        (prompt) => this.promptDeliveryKind(prompt) === 'direct',
+      )) {
+        throw new Error('Wait for pending prompt delivery or recovery before archiving')
+      }
+      const pendingTask = Object.values(this.state.tasks).find(
+        (task) => task.threadId === channel.id &&
+          (task.status === 'scheduled' || task.status === 'running'),
+      )
+      if (pendingTask) throw new Error(`Cancel scheduled task ${pendingTask.id} before archiving`)
+      this.archivingDiscordThreads.add(channel.id)
+    })
+
+    try {
+      await this.resumeQueue.run(session.codexThreadId, async () => {
+        await this.codexEventQueue.run(session.codexThreadId, async () => {
+          if (session.activeTurnId || this.runs.has(session.codexThreadId)) {
+            throw new Error('Wait for active turn or run /abort first')
+          }
+          if (this.pendingTurnStarts.has(session.codexThreadId)) {
+            throw new Error('Wait for the pending turn start or run /abort first')
+          }
+          const goal = await this.codex.getThreadGoal(session.codexThreadId)
+          if (goal?.status === 'active') throw new Error('Pause, complete, or clear the active goal before archiving')
+          const previousUpdatedAt = session.updatedAt
+          session.archived = true
+          session.updatedAt = new Date().toISOString()
+          try {
+            await saveState(this.state)
+          } catch (error) {
+            delete session.archived
+            session.updatedAt = previousUpdatedAt
+            throw error
+          }
+          try {
+            await this.codex.archiveThread(session.codexThreadId)
+          } catch (error) {
+            delete session.archived
+            session.updatedAt = previousUpdatedAt
+            try {
+              await saveState(this.state)
+            } catch (rollbackError) {
+              session.archived = true
+              session.updatedAt = new Date().toISOString()
+              throw rollbackError
+            }
+            throw error
+          }
+          this.expectArchiveNotification(session.codexThreadId, 'archived')
+          this.loadedThreads.delete(session.codexThreadId)
+          this.preserveArchivedUntilResume.delete(session.codexThreadId)
+          this.clearTitleVerificationState(session.codexThreadId, [channel.id])
+        })
+      })
+      await interaction.editReply('Session archived.')
+      await channel.setArchived(true, 'Archived by Cordex user')
+    } finally {
+      this.archivingDiscordThreads.delete(channel.id)
+    }
   }
 
   private async handleReviewCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -1860,7 +4306,12 @@ export class CordexDiscordBot {
       status: 'scheduled',
     }
     this.state.tasks[task.id] = task
-    await saveState(this.state)
+    try {
+      await saveState(this.state)
+    } catch (error) {
+      if (this.state.tasks[task.id] === task) delete this.state.tasks[task.id]
+      throw error
+    }
     this.scheduler.schedule(task)
     await interaction.reply({
       content: `Scheduled \`${task.id}\` for <t:${Math.floor(Date.parse(task.runAt) / 1_000)}:R>${task.repeatMs ? `; repeats every ${repeatSeconds}s` : ''}.`,
@@ -1872,16 +4323,102 @@ export class CordexDiscordBot {
       Object.values(this.state.tasks),
       interaction.options.getBoolean('all') === true,
     )
-    const lines = tasks.map(
-      (task) => `\`${task.id}\` · **${task.status}** · <t:${Math.floor(Date.parse(task.runAt) / 1_000)}:R> · ${truncate(task.prompt, 120)}`,
-    )
-    await this.replyWithChunks(interaction, lines.join('\n') || 'No scheduled tasks.')
+    if (tasks.length === 0) {
+      await interaction.reply({ content: 'No scheduled tasks.' })
+      return
+    }
+    const batches: Array<{
+      content: string
+      components: ActionRowBuilder<ButtonBuilder>[]
+    }> = []
+    let lines: string[] = []
+    let components: ActionRowBuilder<ButtonBuilder>[] = []
+    const flush = () => {
+      if (lines.length === 0) return
+      batches.push({ content: lines.join('\n'), components })
+      lines = []
+      components = []
+    }
+    for (const task of tasks) {
+      const line = `\`${task.id}\` · **${task.status}** · <#${task.threadId}> · <t:${Math.floor(Date.parse(task.runAt) / 1_000)}:R> · ${truncate(task.prompt, 120)}`
+      if (components.length >= 5 || [...lines, line].join('\n').length > 1_850) flush()
+      lines.push(line)
+      const row = new ActionRowBuilder<ButtonBuilder>()
+      if (task.status === 'scheduled') {
+        row.addComponents(
+          new ButtonBuilder()
+            .setCustomId(`task:run:${task.id}`)
+            .setLabel('Run now')
+            .setStyle(ButtonStyle.Primary),
+        )
+      }
+      row.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`task:delete:${task.id}`)
+          .setLabel(task.status === 'running' ? 'Cancel' : 'Delete')
+          .setStyle(task.status === 'running' ? ButtonStyle.Secondary : ButtonStyle.Danger),
+      )
+      components.push(row)
+    }
+    flush()
+    const first = batches.shift()
+    if (!first) return
+    await interaction.reply(first)
+    for (const batch of batches) await interaction.followUp(batch)
   }
 
   private async handleCancelTaskCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     const id = interaction.options.getString('id', true)
-    if (!this.scheduler.cancel(id)) throw new Error(`Unknown task: ${id}`)
+    if (!(await this.scheduler.cancel(id))) throw new Error(`Unknown task: ${id}`)
     await interaction.reply({ content: `Cancelled \`${id}\`.` })
+  }
+
+  private resolveSkillSelection(
+    skills: CodexSkillMetadata[],
+    selected: string,
+  ): CodexSkillMetadata {
+    const exact = skills.filter((skill) => skill.name === selected)
+    const matches = exact.length > 0
+      ? exact
+      : skills.filter((skill) => skill.name.toLowerCase() === selected.toLowerCase())
+    if (matches.length === 0) throw new Error(`Unknown Codex skill: ${selected}`)
+    if (matches.length > 1) {
+      throw new Error(`Ambiguous Codex skill name: ${selected}`)
+    }
+    const skill = matches[0]
+    if (!skill) throw new Error(`Unknown Codex skill: ${selected}`)
+    if (!skill.enabled) throw new Error(`Codex skill is disabled: ${skill.name}`)
+    return skill
+  }
+
+  private async handleSkillCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const { channel, session } = this.requireThreadSession(interaction)
+    if (session.archived) throw new Error('Session is archived; run /resume first')
+    const selected = interaction.options.getString('skill', true).trim()
+    const prompt = interaction.options.getString('prompt')?.trim()
+    const { skills } = await this.directorySkills(session.directory, {
+      refresh: true,
+      forceReload: true,
+    })
+    const skill = this.resolveSkillSelection(skills, selected)
+    const input: UserInput[] = [{
+      type: 'skill',
+      name: skill.name,
+      path: path.resolve(session.directory, skill.path),
+    }]
+    if (prompt) input.push({ type: 'text', text: prompt, text_elements: [] })
+    await this.persistAndDeliverDirectPrompt(session, channel, {
+      id: interaction.id,
+      authorId: interaction.user.id,
+      authorName: interaction.user.displayName,
+      input,
+      displayText: prompt || `[${skill.name} skill]`,
+      createdAt: new Date().toISOString(),
+      deliveryKind: 'direct',
+    })
+    await interaction.reply({
+      content: `Invoked Codex skill ${discordInlineCode(skill.name)}.`,
+    })
   }
 
   private async handleSkillsCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -1891,16 +4428,24 @@ export class CordexDiscordBot {
       ? this.state.sessions[interaction.channel.id]?.directory || project.directory
       : project.directory
     await interaction.deferReply()
-    const entries = await this.codex.listSkills(directory)
-    const lines = entries.flatMap((entry) => {
-      if (!Array.isArray(entry.skills)) return []
-      return entry.skills.flatMap((skill) => {
-        if (!isRecord(skill) || typeof skill.name !== 'string') return []
-        const enabled = skill.enabled === false ? 'disabled' : 'enabled'
-        const description = typeof skill.description === 'string' ? ` — ${truncate(skill.description, 110)}` : ''
-        return [`• \`${skill.name}\` (${enabled})${description}`]
-      })
+    const { skills, errors } = await this.directorySkills(directory, {
+      refresh: true,
+      forceReload: true,
     })
+    const lines = skills.map((skill) => {
+      const enabled = skill.enabled ? 'enabled' : 'disabled'
+      const displayName = this.skillDisplayName(skill)
+      const description = skill.interface?.shortDescription ||
+        skill.shortDescription ||
+        skill.description
+      const label = displayName === skill.name
+        ? discordInlineCode(skill.name)
+        : `**${escapeInlineMarkdown(displayName)}** (${discordInlineCode(skill.name)})`
+      return `• ${label} — ${skill.scope}, ${enabled}${description ? ` — ${truncate(description, 110)}` : ''}`
+    })
+    for (const error of errors) {
+      lines.push(`⚠ ${discordInlineCode(truncate(error.path, 120))} — ${truncate(error.message, 180)}`)
+    }
     await this.replyWithChunks(interaction, lines.join('\n') || 'No Codex skills found.')
   }
 
@@ -2113,20 +4658,39 @@ export class CordexDiscordBot {
     ) {
       throw new Error('Scheduled task Discord thread is outside the configured server or project')
     }
+    if (task.status !== 'running' || this.state.tasks[task.id] !== task) return
     const input: UserInput[] = [{ type: 'text', text: task.prompt, text_elements: [] }]
-    if (session.activeTurnId) {
-      await this.enqueuePrompt(channel.id, {
-        id: task.id,
-        authorId: task.createdBy,
-        authorName: 'scheduled task',
-        input,
-        displayText: task.prompt,
-        createdAt: new Date().toISOString(),
+    const deliveryId = scheduledTaskDeliveryId(task)
+    await this.enqueuePrompt(channel.id, {
+      id: deliveryId,
+      authorId: task.createdBy,
+      authorName: 'scheduled task',
+      input,
+      displayText: task.prompt,
+      createdAt: new Date().toISOString(),
+      deliveryKind: 'queued',
+    }, session.archived === true)
+    if (session.archived) {
+      await channel.send(`» **scheduled task queued while archived:** ${truncate(task.prompt, 1_650)}`)
+        .catch(() => undefined)
+    } else {
+      await this.recoverPersistedPrompts(session, channel).catch((error: unknown) => {
+        this.logVerbose('scheduled prompt drain deferred after durable enqueue', {
+          taskId: task.id,
+          error: errorText(error),
+        })
       })
-      await channel.send(`» **scheduled task:** ${truncate(task.prompt, 1_700)}`)
-      return
+      if (this.queueFor(channel.id).some((prompt) =>
+        this.queuedPromptDeliveryId(prompt) === deliveryId)) {
+        await channel.send(`» **scheduled task:** ${truncate(task.prompt, 1_700)}`)
+          .catch((error: unknown) => {
+            this.logVerbose('scheduled prompt announcement failed', {
+              taskId: task.id,
+              error: errorText(error),
+            })
+          })
+      }
     }
-    await this.dispatchInput(channel, session.parentChannelId, input, task.id)
   }
 
   private async handleNewWorktreeCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -2145,13 +4709,15 @@ export class CordexDiscordBot {
       ...(baseRef ? { baseRef } : {}),
     })
     try {
+      const serviceTier = await this.serviceTierForFastMode(
+        session.model || this.config.defaultModel,
+        session.fastMode,
+      )
       const forked = await this.codex.forkThread({
         threadId: session.codexThreadId,
         cwd: created.directory,
         ...(session.model ? { model: session.model } : {}),
-        ...(session.fastMode !== undefined
-          ? { serviceTier: session.fastMode ? 'fast' : null }
-          : {}),
+        ...(serviceTier !== undefined ? { serviceTier } : {}),
         ...(session.workspaceRoots?.length
           ? { runtimeWorkspaceRoots: [created.directory, ...session.workspaceRoots] }
           : {}),
@@ -2195,6 +4761,15 @@ export class CordexDiscordBot {
       if (!modelTransition) this.hydratePendingContextUsage(worktreeSession)
       this.loadedThreads.add(forked.threadId)
       await saveState(this.state)
+      await this.synchronizeCodexThreadTitle(forked.threadId, thread.name).catch((error: unknown) => {
+        this.logVerbose('worktree title synchronization failed', {
+          threadId: forked.threadId,
+          error: errorText(error),
+        })
+        void thread.send(
+          '⚠ Session title synchronization failed; Cordex will retry on the next load.',
+        ).catch(() => undefined)
+      })
       await interaction.editReply(
         `Worktree ready: ${thread}\nBranch: \`${created.branch}\`\nDirectory: \`${created.directory}\``,
       )
@@ -2206,9 +4781,17 @@ export class CordexDiscordBot {
 
   private async handleToggleWorktreesCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     const { parentChannelId } = this.requireProject(this.parentChannelId(interaction.channel))
+    const previous = this.state.channelAutoWorktrees[parentChannelId]
+    const hadPrevious = Object.hasOwn(this.state.channelAutoWorktrees, parentChannelId)
     const enabled = !this.state.channelAutoWorktrees[parentChannelId]
     this.state.channelAutoWorktrees[parentChannelId] = enabled
-    await saveState(this.state)
+    try {
+      await saveState(this.state)
+    } catch (error) {
+      if (hadPrevious) this.state.channelAutoWorktrees[parentChannelId] = previous!
+      else delete this.state.channelAutoWorktrees[parentChannelId]
+      throw error
+    }
     await interaction.reply({
       content: `Automatic worktrees: **${enabled ? 'enabled' : 'disabled'}** for this project channel.`,
     })
@@ -2226,74 +4809,440 @@ export class CordexDiscordBot {
   }
 
   private async handleMergeWorktreeCommand(interaction: ChatInputCommandInteraction): Promise<void> {
-    const { channel, session } = this.requireThreadSession(interaction)
-    if (session.activeTurnId) throw new Error('Wait for active turn or run /abort first')
-    const worktree = session.worktree
-    if (!worktree) throw new Error('Session is not associated with a worktree')
-    if (worktree.merged) throw new Error('Worktree already merged')
+    const initial = this.requireThreadSession(interaction)
     const targetBranch = interaction.options.getString('target-branch') || undefined
     await interaction.deferReply()
-    const result = await mergeWorktree({
-      projectDirectory: worktree.projectDirectory,
-      worktreeDirectory: worktree.directory,
-      branch: worktree.branch,
-      ...(targetBranch ? { targetBranch } : {}),
-    })
+    const { channel, session, result } = await this.projectMutationQueue.run(
+      `channel:${initial.session.parentChannelId}`,
+      async () => {
+        const current = this.requireThreadSession(interaction)
+        if (current.session.activeTurnId) {
+          throw new Error('Wait for active turn or run /abort first')
+        }
+        const worktree = current.session.worktree
+        if (!worktree) throw new Error('Session is not associated with a worktree')
+        if (worktree.merged) throw new Error('Worktree already merged')
+        const worktreeDirectory = path.resolve(worktree.directory)
+        if ((this.pendingSessionDirectoryReservations.get(worktreeDirectory) || 0) > 0) {
+          throw new Error('Worktree is being inherited by a new session; retry after it finishes starting')
+        }
+        const sharedSession = Object.values(this.state.sessions).find((candidate) =>
+          candidate.discordThreadId !== current.session.discordThreadId &&
+          !candidate.archived &&
+          path.resolve(candidate.directory) === worktreeDirectory)
+        if (sharedSession) {
+          throw new Error(`Worktree is still used by <#${sharedSession.discordThreadId}>; archive that session before merging`)
+        }
+        const result = await mergeWorktree({
+          projectDirectory: worktree.projectDirectory,
+          worktreeDirectory: worktree.directory,
+          branch: worktree.branch,
+          ...(targetBranch ? { targetBranch } : {}),
+        })
+        if (result.status !== 'conflict') {
+          worktree.merged = true
+          current.session.updatedAt = new Date().toISOString()
+          await saveState(this.state)
+        }
+        return { ...current, result }
+      },
+    )
     if (result.status === 'conflict') {
+      const input: UserInput[] = [
+        {
+          type: 'text',
+          text: [
+            `A rebase conflict occurred while merging this worktree into ${result.targetBranch}.`,
+            'Inspect git status, both sides, and the replayed commit intent.',
+            'Resolve conflicts preserving both intended changes, stage files, then run git rebase --continue.',
+            'Repeat until rebase fully finishes and git status is clean. Do not merge into the main checkout yourself.',
+            'Report when complete so /merge-worktree can be run again.',
+          ].join('\n'),
+          text_elements: [],
+        },
+      ]
+      await this.enqueuePrompt(channel.id, {
+        id: interaction.id,
+        authorId: interaction.user.id,
+        authorName: interaction.user.displayName,
+        input,
+        displayText: `Resolve the rebase conflict against ${result.targetBranch}.`,
+        createdAt: new Date().toISOString(),
+        deliveryKind: 'direct',
+      })
+      await this.recoverPersistedPrompts(session, channel)
       await interaction.editReply(
         `Rebase conflict against \`${result.targetBranch}\`. Asking Codex to resolve and finish rebase.`,
       )
-      await this.dispatchInput(
-        channel,
-        session.parentChannelId,
-        [
-          {
-            type: 'text',
-            text: [
-              `A rebase conflict occurred while merging this worktree into ${result.targetBranch}.`,
-              'Inspect git status, both sides, and the replayed commit intent.',
-              'Resolve conflicts preserving both intended changes, stage files, then run git rebase --continue.',
-              'Repeat until rebase fully finishes and git status is clean. Do not merge into the main checkout yourself.',
-              'Report when complete so /merge-worktree can be run again.',
-            ].join('\n'),
-            text_elements: [],
-          },
-        ],
-        interaction.id,
-      )
       return
     }
-    worktree.merged = true
-    session.updatedAt = new Date().toISOString()
-    await saveState(this.state)
-    if (channel.name.startsWith('⬦ ')) await channel.setName(channel.name.slice(2)).catch(() => undefined)
-    await interaction.editReply(
-      `Merged \`${result.branch}\` into \`${result.targetBranch}\` @ ${result.shortSha} (${result.commitCount} commit${result.commitCount === 1 ? '' : 's'}).\nWorktree remains at detached HEAD.`,
-    )
+    let titleWarning = ''
+    if (channel.name.startsWith('⬦ ')) {
+      await this.synchronizeThreadTitle(session, channel, channel.name.slice(2)).catch((error: unknown) => {
+        titleWarning = `\nTitle synchronization failed: ${truncate(errorText(error), 300)}`
+      })
+    }
+    if (result.status === 'nothing-to-merge') {
+      await interaction.editReply(
+        `Nothing to merge from \`${result.branch}\` into \`${result.targetBranch}\`; cleared the worktree marker.${titleWarning}`,
+      )
+    } else {
+      await interaction.editReply(
+        `Merged \`${result.branch}\` into \`${result.targetBranch}\` @ ${result.shortSha} (${result.commitCount} commit${result.commitCount === 1 ? '' : 's'}).\nWorktree remains at detached HEAD.${titleWarning}`,
+      )
+    }
   }
 
   private queueFor(threadId: string): QueuedPrompt[] {
     return (this.state.queues[threadId] ??= [])
   }
 
-  private async enqueuePrompt(threadId: string, prompt: QueuedPrompt): Promise<number> {
+  private queuedPromptsFor(threadId: string): QueuedPrompt[] {
+    return this.queueFor(threadId).filter((prompt) => this.promptDeliveryKind(prompt) === 'queued')
+  }
+
+  private async enqueuePrompt(
+    threadId: string,
+    prompt: QueuedPrompt,
+    allowArchived = false,
+  ): Promise<number> {
+    return this.promptQueue.run(threadId, async () => {
+      this.assertDiscordThreadAvailable(threadId)
+      const session = this.state.sessions[threadId]
+      if (this.archivingDiscordThreads.has(threadId)) {
+        throw new Error('Session is being archived')
+      }
+      if (!session || this.unlinkedCodexSessionChannels.has(threadId)) {
+        throw new Error('Thread has no Codex session')
+      }
+      if (
+        this.removingProjects.has(session.parentChannelId) ||
+        !this.config.projects[session.parentChannelId]
+      ) {
+        throw new Error('Project is no longer available')
+      }
+      if (session.archived && !allowArchived) throw new Error('Session is archived; run /resume first')
+      const queue = this.queueFor(threadId)
+      const deliveryId = this.queuedPromptDeliveryId(prompt)
+      const existingIndex = queue.findIndex(
+        (queued) => this.queuedPromptDeliveryId(queued) === deliveryId,
+      )
+      if (existingIndex >= 0) {
+        return queue
+          .slice(0, existingIndex + 1)
+          .filter((queued) => this.promptDeliveryKind(queued) === 'queued')
+          .length
+      }
+      queue.push(prompt)
+      try {
+        await saveState(this.state)
+      } catch (error) {
+        const index = queue.lastIndexOf(prompt)
+        if (index >= 0) queue.splice(index, 1)
+        throw error
+      }
+      if (
+        this.unlinkedCodexSessionChannels.has(threadId) ||
+        this.state.sessions[threadId]?.codexThreadId !== session.codexThreadId
+      ) {
+        throw new Error('Thread has no Codex session')
+      }
+      return this.promptDeliveryKind(prompt) === 'queued'
+        ? queue.filter((queued) => this.promptDeliveryKind(queued) === 'queued').length
+        : 0
+    })
+  }
+
+  private async announceQueuedPrompt(channel: ThreadChannel, prompt: QueuedPrompt): Promise<void> {
+    await channel.send({
+      content: `» **${escapeInlineMarkdown(prompt.authorName)}:** ${truncate(prompt.displayText, 1_700)}`,
+      allowedMentions: { parse: [] },
+    })
+  }
+
+  private queuedPromptDeliveryId(prompt: QueuedPrompt): string {
+    return prompt.sourceMessageId || prompt.id
+  }
+
+  private promptDeliveryKind(prompt: QueuedPrompt): 'direct' | 'queued' {
+    return prompt.deliveryKind || 'queued'
+  }
+
+  private async announceDeliveredPrompt(channel: ThreadChannel, prompt: QueuedPrompt): Promise<void> {
+    if (this.promptDeliveryKind(prompt) === 'queued') {
+      await this.announceQueuedPrompt(channel, prompt)
+    }
+  }
+
+  private async removeQueuedPrompt(threadId: string, prompt: QueuedPrompt): Promise<boolean> {
     const queue = this.queueFor(threadId)
-    queue.push(prompt)
-    await saveState(this.state)
-    return queue.length
+    const deliveryId = this.queuedPromptDeliveryId(prompt)
+    const index = queue.findIndex((queued) => this.queuedPromptDeliveryId(queued) === deliveryId)
+    if (index < 0) return false
+    const [removed] = queue.splice(index, 1)
+    try {
+      await saveState(this.state)
+    } catch (error) {
+      if (removed) queue.splice(Math.min(index, queue.length), 0, removed)
+      throw error
+    }
+    return true
+  }
+
+  private async removeDeliveredQueuePrompts(
+    session: SessionState,
+    channel: ThreadChannel,
+    knownRuntime?: CodexThreadRuntimeState,
+  ): Promise<void> {
+    const queue = this.queueFor(channel.id)
+    if (queue.length === 0) return
+    const runtime = knownRuntime || await this.readThreadRuntimeState(session)
+    const deliveredIds = new Set(runtime.userMessageClientIds || [])
+    const delivered = queue.filter((prompt) =>
+      deliveredIds.has(this.queuedPromptDeliveryId(prompt)))
+    if (delivered.length === 0) return
+    const original = [...queue]
+    queue.splice(
+      0,
+      queue.length,
+      ...queue.filter((prompt) => !deliveredIds.has(this.queuedPromptDeliveryId(prompt))),
+    )
+    try {
+      await saveState(this.state)
+    } catch (error) {
+      queue.splice(0, queue.length, ...original)
+      throw error
+    }
+    for (const prompt of delivered) await this.announceDeliveredPrompt(channel, prompt)
+  }
+
+  private async deliverPersistedDirectPromptsUnlocked(
+    session: SessionState,
+    channel: ThreadChannel,
+  ): Promise<void> {
+    while (true) {
+      const current = this.state.sessions[channel.id]
+      if (
+        current?.codexThreadId !== session.codexThreadId ||
+        current.archived ||
+        this.deletedDiscordThreads.has(channel.id)
+      ) return
+      this.assertCodexSessionLinked(current)
+      const next = this.queueFor(channel.id).find(
+        (prompt) => this.promptDeliveryKind(prompt) === 'direct',
+      )
+      if (!next) return
+
+      const runtime = await this.readThreadRuntimeState(current)
+      await this.removeDeliveredQueuePrompts(current, channel, runtime)
+      if (!this.queueFor(channel.id).includes(next)) continue
+      if (runtime.status === 'active' && runtime.activeTurnId) {
+        await this.adoptActiveTurn(current, channel, runtime.activeTurnId)
+      } else if (runtime.status === 'idle') {
+        await this.clearInactiveTurn(current, channel)
+      } else if (runtime.status === 'systemError') {
+        throw new Error('Codex thread is unavailable for persisted prompt recovery')
+      }
+
+      await this.dispatchInputUnlocked(
+        channel,
+        current.parentChannelId,
+        next.input,
+        this.queuedPromptDeliveryId(next),
+      )
+      await this.removeQueuedPrompt(channel.id, next)
+    }
+  }
+
+  private async recoverPersistedPromptsUnlocked(
+    session: SessionState,
+    channel: ThreadChannel,
+  ): Promise<void> {
+    if (this.unlinkedCodexSessionChannels.has(channel.id)) {
+      throw new Error('Thread has no Codex session')
+    }
+    const current = this.state.sessions[channel.id]
+    if (
+      current?.codexThreadId !== session.codexThreadId ||
+      current.archived ||
+      this.deletedDiscordThreads.has(channel.id)
+    ) return
+    const runtime = await this.readThreadRuntimeState(current)
+    this.assertCodexSessionLinked(current)
+    await this.removeDeliveredQueuePrompts(current, channel, runtime)
+    if (runtime.status === 'active' && runtime.activeTurnId) {
+      await this.adoptActiveTurn(current, channel, runtime.activeTurnId)
+    } else if (runtime.status === 'idle') {
+      await this.clearInactiveTurn(current, channel)
+    } else if (runtime.status === 'systemError') {
+      throw new Error('Codex thread is unavailable for persisted prompt recovery')
+    }
+    await this.deliverPersistedDirectPromptsUnlocked(current, channel)
+    if (this.blockedQueuedSourceThreads.has(channel.id)) {
+      await this.reconcilePersistedQueuedSourcesUnlocked(current, channel)
+    }
+    if (!this.blockedQueuedSourceThreads.has(channel.id)) {
+      await this.drainQueueAfterTurnUnlocked(current, channel, true)
+    }
+  }
+
+  private async recoverPersistedPrompts(
+    session: SessionState,
+    channel: ThreadChannel,
+    waitForRecovery = true,
+  ): Promise<void> {
+    if (waitForRecovery) await this.waitForCodexRecovery()
+    await this.projectMutationQueue.run(`channel:${session.parentChannelId}`, async () => {
+      await this.refreshProjectsSafely()
+      if (
+        this.removingProjects.has(session.parentChannelId) ||
+        !this.config.projects[session.parentChannelId]
+      ) {
+        throw new Error('Project is no longer available')
+      }
+      await this.promptQueue.run(channel.id, () =>
+        this.recoverPersistedPromptsUnlocked(session, channel))
+    })
+  }
+
+  private async persistAndDeliverDirectPrompt(
+    session: SessionState,
+    channel: ThreadChannel,
+    prompt: QueuedPrompt,
+  ): Promise<void> {
+    await this.enqueuePrompt(channel.id, { ...prompt, deliveryKind: 'direct' })
+    await this.recoverPersistedPrompts(session, channel)
+  }
+
+  private async steerNextQueuedPrompt(run: ActiveRun): Promise<void> {
+    await this.promptQueue.run(run.channel.id, () => this.steerNextQueuedPromptUnlocked(run))
+  }
+
+  private async steerNextQueuedPromptUnlocked(run: ActiveRun): Promise<void> {
+    if (
+      this.deletedDiscordThreads.has(run.channel.id) ||
+      run.session.archived ||
+      this.blockedQueuedSourceThreads.has(run.channel.id)
+    ) return
+    try {
+      await this.removeDeliveredQueuePrompts(run.session, run.channel)
+    } catch (error) {
+      await run.channel.send(`⨯ Queued prompt deferred: ${truncate(errorText(error), 1_700)}`).catch(() => undefined)
+      return
+    }
+    if (this.deletedDiscordThreads.has(run.channel.id) || run.session.archived) return
+    const turnId = run.turnId || run.session.activeTurnId
+    const queue = this.queueFor(run.channel.id)
+    const next = turnId ? queue[0] : undefined
+    if (!turnId || !next) return
+    try {
+      const delivered = await this.steerActiveTurn(
+        run.session,
+        run.channel,
+        next.input,
+        this.queuedPromptDeliveryId(next),
+      )
+      if (!delivered) throw new Error('Active turn ended before the queued prompt was delivered')
+      await this.removeQueuedPrompt(run.channel.id, next)
+    } catch (error) {
+      await run.channel.send(`⨯ Queued prompt deferred: ${truncate(errorText(error), 1_700)}`).catch(() => undefined)
+      return
+    }
+    await this.announceDeliveredPrompt(run.channel, next)
+  }
+
+  private async drainQueueAfterTurnUnlocked(
+    session: SessionState,
+    channel: ThreadChannel,
+    allowWithoutGoal: boolean,
+    knownGoalStatus?: string,
+  ): Promise<void> {
+    if (
+      this.deletedDiscordThreads.has(channel.id) ||
+      session.archived ||
+      this.blockedQueuedSourceThreads.has(channel.id)
+    ) return
+    const queue = this.queueFor(channel.id)
+    if (queue.length === 0) return
+    if (session.activeTurnId || this.runs.has(session.codexThreadId)) return
+    try {
+      await this.removeDeliveredQueuePrompts(session, channel)
+    } catch (error) {
+      await channel.send(`⨯ Queued prompt deferred: ${truncate(errorText(error), 1_700)}`).catch(() => undefined)
+      return
+    }
+    if (queue.length === 0) return
+    let goalStatus = knownGoalStatus
+    if (goalStatus === undefined) {
+      try {
+        goalStatus = (await this.codex.getThreadGoal(session.codexThreadId))?.status
+      } catch (error) {
+        this.logVerbose('goal lookup before queue drain failed', {
+          threadId: session.codexThreadId,
+          error: errorText(error),
+        })
+      }
+    }
+    if (goalStatus === 'active') return
+    if (!allowWithoutGoal && !goalStatus) return
+    const next = queue[0]
+    if (!next) return
+    try {
+      await this.dispatchInputUnlocked(
+        channel,
+        session.parentChannelId,
+        next.input,
+        this.queuedPromptDeliveryId(next),
+      )
+      await this.removeQueuedPrompt(channel.id, next)
+    } catch (error) {
+      await channel.send(`⨯ Queued prompt deferred: ${truncate(errorText(error), 1_700)}`).catch(() => undefined)
+      return
+    }
+    await this.announceDeliveredPrompt(channel, next)
+  }
+
+  private scheduleQueueDrain(
+    session: SessionState,
+    channel: ThreadChannel,
+    allowWithoutGoal: boolean,
+    knownGoalStatus?: string,
+  ): void {
+    void (async () => {
+      while (!this.stopping) {
+        await this.waitForCodexRecovery()
+        let retryAfterRecovery = false
+        try {
+          await this.projectMutationQueue.run(`channel:${session.parentChannelId}`, async () => {
+            if (this.removingProjects.has(session.parentChannelId)) return
+            if (this.codexRecoveryPromise) {
+              retryAfterRecovery = true
+              return
+            }
+            await this.promptQueue.run(
+              channel.id,
+              () => this.drainQueueAfterTurnUnlocked(
+                session,
+                channel,
+                allowWithoutGoal,
+                knownGoalStatus,
+              ),
+            )
+          })
+        } catch (error) {
+          console.error(`Failed to drain queued Discord prompt: ${errorText(error)}`)
+          return
+        }
+        if (!retryAfterRecovery) return
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+    })()
   }
 
   private async handleQueueCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     const { channel, session } = this.requireThreadSession(interaction)
     const message = interaction.options.getString('message', true)
     const input: UserInput[] = [{ type: 'text', text: message, text_elements: [] }]
-    if (!session.activeTurnId) {
-      await this.dispatchInput(channel, session.parentChannelId, input, interaction.id)
-      await interaction.reply({
-        content: `» **${escapeInlineMarkdown(interaction.user.displayName)}:** ${truncate(message, 1_000)}`,
-      })
-      return
-    }
     const position = await this.enqueuePrompt(channel.id, {
       id: interaction.id,
       authorId: interaction.user.id,
@@ -2301,25 +5250,46 @@ export class CordexDiscordBot {
       input,
       displayText: message,
       createdAt: new Date().toISOString(),
+      deliveryKind: 'queued',
     })
-    await interaction.reply({ content: `Queued message (position ${position})` })
+    await this.recoverPersistedPrompts(session, channel)
+    const remainsQueued = this.queueFor(channel.id).some((prompt) =>
+      this.queuedPromptDeliveryId(prompt) === interaction.id)
+    await interaction.reply({
+      content: remainsQueued
+        ? `Queued message (position ${position})`
+        : `» **${escapeInlineMarkdown(interaction.user.displayName)}:** ${truncate(message, 1_000)}`,
+    })
   }
 
   private async handleClearQueueCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     const { channel } = this.requireThreadSession(interaction)
-    const queue = this.queueFor(channel.id)
     const position = interaction.options.getInteger('position')
-    if (position !== null) {
-      if (!queue[position - 1]) throw new Error(`No queued message at position ${position}`)
-      queue.splice(position - 1, 1)
-      await saveState(this.state)
-      await interaction.reply({ content: `Cleared queued message ${position}.` })
-      return
-    }
-    const count = queue.length
-    queue.length = 0
-    await saveState(this.state)
-    await interaction.reply({ content: `Cleared ${count} queued message${count === 1 ? '' : 's'}.` })
+    const reply = await this.promptQueue.run(channel.id, async () => {
+      const queue = this.queueFor(channel.id)
+      const original = [...queue]
+      const queued = this.queuedPromptsFor(channel.id)
+      try {
+        if (position !== null) {
+          const selected = queued[position - 1]
+          if (!selected) throw new Error(`No queued message at position ${position}`)
+          const index = queue.indexOf(selected)
+          if (index >= 0) queue.splice(index, 1)
+          await saveState(this.state)
+          return `Cleared queued message ${position}.`
+        }
+        const count = queued.length
+        for (let index = queue.length - 1; index >= 0; index--) {
+          if (this.promptDeliveryKind(queue[index]!) === 'queued') queue.splice(index, 1)
+        }
+        await saveState(this.state)
+        return `Cleared ${count} queued message${count === 1 ? '' : 's'}.`
+      } catch (error) {
+        queue.splice(0, queue.length, ...original)
+        throw error
+      }
+    })
+    await interaction.reply({ content: reply })
   }
 
   private async sendShellResult(interaction: ChatInputCommandInteraction, command: string, directory: string): Promise<void> {
@@ -2393,8 +5363,16 @@ export class CordexDiscordBot {
       })
       return
     }
+    const previous = this.state.channelVerbosity[parentId]
+    const hadPrevious = Object.hasOwn(this.state.channelVerbosity, parentId)
     this.state.channelVerbosity[parentId] = level
-    await saveState(this.state)
+    try {
+      await saveState(this.state)
+    } catch (error) {
+      if (hadPrevious) this.state.channelVerbosity[parentId] = previous!
+      else delete this.state.channelVerbosity[parentId]
+      throw error
+    }
     const description = level === 'tools_and_text'
       ? 'All output including tool executions and status messages'
       : level === 'text_and_essential_tools'
@@ -2417,16 +5395,18 @@ export class CordexDiscordBot {
   private async handleAbortCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     if (!interaction.channel?.isThread()) throw new Error('Abort must run inside a Cordex thread')
     const session = this.state.sessions[interaction.channel.id]
-    if (!session?.activeTurnId) {
+    if (!session) {
       await interaction.reply({ content: 'No active turn.' })
       return
     }
-    await this.codex.interruptTurn(session.codexThreadId, session.activeTurnId)
-    await this.cancelActionButtonsForChannel(
-      interaction.channel.id,
-      '_Turn aborted._',
-      'Action button request cancelled because the turn was aborted.',
-    )
+    const activeTurnId = this.runs.get(session.codexThreadId)?.turnId || session.activeTurnId
+    if (!activeTurnId && !this.pendingTurnStarts.has(session.codexThreadId)) {
+      await interaction.reply({ content: 'No active turn.' })
+      return
+    }
+    if (activeTurnId) await this.codex.interruptTurn(session.codexThreadId, activeTurnId)
+    else this.abortRequestedThreads.add(session.codexThreadId)
+    await this.dismissPendingControlsForChannel(interaction.channel.id, '_Turn aborted._')
     await interaction.reply('Abort requested.')
   }
 
@@ -2435,7 +5415,9 @@ export class CordexDiscordBot {
     if (!parentId) throw new Error('Status requires a project channel')
     const project = this.config.projects[parentId]
     const session = interaction.channel?.isThread() ? this.state.sessions[interaction.channel.id] : undefined
-    const queued = interaction.channel?.isThread() ? this.queueFor(interaction.channel.id).length : 0
+    const queued = interaction.channel?.isThread()
+      ? this.queuedPromptsFor(interaction.channel.id).length
+      : 0
     await interaction.reply({
       content: [
         `Project: ${project ? `\`${project.directory}\`` : 'not configured'}`,
@@ -2492,13 +5474,13 @@ export class CordexDiscordBot {
         return
       }
       if (message.channel.type !== ChannelType.GuildText) return
-      const name = truncate(message.content.replace(/\s+/g, ' ').trim() || 'Cordex session', 80)
+      const name = normalizeThreadTitle(message.content)
       const worktree = await this.createAutomaticWorktree(parentId, name)
       let thread: ThreadChannel | undefined
       try {
         if (this.removingProjects.has(parentId)) throw new Error('Project is being removed')
         thread = await message.startThread({
-          name: `${worktree ? '⬦ ' : ''}${name}`,
+          name: normalizeThreadTitle(`${worktree ? '⬦ ' : ''}${message.content}`),
           autoArchiveDuration: ThreadAutoArchiveDuration.OneDay,
           reason: 'Start Codex session',
         })
@@ -2520,26 +5502,45 @@ export class CordexDiscordBot {
     }
   }
 
-  private async buildInput(message: DiscordMessage, contentOverride?: string): Promise<UserInput[]> {
-    let content = contentOverride ?? message.content
-      .replace(new RegExp(`<@!?${this.client.user?.id ?? ''}>`, 'g'), '')
-      .trim()
-    const input: UserInput[] = []
-    for (const attachment of message.attachments.values()) {
-      const extension = path.extname(attachment.name || '').toLowerCase()
-      if (attachment.contentType?.startsWith('image/') || imageExtensions.has(extension)) {
-        input.push({ type: 'image', url: attachment.url })
-      } else if ((attachment.size ?? 0) <= 1_000_000) {
-        const attachmentText = await fetch(attachment.url).then((response) => {
-          if (!response.ok) throw new Error(`Failed to read attachment ${attachment.name}`)
-          return response.text()
-        })
-        content += `\n\nAttachment: ${attachment.name}\n\n${attachmentText}`
-      }
+  private async buildInput(
+    message: DiscordMessage,
+    contentOverride?: string,
+  ): Promise<DiscordInputResult> {
+    return buildDiscordInput({
+      message,
+      ...(this.client.user?.id ? { botUserId: this.client.user.id } : {}),
+      ...(contentOverride !== undefined ? { contentOverride } : {}),
+    })
+  }
+
+  private async requireSupportedInput(
+    channel: ThreadChannel,
+    built: DiscordInputResult,
+  ): Promise<UserInput[]> {
+    if (built.input.length === 0) {
+      throw new Error(
+        built.feedback.map((item) => item.message).join(' ') ||
+        'Message has no prompt text or supported attachment',
+      )
     }
-    if (content) input.unshift({ type: 'text', text: content, text_elements: [] })
-    if (input.length === 0) throw new Error('Message has no prompt text or supported attachment')
-    return input
+    if (built.feedback.length > 0) {
+      await channel.send({
+        content: truncate(built.feedback.map((item) => `⚠ ${item.message}`).join('\n'), 1_900),
+        allowedMentions: { parse: [] },
+      })
+    }
+    return built.input
+  }
+
+  private btwInput(input: UserInput[]): UserInput[] {
+    const instruction = 'Answer only this side question. Do not continue the previous task.'
+    const textIndex = input.findIndex((item) => item.type === 'text')
+    if (textIndex < 0) {
+      return [{ type: 'text', text: `${instruction}\n\nInspect the attached input.`, text_elements: [] }, ...input]
+    }
+    return input.map((item, index) => index === textIndex && item.type === 'text'
+      ? { ...item, text: `${instruction}\n\n${item.text}` }
+      : item)
   }
 
   private async processPrompt(
@@ -2548,6 +5549,32 @@ export class CordexDiscordBot {
     message: DiscordMessage,
     initialWorktree?: CreatedWorktree,
   ): Promise<void> {
+    this.assertDiscordThreadAvailable(channel.id)
+    const session = this.state.sessions[channel.id]
+    const btw = session ? parseBtwMessage(message.content) : { prompt: message.content, fork: false }
+    if (session && btw.fork) {
+      const input = this.btwInput(await this.requireSupportedInput(
+        channel,
+        await this.buildInput(message, btw.prompt),
+      ))
+      this.assertDiscordThreadAvailable(channel.id)
+      const forked = await this.forkSession({
+        source: session,
+        parentChannelId: session.parentChannelId,
+        name: `BTW: ${btw.prompt || 'attachment'}`,
+        userId: message.author.id,
+      })
+      await this.dispatchInput(
+        forked.thread,
+        session.parentChannelId,
+        input,
+        message.id,
+      )
+      await this.pruneAttachmentCache().catch(() => undefined)
+      await channel.send(`Side session started: ${forked.thread}`)
+      return
+    }
+
     await this.cancelActionButtonsForChannel(
       channel.id,
       '_Buttons dismissed._',
@@ -2555,9 +5582,12 @@ export class CordexDiscordBot {
     )
     const parsed = parseQueueMessage(message.content)
     const queuedContent = parsed.queued ? parsed.text : undefined
-    const input = await this.buildInput(message, queuedContent)
-    const session = this.state.sessions[channel.id]
-    if (queuedContent !== undefined && session?.activeTurnId) {
+    const input = await this.requireSupportedInput(
+      channel,
+      await this.buildInput(message, queuedContent),
+    )
+    this.assertDiscordThreadAvailable(channel.id)
+    if (queuedContent !== undefined && session) {
       const position = await this.enqueuePrompt(channel.id, {
         id: message.id,
         authorId: message.author.id,
@@ -2566,11 +5596,39 @@ export class CordexDiscordBot {
         displayText: queuedContent || '(attachment)',
         createdAt: new Date().toISOString(),
         sourceMessageId: message.id,
+        deliveryKind: 'queued',
       })
-      await channel.send(`Queued message (position ${position})`)
+      await this.recoverPersistedPrompts(session, channel)
+      await this.pruneAttachmentCache().catch(() => undefined)
+      if (this.queueFor(channel.id).some((prompt) => this.queuedPromptDeliveryId(prompt) === message.id)) {
+        await channel.send(`Queued message (position ${position})`)
+      }
       return
     }
-    await this.dispatchInput(channel, parentChannelId, input, message.id, initialWorktree)
+    if (session) {
+      await this.persistAndDeliverDirectPrompt(session, channel, {
+        id: message.id,
+        authorId: message.author.id,
+        authorName: message.author.displayName,
+        input,
+        displayText: message.content.trim() || '(attachment)',
+        createdAt: new Date().toISOString(),
+        sourceMessageId: message.id,
+        deliveryKind: 'direct',
+      })
+      await this.pruneAttachmentCache().catch(() => undefined)
+      return
+    }
+    await this.dispatchInput(
+      channel,
+      parentChannelId,
+      input,
+      message.id,
+      initialWorktree
+        ? { directory: initialWorktree.directory, worktree: initialWorktree }
+        : undefined,
+    )
+    await this.pruneAttachmentCache().catch(() => undefined)
   }
 
   private async createAutomaticWorktree(
@@ -2597,19 +5655,35 @@ export class CordexDiscordBot {
     parentChannelId: string,
     input: UserInput[],
     clientUserMessageId?: string,
-    initialWorktree?: CreatedWorktree,
+    initialLocation?: InitialSessionLocation,
   ): Promise<void> {
+    this.assertDiscordThreadAvailable(channel.id)
+    await this.waitForCodexRecovery()
     await this.projectMutationQueue.run(`channel:${parentChannelId}`, async () => {
       await this.refreshProjectsSafely()
       if (this.removingProjects.has(parentChannelId)) throw new Error('Project is being removed')
+      this.assertDiscordThreadAvailable(channel.id)
       await this.dispatchInputUnlocked(
         channel,
         parentChannelId,
         input,
         clientUserMessageId,
-        initialWorktree,
+        initialLocation,
       )
     })
+  }
+
+  private assertDiscordThreadAvailable(threadId: string): void {
+    if (this.deletedDiscordThreads.has(threadId)) throw new Error('Discord thread was deleted')
+  }
+
+  private assertCodexSessionLinked(session: SessionState): void {
+    if (
+      this.unlinkedCodexSessionChannels.has(session.discordThreadId) ||
+      this.state.sessions[session.discordThreadId]?.codexThreadId !== session.codexThreadId
+    ) {
+      throw new Error('Thread has no Codex session')
+    }
   }
 
   private async dispatchInputUnlocked(
@@ -2617,25 +5691,42 @@ export class CordexDiscordBot {
     parentChannelId: string,
     input: UserInput[],
     clientUserMessageId?: string,
-    initialWorktree?: CreatedWorktree,
+    initialLocation?: InitialSessionLocation,
+    deliveryAttempt = 0,
   ): Promise<void> {
+    this.assertDiscordThreadAvailable(channel.id)
+    if (this.archivingDiscordThreads.has(channel.id)) throw new Error('Session is being archived')
     const project = this.config.projects[parentChannelId]
     if (!project) throw new Error('Project not configured')
     let session = this.state.sessions[channel.id]
+    if (session) this.assertCodexSessionLinked(session)
+    if (session?.archived) throw new Error('Session is archived; run /resume first')
     let createdSession = false
     if (!session) {
       const model = this.state.channelModels[parentChannelId] || this.config.defaultModel
       const fastMode = this.state.channelFastMode[parentChannelId]
       const yoloMode = this.state.channelYoloMode[parentChannelId] ?? false
-      const directory = initialWorktree?.directory || project.directory
+      const directory = initialLocation?.directory || project.directory
+      const runtimeWorkspaceRoots = initialLocation?.workspaceRoots?.length
+        ? [...new Set([
+            path.resolve(directory),
+            ...initialLocation.workspaceRoots.map((root) => path.resolve(root)),
+          ])]
+        : undefined
+      const serviceTier = await this.serviceTierForFastMode(model, fastMode)
       const started = await this.codex.startThread({
         cwd: directory,
         ...(model ? { model } : {}),
-        ...(fastMode !== undefined ? { serviceTier: fastMode ? 'fast' : null } : {}),
+        ...(serviceTier !== undefined ? { serviceTier } : {}),
         dynamicTools: cordexDynamicTools,
+        ...(runtimeWorkspaceRoots ? { runtimeWorkspaceRoots } : {}),
         sandbox: yoloMode ? 'danger-full-access' : this.config.sandbox,
         approvalPolicy: yoloMode ? 'never' : this.config.approvalPolicy,
       })
+      if (this.deletedDiscordThreads.has(channel.id)) {
+        await this.codex.deleteThread(started.threadId).catch(() => undefined)
+        this.assertDiscordThreadAvailable(channel.id)
+      }
       session = {
         discordThreadId: channel.id,
         parentChannelId,
@@ -2649,12 +5740,15 @@ export class CordexDiscordBot {
               : {}),
         ...(fastMode !== undefined ? { fastMode } : {}),
         ...(Object.hasOwn(this.state.channelYoloMode, parentChannelId) ? { yoloMode } : {}),
-        ...(initialWorktree
+        ...(initialLocation?.workspaceRoots?.length
+          ? { workspaceRoots: [...initialLocation.workspaceRoots] }
+          : {}),
+        ...(initialLocation?.worktree
           ? {
               worktree: {
-                projectDirectory: initialWorktree.projectDirectory,
-                directory: initialWorktree.directory,
-                branch: initialWorktree.branch,
+                projectDirectory: initialLocation.worktree.projectDirectory,
+                directory: initialLocation.worktree.directory,
+                branch: initialLocation.worktree.branch,
               },
             }
           : {}),
@@ -2663,25 +5757,17 @@ export class CordexDiscordBot {
       this.state.sessions[channel.id] = session
       createdSession = true
       this.loadedThreads.add(session.codexThreadId)
-      await this.codex.setThreadName(session.codexThreadId, channel.name).catch(() => undefined)
+      await this.synchronizeCodexThreadTitle(session.codexThreadId, channel.name)
+        .catch(async () => {
+          await channel.send(
+            '⚠ Session title synchronization failed; Cordex will retry on the next load.',
+          ).catch(() => undefined)
+        })
       await saveState(this.state)
-    } else if (!this.loadedThreads.has(session.codexThreadId)) {
-      const runtimeRoots = this.runtimeWorkspaceRoots(session)
-      await this.codex.resumeThread({
-        threadId: session.codexThreadId,
-        cwd: session.directory,
-        ...(session.model ? { model: session.model } : {}),
-        ...(session.fastMode !== undefined
-          ? { serviceTier: session.fastMode ? 'fast' : null }
-          : {}),
-        ...(runtimeRoots ? { runtimeWorkspaceRoots: runtimeRoots } : {}),
-        ...(!session.yoloMode && session.permissions
-          ? { permissions: session.permissions }
-          : { sandbox: session.yoloMode ? 'danger-full-access' as const : this.config.sandbox }),
-        approvalPolicy: session.yoloMode ? 'never' : this.config.approvalPolicy,
-      })
-      this.loadedThreads.add(session.codexThreadId)
-    }
+      this.unlinkedCodexSessionChannels.delete(channel.id)
+    } else await this.ensureSessionLoaded(session)
+    this.assertCodexSessionLinked(session)
+    this.assertDiscordThreadAvailable(channel.id)
     if (createdSession) {
       await channel.send(formatModelBanner(
         session.model || this.config.defaultModel || 'Codex default',
@@ -2689,69 +5775,358 @@ export class CordexDiscordBot {
       ))
     }
 
-    if (session.activeTurnId) {
-      await this.codex.steerTurn({
+    if (await this.steerActiveTurn(session, channel, input, clientUserMessageId)) return
+    this.assertDiscordThreadAvailable(channel.id)
+    await channel.sendTyping()
+    this.assertDiscordThreadAvailable(channel.id)
+    const runtimeRoots = this.runtimeWorkspaceRoots(session)
+    const serviceTier = await this.serviceTierForFastMode(
+      session.model || this.config.defaultModel,
+      session.fastMode,
+    )
+    let turnId: string | undefined
+    let retryAfterStartFailure = false
+    let startError: unknown
+    this.pendingTurnStarts.add(session.codexThreadId)
+    try {
+      turnId = await this.codex.startTurn({
         threadId: session.codexThreadId,
-        expectedTurnId: session.activeTurnId,
         input,
+        ...(session.model ? { model: session.model } : {}),
+        ...(session.effort ? { effort: session.effort } : {}),
+        ...(serviceTier !== undefined ? { serviceTier } : {}),
+        ...(session.mode ? { mode: session.mode } : {}),
+        ...(runtimeRoots ? { runtimeWorkspaceRoots: runtimeRoots } : {}),
+        ...(!session.yoloMode && session.permissions ? { permissions: session.permissions } : {}),
+        ...(session.yoloMode
+          ? { sandbox: 'danger-full-access' as const, approvalPolicy: 'never' as const }
+          : {}),
         ...(clientUserMessageId ? { clientUserMessageId } : {}),
       })
+      this.assertCodexSessionLinked(session)
+      if (this.abortRequestedThreads.has(session.codexThreadId)) {
+        await this.codex.interruptTurn(session.codexThreadId, turnId)
+        this.abortRequestedThreads.delete(session.codexThreadId)
+        return
+      }
+      if (this.deletedDiscordThreads.has(channel.id)) {
+        await this.interruptDeletedTurn(channel.id, session.codexThreadId, turnId)
+          .catch(() => undefined)
+        this.assertDiscordThreadAvailable(channel.id)
+      }
+    } catch (error) {
+      startError = error
+      if (this.abortRequestedThreads.has(session.codexThreadId)) {
+        await this.interruptRuntimeTurn(session).catch((interruptError: unknown) => {
+          this.logVerbose('pending start abort reconciliation failed', {
+            threadId: session.codexThreadId,
+            error: errorText(interruptError),
+          })
+        })
+        this.abortRequestedThreads.delete(session.codexThreadId)
+        return
+      }
+      if (this.deletedDiscordThreads.has(channel.id)) {
+        if (!turnId) {
+          await this.interruptDeletedRuntimeTurn(channel.id, session).catch((interruptError: unknown) => {
+            this.logVerbose('deleted thread turn reconciliation failed', {
+              threadId: session.codexThreadId,
+              error: errorText(interruptError),
+            })
+          })
+        }
+        throw error
+      }
+      await this.waitForActiveTurn(session)
+      let runtime: CodexThreadRuntimeState
+      try {
+        runtime = await this.readThreadRuntimeState(session)
+      } catch {
+        throw error
+      }
+      if (this.runtimeHasClientMessage(runtime, clientUserMessageId)) {
+        await this.reconcileDeliveredInput(session, channel, runtime)
+        return
+      }
+      const activeTurnId = await this.reconcileActiveTurn(session, channel, runtime)
+      if (!activeTurnId) throw error
+      if (await this.steerActiveTurn(session, channel, input, clientUserMessageId)) return
+      if (clientUserMessageId) {
+        let latestRuntime: CodexThreadRuntimeState
+        try {
+          latestRuntime = await this.readThreadRuntimeState(session)
+        } catch {
+          throw error
+        }
+        if (this.runtimeHasClientMessage(latestRuntime, clientUserMessageId)) {
+          await this.reconcileDeliveredInput(session, channel, latestRuntime)
+          return
+        }
+      }
+      retryAfterStartFailure = true
+    } finally {
+      this.pendingTurnStarts.delete(session.codexThreadId)
+    }
+    if (retryAfterStartFailure) {
+      if (deliveryAttempt >= 3) throw startError
+      await this.dispatchInputUnlocked(
+        channel,
+        parentChannelId,
+        input,
+        clientUserMessageId,
+        initialLocation,
+        deliveryAttempt + 1,
+      )
       return
     }
-    await channel.sendTyping()
-    const runtimeRoots = this.runtimeWorkspaceRoots(session)
-    const turnId = await this.codex.startTurn({
-      threadId: session.codexThreadId,
-      input,
-      ...(session.model ? { model: session.model } : {}),
-      ...(session.effort ? { effort: session.effort } : {}),
-      ...(session.fastMode !== undefined
-        ? { serviceTier: session.fastMode ? 'fast' : null }
-        : {}),
-      ...(session.mode ? { mode: session.mode } : {}),
-      ...(runtimeRoots ? { runtimeWorkspaceRoots: runtimeRoots } : {}),
-      ...(!session.yoloMode && session.permissions ? { permissions: session.permissions } : {}),
-      ...(session.yoloMode
-        ? { sandbox: 'danger-full-access' as const, approvalPolicy: 'never' as const }
-        : {}),
-      ...(clientUserMessageId ? { clientUserMessageId } : {}),
-    })
+    if (!turnId) throw startError || new Error('Codex turn did not start')
     session.activeTurnId = turnId
     session.updatedAt = new Date().toISOString()
     this.startRun(session, channel)
     await saveState(this.state)
   }
 
-  private async handleQueuedMessageUpdate(message: DiscordMessage): Promise<void> {
-    if (message.author.bot) return
-    for (const [threadId, queue] of Object.entries(this.state.queues)) {
-      const queued = queue.find((item) => item.sourceMessageId === message.id)
-      if (!queued) continue
-      const edited = editQueuedPrompt(queued, message.content)
-      if (!edited) {
-        queue.splice(queue.indexOf(queued), 1)
-      } else {
-        queue[queue.indexOf(queued)] = edited
-      }
-      await saveState(this.state)
-      await this.client.channels
-        .fetch(threadId)
-        .then((channel) => (channel?.isThread()
-          ? channel.send(`Queue updated: ${truncate(edited?.displayText || 'removed', 1_700)}`)
-          : undefined))
-        .catch(() => undefined)
+  private async reconcileActiveTurn(
+    session: SessionState,
+    channel: ThreadChannel,
+    knownRuntime?: CodexThreadRuntimeState,
+  ): Promise<string | undefined> {
+    const runtime = knownRuntime || await this.readThreadRuntimeState(session)
+    if (runtime.status !== 'active' || !runtime.activeTurnId) return undefined
+    await this.adoptActiveTurn(session, channel, runtime.activeTurnId)
+    return runtime.activeTurnId
+  }
+
+  private async readThreadRuntimeState(
+    session: SessionState,
+  ): Promise<CodexThreadRuntimeState> {
+    this.assertCodexSessionLinked(session)
+    let runtime = await this.codex.getThreadRuntimeState(session.codexThreadId)
+    this.assertCodexSessionLinked(session)
+    if (runtime.status !== 'notLoaded') return runtime
+    this.loadedThreads.delete(session.codexThreadId)
+    await this.ensureSessionLoaded(session)
+    this.assertCodexSessionLinked(session)
+    runtime = await this.codex.getThreadRuntimeState(session.codexThreadId)
+    this.assertCodexSessionLinked(session)
+    return runtime
+  }
+
+  private async interruptRuntimeTurn(session: SessionState): Promise<void> {
+    const runtime = await this.readThreadRuntimeState(session)
+    if (runtime.status !== 'active' || !runtime.activeTurnId) return
+    await this.codex.interruptTurn(session.codexThreadId, runtime.activeTurnId)
+  }
+
+  private async interruptDeletedRuntimeTurn(
+    discordThreadId: string,
+    session: SessionState,
+  ): Promise<void> {
+    const runtime = await this.readThreadRuntimeState(session)
+    if (runtime.status !== 'active' || !runtime.activeTurnId) return
+    await this.interruptDeletedTurn(
+      discordThreadId,
+      session.codexThreadId,
+      runtime.activeTurnId,
+    )
+  }
+
+  private runtimeHasClientMessage(
+    runtime: CodexThreadRuntimeState,
+    clientUserMessageId?: string,
+  ): boolean {
+    return Boolean(
+      clientUserMessageId && runtime.userMessageClientIds?.includes(clientUserMessageId),
+    )
+  }
+
+  private async adoptActiveTurn(
+    session: SessionState,
+    channel: ThreadChannel,
+    activeTurnId: string,
+  ): Promise<void> {
+    const previousTurnId = session.activeTurnId
+    session.activeTurnId = activeTurnId
+    session.updatedAt = new Date().toISOString()
+    const run = this.startRun(session, channel)
+    if (previousTurnId !== activeTurnId || run.turnId !== activeTurnId) {
+      run.turnId = activeTurnId
+      run.agentText.clear()
+      run.startedAt = Date.now()
+    }
+    await saveState(this.state)
+  }
+
+  private async clearInactiveTurn(
+    session: SessionState,
+    channel: ThreadChannel,
+  ): Promise<void> {
+    const staleRun = this.runs.get(session.codexThreadId)
+    if (staleRun) {
+      clearInterval(staleRun.typingTimer)
+      this.runs.delete(session.codexThreadId)
+    }
+    const hadActiveTurn = session.activeTurnId !== undefined
+    delete session.activeTurnId
+    if (!staleRun && !hadActiveTurn) return
+    session.updatedAt = new Date().toISOString()
+    await this.dismissPendingControlsForChannel(channel.id, '_Turn already ended._')
+    await saveState(this.state)
+  }
+
+  private async reconcileDeliveredInput(
+    session: SessionState,
+    channel: ThreadChannel,
+    runtime: CodexThreadRuntimeState,
+  ): Promise<void> {
+    if (runtime.status === 'active' && runtime.activeTurnId) {
+      await this.adoptActiveTurn(session, channel, runtime.activeTurnId)
       return
+    }
+    await this.clearInactiveTurn(session, channel)
+  }
+
+  private async steerActiveTurn(
+    session: SessionState,
+    channel: ThreadChannel,
+    input: UserInput[],
+    clientUserMessageId?: string,
+    remainingReconciliations = 3,
+  ): Promise<boolean> {
+    this.assertCodexSessionLinked(session)
+    const expectedTurnId = session.activeTurnId
+    if (!expectedTurnId) return false
+    const steer = (turnId: string) => this.codex.steerTurn({
+      threadId: session.codexThreadId,
+      expectedTurnId: turnId,
+      input,
+      ...(clientUserMessageId ? { clientUserMessageId } : {}),
+    })
+    try {
+      await steer(expectedTurnId)
+      this.assertCodexSessionLinked(session)
+      return true
+    } catch (steerError) {
+      let runtime: CodexThreadRuntimeState
+      try {
+        runtime = await this.readThreadRuntimeState(session)
+      } catch {
+        throw steerError
+      }
+
+      if (this.runtimeHasClientMessage(runtime, clientUserMessageId)) {
+        await this.reconcileDeliveredInput(session, channel, runtime)
+        return true
+      }
+
+      if (runtime.status === 'active' && runtime.activeTurnId) {
+        if (runtime.activeTurnId === expectedTurnId) throw steerError
+        if (!this.runs.has(session.codexThreadId)) await channel.sendTyping().catch(() => undefined)
+        await this.adoptActiveTurn(session, channel, runtime.activeTurnId)
+        if (remainingReconciliations <= 0) throw steerError
+        return this.steerActiveTurn(
+          session,
+          channel,
+          input,
+          clientUserMessageId,
+          remainingReconciliations - 1,
+        )
+      }
+      if (runtime.status !== 'idle') throw steerError
+      await this.clearInactiveTurn(session, channel)
+      return false
     }
   }
 
-  private async handleQueuedMessageDelete(messageId: string): Promise<void> {
-    for (const queue of Object.values(this.state.queues)) {
-      const index = queue.findIndex((item) => item.sourceMessageId === messageId)
-      if (index === -1) continue
-      queue.splice(index, 1)
-      await saveState(this.state)
-      return
+  private async waitForActiveTurn(
+    session: SessionState,
+    timeoutMs = 1_000,
+  ): Promise<string | undefined> {
+    const deadline = Date.now() + timeoutMs
+    while (!session.activeTurnId && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
     }
+    return session.activeTurnId
+  }
+
+  private async handleQueuedMessageUpdate(message: DiscordMessage): Promise<void> {
+    if (message.author.bot) return
+    const threadId = Object.entries(this.state.queues).find(([, queue]) =>
+      queue.some((item) =>
+        this.promptDeliveryKind(item) === 'queued' && item.sourceMessageId === message.id))?.[0]
+    if (!threadId) return
+    await this.promptQueue.run(threadId, async () => {
+      const queue = this.queueFor(threadId)
+      const original = [...queue]
+      const index = queue.findIndex((item) =>
+        this.promptDeliveryKind(item) === 'queued' && item.sourceMessageId === message.id)
+      const channel = message.channel.isThread()
+        ? message.channel
+        : await this.client.channels.fetch(threadId).then((target) =>
+            target?.isThread() ? target : undefined).catch(() => undefined)
+      if (index === -1) {
+        await channel?.send('Queue update ignored: the prompt was already delivered.').catch(() => undefined)
+        return
+      }
+      const queued = queue[index]
+      if (!queued) return
+      const parsed = parseQueueMessage(message.content)
+      let displayText = 'removed'
+      if (!parsed.queued) {
+        queue.splice(index, 1)
+      } else if (!channel) {
+        return
+      } else {
+        try {
+          const input = await this.requireSupportedInput(
+            channel,
+            await this.buildInput(message, parsed.text),
+          )
+          queue[index] = {
+            ...queued,
+            input: [
+              ...queued.input.filter((item) => item.type === 'skill'),
+              ...input,
+            ],
+            displayText: parsed.text || '(attachment)',
+          }
+          displayText = parsed.text || '(attachment)'
+        } catch (error) {
+          displayText = `unchanged (${errorText(error)})`
+        }
+      }
+      try {
+        await saveState(this.state)
+      } catch (error) {
+        queue.splice(0, queue.length, ...original)
+        await this.pruneAttachmentCache().catch(() => undefined)
+        throw error
+      }
+      await this.pruneAttachmentCache().catch(() => undefined)
+      await channel?.send(`Queue updated: ${truncate(displayText, 1_700)}`).catch(() => undefined)
+    })
+  }
+
+  private async handleQueuedMessageDelete(messageId: string): Promise<void> {
+    const threadId = Object.entries(this.state.queues).find(([, queue]) =>
+      queue.some((item) =>
+        this.promptDeliveryKind(item) === 'queued' && item.sourceMessageId === messageId))?.[0]
+    if (!threadId) return
+    await this.promptQueue.run(threadId, async () => {
+      const queue = this.queueFor(threadId)
+      const original = [...queue]
+      const index = queue.findIndex((item) =>
+        this.promptDeliveryKind(item) === 'queued' && item.sourceMessageId === messageId)
+      if (index === -1) return
+      queue.splice(index, 1)
+      try {
+        await saveState(this.state)
+      } catch (error) {
+        queue.splice(0, queue.length, ...original)
+        throw error
+      }
+      await this.pruneAttachmentCache().catch(() => undefined)
+    })
   }
 
   private startRun(session: SessionState, channel: ThreadChannel): ActiveRun {
@@ -2781,37 +6156,518 @@ export class CordexDiscordBot {
     return threadId ? this.runs.get(threadId) : undefined
   }
 
+  private turnIdFrom(params: JsonObject): string | undefined {
+    if (typeof params.turnId === 'string') return params.turnId
+    return isRecord(params.turn) ? text(params.turn.id) : undefined
+  }
+
+  private async adoptCodexStartedRun(
+    params: JsonObject,
+    requirePersistedTurn = false,
+  ): Promise<ActiveRun | undefined> {
+    const threadId = text(params.threadId) || text(params.conversationId)
+    const turnId = this.turnIdFrom(params)
+    if (!threadId || !turnId) return undefined
+
+    const existing = this.runs.get(threadId)
+    if (existing) {
+      const changedTurn = existing.turnId !== turnId
+      existing.turnId = turnId
+      existing.session.activeTurnId = turnId
+      existing.session.updatedAt = new Date().toISOString()
+      if (changedTurn) {
+        existing.agentText.clear()
+        existing.startedAt = isRecord(params.turn) && typeof params.turn.startedAt === 'number'
+          ? params.turn.startedAt * 1_000
+          : Date.now()
+        await saveState(this.state)
+      }
+      return existing
+    }
+
+    const session = Object.values(this.state.sessions).find(
+      (candidate) => candidate.codexThreadId === threadId,
+    )
+    if (!session) return undefined
+    if (requirePersistedTurn && session.activeTurnId !== turnId) return undefined
+    const channel = await this.client.channels.fetch(session.discordThreadId).catch(() => undefined)
+    if (!channel?.isThread()) return undefined
+
+    session.activeTurnId = turnId
+    session.updatedAt = new Date().toISOString()
+    this.loadedThreads.add(threadId)
+    await channel.sendTyping().catch(() => undefined)
+    const run = this.startRun(session, channel)
+    run.turnId = turnId
+    if (isRecord(params.turn) && typeof params.turn.startedAt === 'number') {
+      run.startedAt = params.turn.startedAt * 1_000
+    }
+    await saveState(this.state)
+    return run
+  }
+
+  private notificationMatchesRun(run: ActiveRun, params: JsonObject): boolean {
+    const turnId = this.turnIdFrom(params)
+    const activeTurnId = run.turnId || run.session.activeTurnId
+    return !turnId || !activeTurnId || turnId === activeTurnId
+  }
+
   private codexEventKey(params: JsonObject): string {
     return text(params.threadId) || text(params.conversationId) || 'global'
   }
 
-  private async enqueueNotification(notification: ServerNotification): Promise<void> {
+  private async enqueueNotification(
+    notification: ServerNotification,
+    generation = this.codexGeneration,
+  ): Promise<void> {
     await this.codexEventQueue.run(
       this.codexEventKey(notification.params),
-      () => this.handleNotification(notification),
+      async () => {
+        if (generation !== this.codexGeneration) return
+        await this.handleNotification(notification, generation)
+      },
     )
   }
 
-  private async enqueueServerRequest(request: ServerRequest): Promise<void> {
+  private async enqueueServerRequest(
+    request: ServerRequest,
+    generation = this.codexGeneration,
+  ): Promise<void> {
     await this.codexEventQueue.run(
       this.codexEventKey(request.params),
-      () => this.handleServerRequest(request),
+      async () => {
+        if (generation !== this.codexGeneration) return
+        await this.handleServerRequest(request)
+      },
     )
   }
 
-  private async handleNotification(notification: ServerNotification): Promise<void> {
+  private async handleNotification(
+    notification: ServerNotification,
+    generation = this.codexGeneration,
+  ): Promise<void> {
+    if (notification.method === 'thread/name/updated') {
+      await this.onThreadNameUpdated(notification.params)
+      return
+    }
+    if (notification.method === 'skills/changed') {
+      this.invalidateSkillCache()
+      return
+    }
+    if (notification.method === 'thread/status/changed') {
+      this.onThreadStatusChanged(notification.params)
+      return
+    }
+    if (notification.method === 'thread/archived') {
+      await this.onThreadArchived(notification.params)
+      return
+    }
+    if (notification.method === 'thread/unarchived') {
+      await this.onThreadUnarchived(notification.params)
+      return
+    }
+    if (notification.method === 'thread/closed') {
+      this.onThreadClosed(notification.params)
+      return
+    }
+    if (notification.method === 'thread/deleted') {
+      await this.onThreadDeleted(notification.params)
+      return
+    }
+    if (notification.method === 'serverRequest/resolved') {
+      await this.onServerRequestResolved(notification.params)
+      return
+    }
     if (notification.method === 'thread/tokenUsage/updated') {
       await this.onTokenUsage(notification.params)
       return
     }
-    const run = this.findRun(notification.params)
-    if (!run) return
+    if (notification.method === 'thread/settings/updated') {
+      await this.onThreadSettingsUpdated(notification.params)
+      return
+    }
+    if (notification.method === 'warning' || notification.method === 'guardianWarning') {
+      await this.onWarning(notification.params)
+      return
+    }
+    if (notification.method === 'thread/goal/updated') {
+      await this.onGoalUpdated(notification.params, generation)
+      return
+    }
+    if (notification.method === 'turn/started') {
+      const existing = this.findRun(notification.params)
+      const threadId = text(notification.params.threadId) || text(notification.params.conversationId)
+      const cordexStartPending = threadId ? this.pendingTurnStarts.has(threadId) : false
+      const run = await this.adoptCodexStartedRun(notification.params)
+      if (generation !== this.codexGeneration) return
+      if (run && !existing && !cordexStartPending) await this.steerNextQueuedPrompt(run)
+      return
+    }
+    const run = this.findRun(notification.params) ||
+      await this.adoptCodexStartedRun(notification.params, true)
+    if (!run || !this.notificationMatchesRun(run, notification.params)) return
     if (notification.method === 'item/started') await this.onItemStarted(run, notification.params)
     else if (notification.method === 'item/agentMessage/delta') this.onAgentDelta(run, notification.params)
     else if (notification.method === 'item/completed') await this.onItemCompleted(run, notification.params)
     else if (notification.method === 'model/rerouted') this.onModelRerouted(run, notification.params)
     else if (notification.method === 'error') await this.onTurnError(run, notification.params)
-    else if (notification.method === 'turn/completed') await this.onTurnCompleted(run, notification.params)
+    else if (notification.method === 'turn/completed') {
+      await this.onTurnCompleted(run, notification.params, generation)
+    }
+  }
+
+  private async onThreadNameUpdated(params: JsonObject): Promise<void> {
+    if (this.stopping) return
+    const threadId = text(params.threadId)
+    const rawTitle = text(params.threadName)
+    if (!threadId || rawTitle === undefined) return
+    const title = normalizeThreadTitle(rawTitle)
+    const entry = Object.entries(this.state.sessions).find(
+      ([discordThreadId, session]) =>
+        session.codexThreadId === threadId &&
+        !session.archived &&
+        !this.deletedDiscordThreads.has(discordThreadId),
+    )
+    if (!entry) return
+    await this.titleQueue.run(threadId, async () => {
+      const current = this.state.sessions[entry[0]]
+      if (
+        current?.codexThreadId !== threadId ||
+        current.archived ||
+        this.deletedDiscordThreads.has(entry[0])
+      ) return
+      if (this.pendingCodexTitleVerifications.has(threadId)) {
+        this.deferCodexTitleVerification(current, title)
+        return
+      }
+      const echo = this.consumeExpectedTitle(
+        this.expectedCodexTitles,
+        this.recentCodexTitleEchoes,
+        threadId,
+        title,
+      )
+      if (echo === 'expected') return
+      let authoritativeRawTitle = rawTitle
+      let authoritativeTitle = title
+      if (echo === 'recent') {
+        const authoritative = await this.codex.getThreadSummary(threadId).catch(() => undefined)
+        if (authoritative?.name === undefined) {
+          this.deferCodexTitleVerification(current, title)
+          return
+        }
+        const latest = this.state.sessions[entry[0]]
+        if (
+          latest?.codexThreadId !== threadId ||
+          latest.archived ||
+          this.deletedDiscordThreads.has(entry[0])
+        ) return
+        authoritativeTitle = normalizeThreadTitle(authoritative.name)
+        if (authoritativeTitle === title) {
+          this.discardExpectedTitle(
+            this.expectedCodexTitles,
+            this.recentCodexTitleEchoes,
+            threadId,
+          )
+        } else {
+          this.rememberTitleEcho(this.recentCodexTitleEchoes, threadId, title)
+          return
+        }
+        authoritativeRawTitle = authoritative.name
+      }
+      const channel = await this.client.channels.fetch(current.discordThreadId).catch(() => undefined)
+      if (!channel?.isThread()) return
+      const latest = this.state.sessions[entry[0]]
+      if (
+        latest?.codexThreadId !== threadId ||
+        latest.archived ||
+        this.deletedDiscordThreads.has(entry[0])
+      ) return
+      await this.synchronizeThreadTitleUnlocked(latest, channel, authoritativeTitle, {
+        codex: authoritativeRawTitle !== authoritativeTitle,
+      })
+    })
+  }
+
+  private async onThreadSettingsUpdated(params: JsonObject): Promise<void> {
+    const threadId = text(params.threadId)
+    const settings = isRecord(params.threadSettings) ? params.threadSettings : undefined
+    if (!threadId || !settings) return
+    const model = text(settings.model)
+    const effort = settings.effort === null ? null : reasoningEffort(settings.effort)
+    const serviceTier = settings.serviceTier === null || typeof settings.serviceTier === 'string'
+      ? settings.serviceTier
+      : undefined
+    if (!model && effort === undefined && serviceTier === undefined) return
+    const models = serviceTier !== undefined
+      ? await this.getModels().catch(() => [])
+      : []
+
+    const restorations: Array<{
+      session: SessionState
+      previous: SessionState
+      replayWasBlocked: boolean
+      pendingUsage?: { update: ContextUsageUpdate; expiresAt: number }
+    }> = []
+    for (const session of Object.values(this.state.sessions)) {
+      if (session.codexThreadId !== threadId) continue
+      const previous = structuredClone(session)
+      const replayWasBlocked = this.contextReplayBlocked.has(session.codexThreadId)
+      const pendingUsage = this.pendingContextUsage.get(session.codexThreadId)
+      let sessionChanged = false
+      const modelChanged = model !== undefined && session.model !== model
+      if (modelChanged) {
+        session.model = model
+        this.clearContextUsage(session, true)
+        sessionChanged = true
+      }
+      if (effort === null) {
+        if (session.effort !== undefined) {
+          delete session.effort
+          sessionChanged = true
+        }
+      } else if (effort !== undefined && session.effort !== effort) {
+        session.effort = effort
+        sessionChanged = true
+      }
+      if (serviceTier !== undefined) {
+        const fastMode = this.serviceTierIsFast(model || session.model, serviceTier, models)
+        if (session.fastMode !== fastMode) {
+          session.fastMode = fastMode
+          sessionChanged = true
+        }
+      }
+      if (sessionChanged) {
+        session.updatedAt = new Date().toISOString()
+        restorations.push({
+          session,
+          previous,
+          replayWasBlocked,
+          ...(pendingUsage ? { pendingUsage } : {}),
+        })
+      }
+    }
+    if (restorations.length === 0) return
+    try {
+      await saveState(this.state)
+    } catch (error) {
+      for (const restoration of restorations) {
+        this.restoreSessionState(restoration.session, restoration.previous)
+        if (restoration.replayWasBlocked) {
+          this.contextReplayBlocked.add(restoration.session.codexThreadId)
+        } else {
+          this.contextReplayBlocked.delete(restoration.session.codexThreadId)
+        }
+        if (restoration.pendingUsage) {
+          this.pendingContextUsage.set(restoration.session.codexThreadId, restoration.pendingUsage)
+        } else {
+          this.pendingContextUsage.delete(restoration.session.codexThreadId)
+        }
+      }
+      throw error
+    }
+  }
+
+  private onThreadStatusChanged(params: JsonObject): void {
+    const threadId = text(params.threadId)
+    const status = isRecord(params.status) ? text(params.status.type) : undefined
+    if (threadId && status === 'notLoaded') this.loadedThreads.delete(threadId)
+  }
+
+  private acceptsArchiveNotification(
+    threadId: string,
+    kind: 'archived' | 'unarchived',
+  ): boolean {
+    const expected = this.expectedArchiveNotifications.get(threadId)
+    if (!expected) return true
+    if (expected.expiresAt <= Date.now()) {
+      this.expectedArchiveNotifications.delete(threadId)
+      return true
+    }
+    if (expected.kind !== kind) return false
+    this.expectedArchiveNotifications.delete(threadId)
+    return true
+  }
+
+  private expectArchiveNotification(
+    threadId: string,
+    kind: 'archived' | 'unarchived',
+  ): void {
+    this.expectedArchiveNotifications.set(threadId, {
+      kind,
+      expiresAt: Date.now() + 30_000,
+    })
+  }
+
+  private async onThreadArchived(params: JsonObject): Promise<void> {
+    const threadId = text(params.threadId)
+    if (!threadId || !this.acceptsArchiveNotification(threadId, 'archived')) return
+    this.loadedThreads.delete(threadId)
+    const entries = Object.entries(this.state.sessions).filter(
+      ([, session]) => session.codexThreadId === threadId,
+    )
+    this.clearTitleVerificationState(threadId, entries.map(([discordThreadId]) => discordThreadId))
+    this.expectedCodexTitles.delete(threadId)
+    this.pendingCodexTitles.delete(threadId)
+    this.recentCodexTitleEchoes.delete(threadId)
+    let changed = false
+    for (const [discordThreadId, session] of entries) {
+      if (this.deletedDiscordThreads.has(discordThreadId)) continue
+      this.expectedDiscordTitles.delete(discordThreadId)
+      this.recentDiscordTitleEchoes.delete(discordThreadId)
+      this.pendingDiscordTitles.delete(discordThreadId)
+      if (!session.archived) {
+        session.archived = true
+        session.updatedAt = new Date().toISOString()
+        changed = true
+      }
+    }
+    if (changed) await saveState(this.state)
+    await Promise.all(entries.map(async ([discordThreadId]) => {
+      if (this.deletedDiscordThreads.has(discordThreadId)) return
+      const channel = await this.client.channels.fetch(discordThreadId).catch(() => undefined)
+      if (channel?.isThread() && !channel.archived) {
+        await channel.setArchived(true, 'Codex session archived').catch(() => undefined)
+      }
+    }))
+  }
+
+  private async onThreadUnarchived(params: JsonObject): Promise<void> {
+    const threadId = text(params.threadId)
+    if (!threadId || !this.acceptsArchiveNotification(threadId, 'unarchived')) return
+    if (this.preserveArchivedUntilResume.delete(threadId)) return
+    let changed = false
+    const recoveries: Array<{ session: SessionState; channel: ThreadChannel }> = []
+    for (const [discordThreadId, session] of Object.entries(this.state.sessions)) {
+      if (
+        session.codexThreadId !== threadId ||
+        this.deletedDiscordThreads.has(discordThreadId) ||
+        !session.archived
+      ) continue
+      const channel = await this.client.channels.fetch(discordThreadId).catch(() => undefined)
+      if (!channel?.isThread()) continue
+      if (channel.archived) {
+        try {
+          await channel.setArchived(false, 'Codex session unarchived')
+        } catch {
+          continue
+        }
+      }
+      delete session.archived
+      session.updatedAt = new Date().toISOString()
+      changed = true
+      recoveries.push({ session, channel })
+    }
+    if (changed) await saveState(this.state)
+    for (const { session, channel } of recoveries) {
+      if ((this.state.queues[channel.id]?.length || 0) === 0) continue
+      if (this.blockedQueuedSourceThreads.has(channel.id)) {
+        this.scheduleQueuedSourceRetry(channel.id)
+      }
+      const timer = setTimeout(() => {
+        if (this.stopping) return
+        void this.recoverPersistedPrompts(session, channel).catch((error: unknown) => {
+          this.logVerbose('externally unarchived prompt recovery failed', {
+            threadId: session.codexThreadId,
+            error: errorText(error),
+          })
+          if (this.blockedQueuedSourceThreads.has(channel.id)) {
+            this.scheduleQueuedSourceRetry(channel.id)
+          }
+        })
+      }, 0)
+      timer.unref()
+    }
+  }
+
+  private onThreadClosed(params: JsonObject): void {
+    const threadId = text(params.threadId)
+    if (threadId) this.loadedThreads.delete(threadId)
+  }
+
+  private async onThreadDeleted(params: JsonObject): Promise<void> {
+    const threadId = text(params.threadId)
+    if (!threadId) return
+    this.loadedThreads.delete(threadId)
+    this.pendingTurnStarts.delete(threadId)
+    this.abortRequestedThreads.delete(threadId)
+    this.preserveArchivedUntilResume.delete(threadId)
+    this.expectedArchiveNotifications.delete(threadId)
+    this.expectedCodexTitles.delete(threadId)
+    this.pendingCodexTitles.delete(threadId)
+    this.recentCodexTitleEchoes.delete(threadId)
+    this.pendingContextUsage.delete(threadId)
+    this.contextReplayBlocked.delete(threadId)
+    this.goalStatusAnnouncements.delete(threadId)
+    const run = this.runs.get(threadId)
+    if (run) clearInterval(run.typingTimer)
+    this.runs.delete(threadId)
+
+    const entries = Object.entries(this.state.sessions).filter(
+      ([discordThreadId, session]) =>
+        session.codexThreadId === threadId &&
+        !this.unlinkedCodexSessionChannels.has(discordThreadId),
+    )
+    for (const [discordThreadId] of entries) {
+      this.unlinkedCodexSessionChannels.add(discordThreadId)
+    }
+    this.clearTitleVerificationState(threadId, entries.map(([discordThreadId]) => discordThreadId))
+    if (entries.length === 0) return
+    let cleanup!: Promise<void>
+    cleanup = new Promise<void>((resolve) => {
+      setImmediate(() => {
+        void this.cleanupDeletedCodexThread(threadId, entries)
+          .catch((error: unknown) => {
+            console.error(`Failed to clean deleted Codex thread ${threadId}: ${errorText(error)}`)
+          })
+          .finally(resolve)
+      })
+    })
+    this.pendingCodexDeletionCleanups.add(cleanup)
+    void cleanup.finally(() => this.pendingCodexDeletionCleanups.delete(cleanup))
+  }
+
+  private async cleanupDeletedCodexThread(
+    threadId: string,
+    entries: Array<[string, SessionState]>,
+  ): Promise<void> {
+    const removedChannels = new Set<string>()
+    await Promise.all(entries.map(async ([discordThreadId]) => {
+      await this.dismissPendingControlsForChannel(discordThreadId, '_Codex session deleted._')
+      this.expectedDiscordTitles.delete(discordThreadId)
+      this.recentDiscordTitleEchoes.delete(discordThreadId)
+      this.pendingDiscordTitles.delete(discordThreadId)
+      await this.promptQueue.run(discordThreadId, async () => {
+        const current = this.state.sessions[discordThreadId]
+        if (current?.codexThreadId !== threadId) {
+          this.unlinkedCodexSessionChannels.delete(discordThreadId)
+          return
+        }
+        this.clearQueuedSourceBlock(discordThreadId)
+        delete this.state.sessions[discordThreadId]
+        removedChannels.add(discordThreadId)
+        this.archivingDiscordThreads.delete(discordThreadId)
+        delete this.state.queues[discordThreadId]
+        for (const [taskId, task] of Object.entries(this.state.tasks)) {
+          if (task.threadId !== discordThreadId) continue
+          this.scheduler.cancel(taskId)
+          delete this.state.tasks[taskId]
+        }
+      })
+    }))
+    await saveState(this.state)
+    await Promise.all(entries.map(async ([discordThreadId]) => {
+      if (!removedChannels.has(discordThreadId)) return
+      if (this.deletedDiscordThreads.has(discordThreadId)) return
+      if (
+        this.state.sessions[discordThreadId] ||
+        !this.unlinkedCodexSessionChannels.has(discordThreadId)
+      ) return
+      const channel = await this.client.channels.fetch(discordThreadId).catch(() => undefined)
+      if (!channel?.isThread()) return
+      await channel.send(
+        '⨯ This Codex session was deleted outside Cordex. The Discord thread is no longer linked.',
+      ).catch(() => undefined)
+    }))
   }
 
   private async onItemStarted(run: ActiveRun, params: JsonObject): Promise<void> {
@@ -2832,6 +6688,31 @@ export class CordexDiscordBot {
     run.agentText.set(itemId, next)
   }
 
+  private durableTurnId(run: ActiveRun, params: JsonObject): string {
+    return this.turnIdFrom(params) ||
+      run.turnId ||
+      run.session.activeTurnId ||
+      `started:${run.startedAt}`
+  }
+
+  private async sendRunBlock(
+    run: ActiveRun,
+    params: JsonObject,
+    itemId: string,
+    value: string,
+  ): Promise<void> {
+    await this.sendDurableDiscordOutput({
+      channel: run.channel,
+      codexThreadId: run.session.codexThreadId,
+      turnId: this.durableTurnId(run, params),
+      itemKey: `item:${itemId}`,
+      value,
+    })
+    if (this.runs.get(run.session.codexThreadId) === run) {
+      await run.channel.sendTyping().catch(() => undefined)
+    }
+  }
+
   private async onItemCompleted(run: ActiveRun, params: JsonObject): Promise<void> {
     if (!isRecord(params.item)) return
     const item = params.item
@@ -2840,12 +6721,12 @@ export class CordexDiscordBot {
     if (item.type === 'agentMessage') {
       const finalText = text(item.text) || run.agentText.get(itemId) || ''
       run.agentText.delete(itemId)
-      await sendCompleteBlock(run.channel, finalText)
-    } else if (item.type === 'plan' && text(item.text)) {
-      await sendCompleteBlock(run.channel, text(item.text) || '')
+      if (finalText.trim()) await this.sendRunBlock(run, params, itemId, finalText)
+    } else if (item.type === 'plan' && text(item.text)?.trim()) {
+      await this.sendRunBlock(run, params, itemId, text(item.text) || '')
     } else {
       const tool = formatCompletedToolItem(item, this.verbosityFor(run.session))
-      if (tool) await sendCompleteBlock(run.channel, tool)
+      if (tool) await this.sendRunBlock(run, params, itemId, tool)
     }
   }
 
@@ -2916,7 +6797,76 @@ export class CordexDiscordBot {
 
   private async onTurnError(run: ActiveRun, params: JsonObject): Promise<void> {
     const message = isRecord(params.error) ? text(params.error.message) : undefined
-    if (message) await run.channel.send(`⨯ ${truncate(message, 1_850)}`)
+    if (!message) return
+    if (params.willRetry === true) {
+      await run.channel.send(`⚠ ${truncate(message, 1_820)} Retrying.`)
+      return
+    }
+    run.lastError = message
+    await this.sendDurableDiscordOutput({
+      channel: run.channel,
+      codexThreadId: run.session.codexThreadId,
+      turnId: this.durableTurnId(run, params),
+      itemKey: 'failure',
+      value: `⨯ ${truncate(message, 1_850)}`,
+      format: false,
+    }).catch((error: unknown) => {
+      this.logVerbose('final turn failure delivery deferred', {
+        threadId: run.session.codexThreadId,
+        error: errorText(error),
+      })
+    })
+  }
+
+  private async onWarning(params: JsonObject): Promise<void> {
+    const message = text(params.message)
+    if (!message) return
+    const channel = await this.resolveThreadChannel(params)
+    if (!channel) {
+      console.error(`[codex warning] ${message}`)
+      return
+    }
+    await channel.send(`⚠ ${truncate(message, 1_850)}`)
+  }
+
+  private async onGoalUpdated(
+    params: JsonObject,
+    generation = this.codexGeneration,
+  ): Promise<void> {
+    const threadId = text(params.threadId)
+    const goal = isRecord(params.goal) ? params.goal : undefined
+    const status = goal ? text(goal.status) : undefined
+    if (!threadId || !goal || !status) return
+    if (!['blocked', 'usageLimited', 'budgetLimited', 'complete'].includes(status)) return
+    const announcementKey = `${status}:${String(goal.updatedAt ?? '')}`
+    if (this.goalStatusAnnouncements.get(threadId) === announcementKey) return
+    const channel = await this.resolveThreadChannel(params)
+    if (!channel) return
+    this.goalStatusAnnouncements.set(threadId, announcementKey)
+    const labels: Record<string, string> = {
+      blocked: 'blocked',
+      usageLimited: 'usage limited',
+      budgetLimited: 'budget limited',
+      complete: 'complete',
+    }
+    const tokensUsed = typeof goal.tokensUsed === 'number'
+      ? `${goal.tokensUsed.toLocaleString('en-US')} tokens`
+      : ''
+    const duration = typeof goal.timeUsedSeconds === 'number'
+      ? formatDuration(goal.timeUsedSeconds * 1_000)
+      : ''
+    const usage = [tokensUsed, duration].filter(Boolean).join(' · ')
+    await channel.send(`**Goal ${labels[status] || status}.**${usage ? ` ${usage}` : ''}`)
+    const session = this.state.sessions[channel.id] || Object.values(this.state.sessions).find(
+      (candidate) => candidate.codexThreadId === threadId,
+    )
+    if (
+      generation !== this.codexGeneration ||
+      !session ||
+      session.activeTurnId ||
+      this.runs.has(threadId)
+    ) return
+    this.scheduleQueueDrain(session, channel, false, status)
   }
 
   private async buildRunFooter(run: ActiveRun, duration: number): Promise<string> {
@@ -2938,35 +6888,199 @@ export class CordexDiscordBot {
     })
   }
 
-  private async onTurnCompleted(run: ActiveRun, params: JsonObject): Promise<void> {
+  private async onTurnCompleted(
+    run: ActiveRun,
+    params: JsonObject,
+    generation = this.codexGeneration,
+  ): Promise<void> {
     clearInterval(run.typingTimer)
     const turn = isRecord(params.turn) ? params.turn : {}
     const status = text(turn.status) || 'completed'
     const duration = typeof turn.durationMs === 'number' ? turn.durationMs : Date.now() - run.startedAt
+    const completionError = isRecord(turn.error) ? text(turn.error.message) : undefined
+    const durableTurnId = this.durableTurnId(run, params)
+    let shouldDrainTerminalOutput = false
+    if (status === 'failed') {
+      const message = completionError || (run.lastError ? undefined : 'Turn failed.')
+      if (message && message !== run.lastError) {
+        run.lastError = message
+        try {
+          await this.stageDurableDiscordOutput({
+            channel: run.channel,
+            codexThreadId: run.session.codexThreadId,
+            turnId: durableTurnId,
+            itemKey: 'failure',
+            value: `⨯ ${truncate(message, 1_850)}`,
+            format: false,
+          })
+          shouldDrainTerminalOutput = true
+        } catch (error) {
+          this.logVerbose('completed turn failure persistence deferred', {
+            threadId: run.session.codexThreadId,
+            error: errorText(error),
+          })
+        }
+      } else if (run.lastError) {
+        shouldDrainTerminalOutput = true
+      }
+    } else if (status === 'completed' && showStatusFooter(this.verbosityFor(run.session))) {
+      try {
+        await this.stageDurableDiscordOutput({
+          channel: run.channel,
+          codexThreadId: run.session.codexThreadId,
+          turnId: durableTurnId,
+          itemKey: 'footer',
+          value: await this.buildRunFooter(run, duration),
+          format: false,
+        })
+        shouldDrainTerminalOutput = true
+      } catch (error) {
+        this.logVerbose('turn footer persistence deferred', {
+          threadId: run.session.codexThreadId,
+          error: errorText(error),
+        })
+      }
+    }
     delete run.session.activeTurnId
     run.session.updatedAt = new Date().toISOString()
-    await this.cancelActionButtonsForChannel(
-      run.channel.id,
-      '_Turn ended._',
-      'Action button request cancelled because the turn ended.',
-    )
+    await this.dismissPendingControlsForChannel(run.channel.id, '_Turn ended._')
     await saveState(this.state)
     this.runs.delete(run.session.codexThreadId)
-    if (status === 'completed' && showStatusFooter(this.verbosityFor(run.session))) {
-      await run.channel.send(await this.buildRunFooter(run, duration))
-    }
-    const queue = this.queueFor(run.channel.id)
-    const next = queue.shift()
-    await saveState(this.state)
-    if (next) {
-      await run.channel.send({
-        content: `» **${escapeInlineMarkdown(next.authorName)}:** ${truncate(next.displayText, 1_700)}`,
-        allowedMentions: { parse: [] },
-      })
-      await this.dispatchInput(run.channel, run.session.parentChannelId, next.input, next.sourceMessageId || next.id).catch(async (error: unknown) => {
-        await run.channel.send(`⨯ Queued prompt failed: ${truncate(errorText(error), 1_700)}`).catch(() => undefined)
+    if (shouldDrainTerminalOutput) {
+      void this.drainDiscordOutbox(run.channel).catch((error: unknown) => {
+        this.logVerbose('terminal turn output delivery deferred', {
+          threadId: run.session.codexThreadId,
+          error: errorText(error),
+        })
       })
     }
+    if (generation === this.codexGeneration) {
+      this.scheduleQueueDrain(run.session, run.channel, status === 'completed')
+    }
+  }
+
+  private protocolRequestKey(requestId: string | number): string {
+    return `${typeof requestId}:${String(requestId)}`
+  }
+
+  private registerPendingRequestControl(
+    request: ServerRequest,
+    kind: PendingRequestControl['kind'],
+    key: string,
+  ): void {
+    const threadId = text(request.params.threadId) || text(request.params.conversationId)
+    this.pendingRequestControls.set(this.protocolRequestKey(request.id), {
+      kind,
+      key,
+      ...(threadId ? { threadId } : {}),
+    })
+  }
+
+  private unregisterPendingRequestControl(
+    request: ServerRequest,
+    kind: PendingRequestControl['kind'],
+    key: string,
+  ): void {
+    const requestKey = this.protocolRequestKey(request.id)
+    const control = this.pendingRequestControls.get(requestKey)
+    if (control?.kind === kind && control.key === key) {
+      this.pendingRequestControls.delete(requestKey)
+    }
+  }
+
+  private takePendingApproval(key: string): PendingApproval | undefined {
+    const pending = this.approvals.get(key)
+    if (!pending) return undefined
+    this.approvals.delete(key)
+    clearTimeout(pending.timeout)
+    this.unregisterPendingRequestControl(pending.request, 'approval', key)
+    return pending
+  }
+
+  private takePendingUserInput(key: string): PendingUserInput | undefined {
+    const pending = this.pendingUserInputs.get(key)
+    if (!pending) return undefined
+    this.pendingUserInputs.delete(key)
+    if (pending.timeout) clearTimeout(pending.timeout)
+    this.unregisterPendingRequestControl(pending.request, 'userInput', key)
+    return pending
+  }
+
+  private async onServerRequestResolved(params: JsonObject): Promise<void> {
+    const requestId = params.requestId
+    if (typeof requestId !== 'string' && typeof requestId !== 'number') return
+    const requestKey = this.protocolRequestKey(requestId)
+    const control = this.pendingRequestControls.get(requestKey)
+    if (!control) return
+    const threadId = text(params.threadId) || text(params.conversationId)
+    if (threadId && control.threadId && threadId !== control.threadId) return
+
+    // Claim the control before editing Discord so a concurrent interaction cannot
+    // send a second response for a request Codex has already resolved.
+    this.pendingRequestControls.delete(requestKey)
+    if (control.kind === 'approval') {
+      const pending = this.takePendingApproval(control.key)
+      if (!pending) return
+      await pending.message.edit({
+        content: `${pending.message.content}\n\n**Resolved elsewhere.**`,
+        components: [],
+      }).catch(() => undefined)
+      return
+    }
+    if (control.kind === 'userInput') {
+      const pending = this.takePendingUserInput(control.key)
+      if (!pending) return
+      await Promise.all(pending.messages.map((message) => message.edit({
+        content: `${message.content}\n_Resolved elsewhere._`,
+        components: [],
+      }).catch(() => undefined)))
+      return
+    }
+    const pending = this.takePendingActionButtons(control.key)
+    if (!pending) return
+    await pending.message.edit({
+      content: '**Action Required**\n_Resolved elsewhere._',
+      components: [],
+    }).catch(() => undefined)
+  }
+
+  private async dismissPendingControlsForChannel(
+    discordThreadId: string,
+    status: string,
+  ): Promise<void> {
+    const approvals = Array.from(this.approvals.entries())
+      .filter(([, pending]) => pending.channel.id === discordThreadId)
+      .flatMap(([key]) => {
+        const pending = this.takePendingApproval(key)
+        return pending ? [pending] : []
+      })
+    const userInputs = Array.from(this.pendingUserInputs.entries())
+      .filter(([, pending]) => pending.channel.id === discordThreadId)
+      .flatMap(([key]) => {
+        const pending = this.takePendingUserInput(key)
+        return pending ? [pending] : []
+      })
+    const actionButtons = Array.from(this.pendingActionButtons.entries())
+      .filter(([, pending]) => pending.channel.id === discordThreadId)
+      .flatMap(([key]) => {
+        const pending = this.takePendingActionButtons(key)
+        return pending ? [pending] : []
+      })
+
+    await Promise.all([
+      ...approvals.map((pending) => pending.message.edit({
+        content: `${pending.message.content}\n\n${status}`,
+        components: [],
+      }).catch(() => undefined)),
+      ...userInputs.flatMap((pending) => pending.messages.map((message) => message.edit({
+        content: `${message.content}\n${status}`,
+        components: [],
+      }).catch(() => undefined))),
+      ...actionButtons.map((pending) => pending.message.edit({
+        content: `**Action Required**\n${status}`,
+        components: [],
+      }).catch(() => undefined)),
+    ])
   }
 
   private parseUserInputQuestions(params: JsonObject): UserInputQuestion[] {
@@ -3003,7 +7117,7 @@ export class CordexDiscordBot {
     const channel = await this.resolveRunChannel(request)
     const questions = this.parseUserInputQuestions(request.params)
     if (!channel || questions.length === 0) {
-      this.codex.respond(request.id, { answers: {} })
+      this.respondToCodex(request, { answers: {} })
       return
     }
     const key = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`
@@ -3015,32 +7129,46 @@ export class CordexDiscordBot {
       messages: [],
     }
     this.pendingUserInputs.set(key, pending)
-    for (let index = 0; index < questions.length; index++) {
-      const question = questions[index]
-      if (!question) continue
-      const content = `**${truncate(question.header, 100)}**\n${truncate(question.question, 1_700)}${question.isSecret ? '\n*Answer entered privately.*' : ''}`
-      if (question.options?.length) {
-        const select = new StringSelectMenuBuilder()
-          .setCustomId(`userinput:${key}:${index}`)
-          .setPlaceholder('Choose an answer')
-          .addOptions(
-            ...question.options.slice(0, question.isOther ? 24 : 25).map((option, optionIndex) => ({
-              label: truncate(option.label, 100),
-              value: `option:${optionIndex}`,
-              ...(option.description ? { description: truncate(option.description, 100) } : {}),
-            })),
-            ...(question.isOther ? [{ label: 'Other…', value: 'other' }] : []),
-          )
-        const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select)
-        pending.messages.push(await channel.send({ content, components: [row] }))
-      } else {
-        const button = new ButtonBuilder()
-          .setCustomId(`userinput-text:${key}:${index}`)
-          .setLabel(question.isSecret ? 'Enter private answer' : 'Answer')
-          .setStyle(ButtonStyle.Primary)
-        const row = new ActionRowBuilder<ButtonBuilder>().addComponents(button)
-        pending.messages.push(await channel.send({ content, components: [row] }))
+    this.registerPendingRequestControl(request, 'userInput', key)
+    try {
+      for (let index = 0; index < questions.length; index++) {
+        const question = questions[index]
+        if (!question) continue
+        const content = `**${truncate(question.header, 100)}**\n${truncate(question.question, 1_700)}${question.isSecret ? '\n*Answer entered privately.*' : ''}`
+        if (question.options?.length) {
+          const select = new StringSelectMenuBuilder()
+            .setCustomId(`userinput:${key}:${index}`)
+            .setPlaceholder('Choose an answer')
+            .addOptions(
+              ...question.options.slice(0, question.isOther ? 24 : 25).map((option, optionIndex) => ({
+                label: truncate(option.label, 100),
+                value: `option:${optionIndex}`,
+                ...(option.description ? { description: truncate(option.description, 100) } : {}),
+              })),
+              ...(question.isOther ? [{ label: 'Other…', value: 'other' }] : []),
+            )
+          const row = new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(select)
+          pending.messages.push(await channel.send({ content, components: [row] }))
+        } else {
+          const button = new ButtonBuilder()
+            .setCustomId(`userinput-text:${key}:${index}`)
+            .setLabel(question.isSecret ? 'Enter private answer' : 'Answer')
+            .setStyle(ButtonStyle.Primary)
+          const row = new ActionRowBuilder<ButtonBuilder>().addComponents(button)
+          pending.messages.push(await channel.send({ content, components: [row] }))
+        }
       }
+    } catch (error) {
+      const claimed = this.takePendingUserInput(key)
+      if (claimed) {
+        this.respondToCodex(claimed.request, { answers: {} })
+        await Promise.all(claimed.messages.map((message) => message.edit({
+          content: `${message.content}\n_Cancelled because Discord could not show every question._`,
+          components: [],
+        }).catch(() => undefined)))
+      }
+      this.logVerbose('user input UI failed', { requestId: request.id, error: errorText(error) })
+      return
     }
     const autoResolutionMs = request.params.autoResolutionMs
     if (typeof autoResolutionMs === 'number' && autoResolutionMs > 0) {
@@ -3097,11 +7225,19 @@ export class CordexDiscordBot {
       await interaction.reply({ content: 'Invalid answer.' })
       return
     }
-    pending.answers[question.id] = [option.label]
     await interaction.deferUpdate()
-    if (!question.isSecret) {
-      await pending.channel.send({
-        content: `» **${escapeInlineMarkdown(interaction.user.displayName)}:** ${option.label}`,
+    await this.waitForMutationIngressReady()
+    const currentPending = this.pendingUserInputs.get(key)
+    const currentQuestion = currentPending?.questions[index]
+    const currentOption = currentQuestion?.options?.[optionIndex]
+    if (!currentPending || !currentQuestion || !currentOption) {
+      await interaction.followUp({ content: 'Question expired.', ephemeral: true }).catch(() => undefined)
+      return
+    }
+    currentPending.answers[currentQuestion.id] = [currentOption.label]
+    if (!currentQuestion.isSecret) {
+      await currentPending.channel.send({
+        content: `» **${escapeInlineMarkdown(interaction.user.displayName)}:** ${currentOption.label}`,
         allowedMentions: { parse: [] },
       })
     }
@@ -3120,10 +7256,17 @@ export class CordexDiscordBot {
       return
     }
     const answer = interaction.fields.getTextInputValue('answer')
-    pending.answers[question.id] = [answer]
     await interaction.deferUpdate()
-    if (!question.isSecret) {
-      await pending.channel.send({
+    await this.waitForMutationIngressReady()
+    const currentPending = this.pendingUserInputs.get(key)
+    const currentQuestion = currentPending?.questions[index]
+    if (!currentPending || !currentQuestion) {
+      await interaction.followUp({ content: 'Question expired.', ephemeral: true }).catch(() => undefined)
+      return
+    }
+    currentPending.answers[currentQuestion.id] = [answer]
+    if (!currentQuestion.isSecret) {
+      await currentPending.channel.send({
         content: `» **${escapeInlineMarkdown(interaction.user.displayName)}:** ${answer}`,
         allowedMentions: { parse: [] },
       })
@@ -3136,17 +7279,17 @@ export class CordexDiscordBot {
     if (!pending) return
     const complete = pending.questions.every((question) => pending.answers[question.id])
     if (!complete && !timedOut) return
-    this.pendingUserInputs.delete(key)
-    if (pending.timeout) clearTimeout(pending.timeout)
+    const claimed = this.takePendingUserInput(key)
+    if (!claimed) return
     const answers = Object.fromEntries(
-      Object.entries(pending.answers).map(([questionId, values]) => [questionId, { answers: values }]),
+      Object.entries(claimed.answers).map(([questionId, values]) => [questionId, { answers: values }]),
     )
-    this.codex.respond(pending.request.id, { answers })
-    for (let index = 0; index < pending.messages.length; index++) {
-      const message = pending.messages[index]
-      const question = pending.questions[index]
+    this.respondToCodex(claimed.request, { answers })
+    for (let index = 0; index < claimed.messages.length; index++) {
+      const message = claimed.messages[index]
+      const question = claimed.questions[index]
       if (!message || !question) continue
-      const answer = pending.answers[question.id]?.join(', ')
+      const answer = claimed.answers[question.id]?.join(', ')
       const result = answer
         ? question.isSecret ? 'Answer recorded privately' : answer
         : 'Auto-resolved'
@@ -3164,6 +7307,7 @@ export class CordexDiscordBot {
     if (!pending) return undefined
     this.pendingActionButtons.delete(key)
     clearTimeout(pending.timeout)
+    this.unregisterPendingRequestControl(pending.request, 'actionButtons', key)
     return pending
   }
 
@@ -3176,7 +7320,7 @@ export class CordexDiscordBot {
     const pending = this.takePendingActionButtons(key)
     if (!pending) return false
     try {
-      this.codex.respond(pending.request.id, actionButtonToolResult(resultText, success))
+      this.respondToCodex(pending.request, actionButtonToolResult(resultText, success))
     } finally {
       await pending.message
         .edit({ content: `**Action Required**\n${status}`, components: [] })
@@ -3200,8 +7344,8 @@ export class CordexDiscordBot {
   private async handleActionButtonsRequest(request: ServerRequest): Promise<void> {
     const tool = text(request.params.tool)
     if (tool !== actionButtonsToolName || typeof request.params.namespace === 'string') {
-      this.codex.respond(
-        request.id,
+      this.respondToCodex(
+        request,
         actionButtonToolResult(`Unsupported Cordex dynamic tool: ${tool || 'unknown'}`, false),
       )
       return
@@ -3210,8 +7354,8 @@ export class CordexDiscordBot {
     const channel = await this.resolveRunChannel(request)
     const session = channel ? this.state.sessions[channel.id] : undefined
     if (!threadId || !channel || !session || session.codexThreadId !== threadId) {
-      this.codex.respond(
-        request.id,
+      this.respondToCodex(
+        request,
         actionButtonToolResult('Discord session is unavailable for action buttons.', false),
       )
       return
@@ -3220,7 +7364,7 @@ export class CordexDiscordBot {
     try {
       buttons = parseActionButtons(request.params.arguments)
     } catch (error) {
-      this.codex.respond(request.id, actionButtonToolResult(errorText(error), false))
+      this.respondToCodex(request, actionButtonToolResult(errorText(error), false))
       return
     }
 
@@ -3240,8 +7384,8 @@ export class CordexDiscordBot {
     try {
       message = await channel.send({ content: '**Action Required**', components: [row] })
     } catch (error) {
-      this.codex.respond(
-        request.id,
+      this.respondToCodex(
+        request,
         actionButtonToolResult(`Failed to show Discord action buttons: ${errorText(error)}`, false),
       )
       return
@@ -3256,12 +7400,13 @@ export class CordexDiscordBot {
     }, actionButtonTtlMs)
     timeout.unref()
     this.pendingActionButtons.set(key, { request, threadId, channel, buttons, message, timeout })
+    this.registerPendingRequestControl(request, 'actionButtons', key)
   }
 
-  private async resolveRunChannel(request: ServerRequest): Promise<ThreadChannel | undefined> {
-    const run = this.findRun(request.params)
+  private async resolveThreadChannel(params: JsonObject): Promise<ThreadChannel | undefined> {
+    const run = this.findRun(params)
     if (run) return run.channel
-    const threadId = text(request.params.threadId) || text(request.params.conversationId)
+    const threadId = text(params.threadId) || text(params.conversationId)
     if (!threadId) return undefined
     const session = Object.values(this.state.sessions).find((candidate) => candidate.codexThreadId === threadId)
     if (!session) return undefined
@@ -3269,28 +7414,233 @@ export class CordexDiscordBot {
     return channel?.isThread() ? channel : undefined
   }
 
+  private async resolveRunChannel(request: ServerRequest): Promise<ThreadChannel | undefined> {
+    return this.resolveThreadChannel(request.params)
+  }
+
+  private approvalDetail(
+    lines: string[],
+    label: string,
+    value: unknown,
+    limit: number,
+  ): void {
+    if (value === undefined || value === null || value === '') return
+    let rendered: string
+    if (typeof value === 'string') {
+      rendered = value
+    } else {
+      try {
+        rendered = JSON.stringify(value)
+      } catch {
+        rendered = String(value)
+      }
+    }
+    lines.push(`**${label}:** ${discordInlineCode(truncate(rendered, limit))}`)
+  }
+
   private approvalDescription(request: ServerRequest): string {
     const header = '⚠️ **Permission Required**'
+    const lines = [header]
     if (request.method === 'item/permissions/requestApproval') {
-      const reason = text(request.params.reason)
-      const permissions = isRecord(request.params.permissions)
-        ? truncate(JSON.stringify(request.params.permissions, null, 2), 1_300)
-        : 'Additional permissions'
-      return `${header}\n**Type:** \`permissions\`${reason ? `\n**Reason:** ${truncate(reason, 400)}` : ''}\n\`\`\`json\n${permissions}\n\`\`\``
+      lines.push('**Type:** `permissions`')
+      this.approvalDetail(lines, 'Working directory', request.params.cwd, 180)
+      this.approvalDetail(lines, 'Reason', request.params.reason, 220)
+      this.approvalDetail(
+        lines,
+        'Requested permissions',
+        isRecord(request.params.permissions)
+          ? request.params.permissions
+          : 'Additional permissions',
+        700,
+      )
+      return lines.join('\n')
     }
     if (request.method.includes('commandExecution')) {
-      return `${header}\n**Type:** \`command\`\n**Command:** ${discordInlineCode(truncate(text(request.params.command) || 'command', 1_400))}`
+      const hasCommand = Boolean(text(request.params.command))
+      lines.push(`**Type:** \`${hasCommand ? 'command' : 'network'}\``)
+      this.approvalDetail(lines, 'Command', request.params.command, 380)
+      this.approvalDetail(lines, 'Working directory', request.params.cwd, 180)
+      this.approvalDetail(lines, 'Reason', request.params.reason, 220)
+      this.approvalDetail(lines, 'Network context', request.params.networkApprovalContext, 200)
+      this.approvalDetail(lines, 'Additional permissions', request.params.additionalPermissions, 220)
+      this.approvalDetail(
+        lines,
+        'Proposed exec policy amendment',
+        request.params.proposedExecpolicyAmendment,
+        200,
+      )
+      this.approvalDetail(
+        lines,
+        'Proposed network amendments',
+        request.params.proposedNetworkPolicyAmendments,
+        220,
+      )
+      return lines.join('\n')
     }
     if (request.method === 'execCommandApproval' && Array.isArray(request.params.command)) {
-      return `${header}\n**Type:** \`command\`\n**Command:** ${discordInlineCode(truncate(request.params.command.join(' '), 1_400))}`
+      lines.push('**Type:** `command`')
+      this.approvalDetail(lines, 'Command', request.params.command.join(' '), 900)
+      this.approvalDetail(lines, 'Working directory', request.params.cwd, 300)
+      this.approvalDetail(lines, 'Reason', request.params.reason, 300)
+      return lines.join('\n')
     }
-    const reason = text(request.params.reason)
-    return `${header}\n**Type:** \`file_change\`${reason ? `\n**Reason:** ${truncate(reason, 1_500)}` : ''}`
+    lines.push('**Type:** `file_change`')
+    this.approvalDetail(lines, 'Reason', request.params.reason, 500)
+    this.approvalDetail(lines, 'Grant root', request.params.grantRoot, 500)
+    if (isRecord(request.params.fileChanges)) {
+      this.approvalDetail(lines, 'Files', Object.keys(request.params.fileChanges), 600)
+    }
+    return lines.join('\n')
+  }
+
+  private exactApprovalChoice(decision: unknown): ApprovalChoice | undefined {
+    if (typeof decision === 'string') {
+      if (decision === 'accept') {
+        return {
+          label: 'Accept',
+          style: ButtonStyle.Success,
+          result: { decision },
+          confirmation: 'Approved',
+        }
+      }
+      if (decision === 'acceptForSession') {
+        return {
+          label: 'Accept for Session',
+          style: ButtonStyle.Success,
+          result: { decision },
+          confirmation: 'Approved for this session',
+        }
+      }
+      if (decision === 'decline') {
+        return {
+          label: 'Deny',
+          style: ButtonStyle.Secondary,
+          result: { decision },
+          confirmation: 'Declined',
+        }
+      }
+      if (decision === 'cancel') {
+        return {
+          label: 'Deny and Stop',
+          style: ButtonStyle.Danger,
+          result: { decision },
+          confirmation: 'Declined and stopped',
+        }
+      }
+      return undefined
+    }
+    if (!isRecord(decision)) return undefined
+
+    const execPolicy = decision.acceptWithExecpolicyAmendment
+    if (
+      isRecord(execPolicy) &&
+      Array.isArray(execPolicy.execpolicy_amendment) &&
+      execPolicy.execpolicy_amendment.every((part) => typeof part === 'string')
+    ) {
+      return {
+        label: 'Accept and Remember Command',
+        style: ButtonStyle.Primary,
+        result: { decision },
+        confirmation: 'Approved and command policy updated',
+      }
+    }
+
+    const networkPolicy = decision.applyNetworkPolicyAmendment
+    if (!isRecord(networkPolicy) || !isRecord(networkPolicy.network_policy_amendment)) {
+      return undefined
+    }
+    const amendment = networkPolicy.network_policy_amendment
+    const host = text(amendment.host)
+    const action = text(amendment.action)
+    if (!host || (action !== 'allow' && action !== 'deny')) return undefined
+    return {
+      label: truncate(`${action === 'allow' ? 'Always Allow' : 'Always Deny'} ${host}`, 80),
+      style: action === 'allow' ? ButtonStyle.Primary : ButtonStyle.Danger,
+      result: { decision },
+      confirmation: action === 'allow'
+        ? 'Approved and network policy updated'
+        : 'Declined and network policy updated',
+    }
+  }
+
+  private approvalChoices(request: ServerRequest): ApprovalChoice[] {
+    if (
+      request.method === 'item/commandExecution/requestApproval' &&
+      Array.isArray(request.params.availableDecisions)
+    ) {
+      return request.params.availableDecisions
+        .map((decision) => this.exactApprovalChoice(decision))
+        .filter((choice): choice is ApprovalChoice => choice !== undefined)
+    }
+    return [
+      {
+        label: 'Accept',
+        style: ButtonStyle.Success,
+        result: this.approvalResult(request, 'once'),
+        confirmation: 'Approved',
+      },
+      {
+        label: 'Accept Always',
+        style: ButtonStyle.Success,
+        result: this.approvalResult(request, 'session'),
+        confirmation: 'Approved for this session',
+      },
+      {
+        label: 'Deny',
+        style: ButtonStyle.Secondary,
+        result: this.approvalResult(request, 'decline'),
+        confirmation: 'Declined',
+      },
+    ]
+  }
+
+  private approvalTimeoutResult(pending: PendingApproval): JsonObject {
+    const refusal = pending.choices.find((choice) => {
+      const decision = choice.result.decision
+      return decision === 'decline' || decision === 'cancel' || decision === 'denied'
+    })
+    return refusal?.result ?? this.approvalResult(pending.request, 'decline')
+  }
+
+  private serverRequestMatchesActiveTurn(request: ServerRequest): boolean {
+    const turnId = this.turnIdFrom(request.params)
+    if (!turnId) return true
+    const run = this.findRun(request.params)
+    if (run) return this.notificationMatchesRun(run, request.params)
+    const threadId = text(request.params.threadId) || text(request.params.conversationId)
+    if (!threadId) return false
+    const session = Object.values(this.state.sessions).find(
+      (candidate) => candidate.codexThreadId === threadId,
+    )
+    return session?.activeTurnId === turnId
+  }
+
+  private rejectStaleServerRequest(request: ServerRequest): void {
+    if (request.method === 'item/tool/requestUserInput') {
+      this.respondToCodex(request, { answers: {} })
+      return
+    }
+    if (request.method === 'item/tool/call') {
+      this.respondToCodex(
+        request,
+        actionButtonToolResult('Discord turn is no longer active.', false),
+      )
+      return
+    }
+    if (request.method === 'mcpServer/elicitation/request') {
+      this.respondToCodex(request, { action: 'decline', content: null, _meta: null })
+      return
+    }
+    this.respondToCodex(request, this.approvalResult(request, 'decline'))
   }
 
   private async handleServerRequest(request: ServerRequest): Promise<void> {
     if (request.method === 'currentTime/read') {
-      this.codex.respond(request.id, { currentTimeAt: Math.floor(Date.now() / 1_000) })
+      this.respondToCodex(request, { currentTimeAt: Math.floor(Date.now() / 1_000) })
+      return
+    }
+    if (!this.serverRequestMatchesActiveTurn(request)) {
+      this.rejectStaleServerRequest(request)
       return
     }
     if (request.method === 'item/tool/requestUserInput') {
@@ -3302,7 +7652,7 @@ export class CordexDiscordBot {
       return
     }
     if (request.method === 'mcpServer/elicitation/request') {
-      this.codex.respond(request.id, { action: 'decline', content: null, _meta: null })
+      this.respondToCodex(request, { action: 'decline', content: null, _meta: null })
       return
     }
     const supported = new Set([
@@ -3313,32 +7663,56 @@ export class CordexDiscordBot {
       'applyPatchApproval',
     ])
     if (!supported.has(request.method)) {
-      this.codex.respond(request.id, { error: `Unsupported Cordex request: ${request.method}` })
+      this.respondToCodex(request, { error: `Unsupported Cordex request: ${request.method}` })
       return
     }
     const channel = await this.resolveRunChannel(request)
     if (!channel) {
-      this.codex.respond(request.id, this.approvalResult(request, 'decline'))
+      this.respondToCodex(request, this.approvalResult(request, 'decline'))
       return
     }
     const key = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
-    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-      new ButtonBuilder().setCustomId(`approve:${key}:once`).setLabel('Accept').setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId(`approve:${key}:session`).setLabel('Accept Always').setStyle(ButtonStyle.Success),
-      new ButtonBuilder().setCustomId(`approve:${key}:decline`).setLabel('Deny').setStyle(ButtonStyle.Secondary),
-    )
-    const message = await channel.send({ content: this.approvalDescription(request), components: [row] })
-    this.approvals.set(key, { request, message })
+    const choices = this.approvalChoices(request)
+    if (choices.length === 0) {
+      this.respondToCodex(request, this.approvalResult(request, 'decline'))
+      await channel.send({
+        content: `${this.approvalDescription(request)}\n\n**No supported approval choices were provided; declined.**`,
+        allowedMentions: { parse: [] },
+      }).catch(() => undefined)
+      return
+    }
+    const rows: ActionRowBuilder<ButtonBuilder>[] = []
+    for (let index = 0; index < choices.length; index += 5) {
+      rows.push(new ActionRowBuilder<ButtonBuilder>().addComponents(
+        ...choices.slice(index, index + 5).map((choice, offset) => new ButtonBuilder()
+          .setCustomId(`approve:${key}:${index + offset}`)
+          .setLabel(choice.label)
+          .setStyle(choice.style)),
+      ))
+    }
+    let message: DiscordMessage
+    try {
+      message = await channel.send({
+        content: this.approvalDescription(request),
+        components: rows,
+        allowedMentions: { parse: [] },
+      })
+    } catch (error) {
+      this.respondToCodex(request, this.approvalResult(request, 'decline'))
+      this.logVerbose('approval UI failed', { requestId: request.id, error: errorText(error) })
+      return
+    }
     const expiry = setTimeout(() => {
-      const pending = this.approvals.get(key)
+      const pending = this.takePendingApproval(key)
       if (!pending) return
-      this.approvals.delete(key)
-      this.codex.respond(request.id, this.approvalResult(request, 'decline'))
+      this.respondToCodex(pending.request, this.approvalTimeoutResult(pending))
       void pending.message
         .edit({ content: `${pending.message.content}\n\n**Approval expired.**`, components: [] })
         .catch(() => undefined)
-    }, 10 * 60_000)
+    }, (this.config.approvalTimeoutMinutes ?? 10) * 60_000)
     expiry.unref()
+    this.approvals.set(key, { request, channel, message, choices, timeout: expiry })
+    this.registerPendingRequestControl(request, 'approval', key)
   }
 
   private approvalResult(request: ServerRequest, choice: 'once' | 'session' | 'decline'): JsonObject {
@@ -3364,6 +7738,45 @@ export class CordexDiscordBot {
   }
 
   private async handleButton(interaction: ButtonInteraction): Promise<void> {
+    if (interaction.customId.startsWith('task:')) {
+      if (!(await this.requireAccess(interaction))) return
+      const [, action, taskId] = interaction.customId.split(':')
+      if (!taskId || (action !== 'run' && action !== 'delete')) {
+        await interaction.reply({ content: 'Invalid scheduled task action.', ephemeral: true })
+        return
+      }
+      await interaction.deferReply({ ephemeral: true })
+      await this.waitForMutationIngressReady()
+      if (action === 'run') {
+        if (!(await this.scheduler.runNow(taskId))) {
+          await interaction.editReply(`Scheduled task \`${taskId}\` is no longer available.`)
+          return
+        }
+        await interaction.editReply(`Ran scheduled task \`${taskId}\` now.`)
+        return
+      }
+      const task = this.state.tasks[taskId]
+      if (!task) {
+        await interaction.editReply(`Scheduled task \`${taskId}\` is no longer available.`)
+        return
+      }
+      if (task.status === 'running') {
+        await this.scheduler.cancel(taskId)
+        await interaction.editReply(
+          `Cancelled scheduled task \`${taskId}\`. An occurrence already in progress may still finish.`,
+        )
+        return
+      }
+      if (task.status === 'scheduled') {
+        await this.scheduler.cancel(taskId)
+      }
+      if (!(await this.scheduler.deleteTerminal(taskId))) {
+        await interaction.editReply(`Scheduled task \`${taskId}\` changed state; refresh /tasks.`)
+        return
+      }
+      await interaction.editReply(`Deleted scheduled task \`${taskId}\`.`)
+      return
+    }
     if (interaction.customId.startsWith('userinput-text:')) {
       if (!(await this.requireAccess(interaction))) return
       const [, key, indexText] = interaction.customId.split(':')
@@ -3376,6 +7789,7 @@ export class CordexDiscordBot {
     }
     if (interaction.customId.startsWith('action-tool:')) {
       if (!(await this.requireAccess(interaction))) return
+      await this.waitForMutationIngressReady()
       const [, key, indexText] = interaction.customId.split(':')
       const index = Number(indexText)
       if (!key || !Number.isInteger(index)) {
@@ -3401,8 +7815,8 @@ export class CordexDiscordBot {
         await interaction.reply({ content: 'This action is no longer available.' })
         return
       }
-      this.codex.respond(
-        claimed.request.id,
+      this.respondToCodex(
+        claimed.request,
         actionButtonToolResult(`User clicked: ${button.label}`, true),
       )
       await interaction.update({
@@ -3413,21 +7827,27 @@ export class CordexDiscordBot {
     }
     if (!interaction.customId.startsWith('approve:')) return
     if (!(await this.requireAccess(interaction))) return
+    await this.waitForMutationIngressReady()
     const [, key, rawChoice] = interaction.customId.split(':')
-    if (!key || !['once', 'session', 'decline'].includes(rawChoice || '')) {
+    const choiceIndex = Number(rawChoice)
+    if (!key || !Number.isInteger(choiceIndex) || choiceIndex < 0) {
       await interaction.reply({ content: 'Invalid approval.' })
       return
     }
-    const pending = this.approvals.get(key)
+    const current = this.approvals.get(key)
+    const choice = current?.choices[choiceIndex]
+    if (!choice) {
+      await interaction.reply({ content: 'Approval expired.' })
+      return
+    }
+    const pending = this.takePendingApproval(key)
     if (!pending) {
       await interaction.reply({ content: 'Approval expired.' })
       return
     }
-    this.approvals.delete(key)
-    const choice = rawChoice as 'once' | 'session' | 'decline'
-    this.codex.respond(pending.request.id, this.approvalResult(pending.request, choice))
+    this.respondToCodex(pending.request, choice.result)
     await interaction.update({
-      content: `${pending.message.content}\n\n**${choice === 'decline' ? 'Declined' : 'Approved'} by ${interaction.user}.**`,
+      content: `${pending.message.content}\n\n**${choice.confirmation} by ${interaction.user}.**`,
       components: [],
     })
   }

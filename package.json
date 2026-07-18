@@ -1,6 +1,6 @@
 {
   "name": "@4pii4/cordex",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Control OpenAI Codex from Discord with persistent projects, sessions, approvals, and live output",
   "keywords": [
     "openai",

@@ -17,9 +17,10 @@ const queued: QueuedPrompt = {
   authorId: 'user-1',
   authorName: 'Kimaki',
   input: [
+    { type: 'skill', name: 'reviewer', path: '/skills/reviewer/SKILL.md' },
     { type: 'text', text: 'review this', text_elements: [] },
     { type: 'image', url: 'https://example.com/one.png' },
-    { type: 'image', url: 'https://example.com/two.png' },
+    { type: 'localImage', path: '/tmp/two.png' },
   ],
   displayText: 'review this',
   createdAt: '2026-07-16T00:00:00.000Z',
@@ -37,13 +38,14 @@ test('queued message edits replace text while preserving images and metadata', (
   assert.deepEqual(edited, {
     ...queued,
     input: [
+      { type: 'skill', name: 'reviewer', path: '/skills/reviewer/SKILL.md' },
       { type: 'text', text: 'review both screenshots', text_elements: [] },
       { type: 'image', url: 'https://example.com/one.png' },
-      { type: 'image', url: 'https://example.com/two.png' },
+      { type: 'localImage', path: '/tmp/two.png' },
     ],
     displayText: 'review both screenshots',
   })
   assert.equal(queued.displayText, 'review this')
-  assert.equal(queued.input[0]?.type, 'text')
-  assert.equal(queued.input[0]?.type === 'text' ? queued.input[0].text : undefined, 'review this')
+  assert.equal(queued.input[1]?.type, 'text')
+  assert.equal(queued.input[1]?.type === 'text' ? queued.input[1].text : undefined, 'review this')
 })

@@ -4,7 +4,18 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { isContextTokenCount, isContextWindowSize } from './context-usage.js'
-import type { CordexConfig, CordexState, ReasoningEffort, VerbosityLevel } from './types.js'
+import {
+  parseDiscordOutbox,
+  parseDiscordOutboxDeliveredKeys,
+} from './discord-outbox.js'
+import { scheduledTaskDeliveryId } from './scheduler.js'
+import type {
+  CordexConfig,
+  CordexState,
+  QueuedPrompt,
+  ReasoningEffort,
+  VerbosityLevel,
+} from './types.js'
 
 const efforts = new Set<ReasoningEffort>([
   'minimal',
@@ -12,6 +23,7 @@ const efforts = new Set<ReasoningEffort>([
   'medium',
   'high',
   'xhigh',
+  'max',
   'ultra',
 ])
 
@@ -21,7 +33,34 @@ const verbosityLevels = new Set<VerbosityLevel>([
   'text_only',
 ])
 
-let stateWriteTail: Promise<void> = Promise.resolve()
+type StateWriteQueue = {
+  tail: Promise<void>
+  nextSequence: number
+  invalidThrough: number
+  failure: unknown
+}
+
+const stateWriteQueues = new Map<string, StateWriteQueue>()
+
+export class StateSaveInvalidatedError extends Error {
+  constructor(cause: unknown) {
+    super('State save invalidated because an earlier queued write failed', { cause })
+    this.name = 'StateSaveInvalidatedError'
+  }
+}
+
+function stateWriteQueue(statePath: string): StateWriteQueue {
+  const existing = stateWriteQueues.get(statePath)
+  if (existing) return existing
+  const created: StateWriteQueue = {
+    tail: Promise.resolve(),
+    nextSequence: 0,
+    invalidThrough: 0,
+    failure: undefined,
+  }
+  stateWriteQueues.set(statePath, created)
+  return created
+}
 
 export function getCordexHome(): string {
   return process.env.CORDEX_HOME || path.join(homedir(), '.cordex')
@@ -37,6 +76,65 @@ export function getStatePath(): string {
 
 export function getManagementLockPath(): string {
   return path.join(getCordexHome(), 'management.lock')
+}
+
+export function getRuntimeLockPath(): string {
+  return path.join(getCordexHome(), 'runtime.lock')
+}
+
+function processIsRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH'
+  }
+}
+
+export async function acquireRuntimeLock(): Promise<() => Promise<void>> {
+  const lockPath = getRuntimeLockPath()
+  await mkdir(path.dirname(lockPath), { recursive: true, mode: 0o700 })
+  const token = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`
+  const payload = `${JSON.stringify({ pid: process.pid, token })}\n`
+  let handle: Awaited<ReturnType<typeof open>> | undefined
+  for (let attempt = 0; attempt < 2 && !handle; attempt++) {
+    try {
+      handle = await open(lockPath, 'wx', 0o600)
+      await handle.writeFile(payload)
+    } catch (error) {
+      const created = handle !== undefined
+      await handle?.close().catch(() => undefined)
+      handle = undefined
+      if (created) await unlink(lockPath).catch(() => undefined)
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+      const existing = await readFile(lockPath, 'utf8')
+        .then((value) => JSON.parse(value) as unknown)
+        .catch(() => undefined)
+      const pid = isRecord(existing) && Number.isInteger(existing.pid) && Number(existing.pid) > 0
+        ? Number(existing.pid)
+        : undefined
+      if (pid !== undefined && !processIsRunning(pid)) {
+        await unlink(lockPath).catch(() => undefined)
+        continue
+      }
+      throw new Error(
+        `Cordex is already running${pid ? ` as PID ${pid}` : ''}. Remove ${lockPath} only if no Cordex process is active.`,
+      )
+    }
+  }
+  if (!handle) throw new Error(`Could not acquire Cordex runtime lock: ${lockPath}`)
+  let released = false
+  return async () => {
+    if (released) return
+    released = true
+    await handle?.close().catch(() => undefined)
+    const current = await readFile(lockPath, 'utf8')
+      .then((value) => JSON.parse(value) as unknown)
+      .catch(() => undefined)
+    if (isRecord(current) && current.token === token) {
+      await unlink(lockPath).catch(() => undefined)
+    }
+  }
 }
 
 export async function withManagementLock<T>(
@@ -93,6 +191,8 @@ export const emptyState = (): CordexState => ({
   sessions: {},
   queues: {},
   tasks: {},
+  discordOutbox: [],
+  discordOutboxDeliveredKeys: [],
 })
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -133,6 +233,15 @@ function parseConfig(value: unknown): CordexConfig {
   if (!['untrusted', 'on-request', 'never'].includes(String(approvalPolicy))) {
     throw new Error(`Invalid approval policy: ${String(approvalPolicy)}`)
   }
+  const approvalTimeoutMinutes = value.approvalTimeoutMinutes
+  if (
+    approvalTimeoutMinutes !== undefined &&
+    (typeof approvalTimeoutMinutes !== 'number' ||
+      !Number.isFinite(approvalTimeoutMinutes) ||
+      approvalTimeoutMinutes <= 0)
+  ) {
+    throw new Error(`Invalid approval timeout: ${String(approvalTimeoutMinutes)}`)
+  }
   const projects: CordexConfig['projects'] = {}
   if (isRecord(value.projects)) {
     for (const [channelId, project] of Object.entries(value.projects)) {
@@ -159,6 +268,7 @@ function parseConfig(value: unknown): CordexConfig {
     ...(defaultEffort ? { defaultEffort: defaultEffort as ReasoningEffort } : {}),
     sandbox: sandbox as CordexConfig['sandbox'],
     approvalPolicy: approvalPolicy as CordexConfig['approvalPolicy'],
+    ...(approvalTimeoutMinutes !== undefined ? { approvalTimeoutMinutes } : {}),
     allowAllUsers: value.allowAllUsers === true,
     allowShellCommands: value.allowShellCommands === true,
     ...(allowedUserIds.length > 0 ? { allowedUserIds } : {}),
@@ -197,6 +307,7 @@ function parseSessions(value: unknown): CordexState['sessions'] {
     ) continue
 
     const session = { ...raw } as CordexState['sessions'][string]
+    if (raw.archived !== true) delete session.archived
     if (!isContextTokenCount(raw.contextTokens)) {
       delete session.contextTokens
       delete session.contextWindow
@@ -212,11 +323,80 @@ function parseSessions(value: unknown): CordexState['sessions'] {
   return sessions
 }
 
+function parseQueues(value: unknown): CordexState['queues'] {
+  if (!isRecord(value)) return {}
+  const queues: CordexState['queues'] = {}
+  for (const [threadId, rawQueue] of Object.entries(value)) {
+    if (!Array.isArray(rawQueue)) continue
+    queues[threadId] = rawQueue.flatMap((raw) => {
+      if (
+        !isRecord(raw) ||
+        typeof raw.id !== 'string' ||
+        typeof raw.authorId !== 'string' ||
+        typeof raw.authorName !== 'string' ||
+        !Array.isArray(raw.input) ||
+        typeof raw.displayText !== 'string' ||
+        typeof raw.createdAt !== 'string'
+      ) return []
+      const legacyScheduled = raw.authorName === 'scheduled task' &&
+        typeof raw.sourceMessageId !== 'string' &&
+        raw.id.startsWith('task-')
+      const prompt = {
+        ...raw,
+        id: legacyScheduled
+          ? `scheduled:${raw.id}:queued:${raw.createdAt}`
+          : raw.id,
+      } as QueuedPrompt
+      if (typeof raw.sourceMessageId !== 'string') delete prompt.sourceMessageId
+      if (raw.deliveryKind !== 'direct') delete prompt.deliveryKind
+      return [prompt]
+    })
+  }
+  return queues
+}
+
+function parseTasks(value: unknown): CordexState['tasks'] {
+  if (!isRecord(value)) return {}
+  return Object.fromEntries(
+    Object.entries(value).filter((entry): entry is [string, CordexState['tasks'][string]] => {
+      if (!isRecord(entry[1])) return false
+      return (
+        typeof entry[1].id === 'string' &&
+        typeof entry[1].threadId === 'string' &&
+        typeof entry[1].prompt === 'string' &&
+        typeof entry[1].runAt === 'string' &&
+        typeof entry[1].createdBy === 'string' &&
+        ['scheduled', 'running', 'completed', 'failed', 'cancelled'].includes(String(entry[1].status))
+      )
+    }),
+  )
+}
+
+function alignLegacyRunningTaskDeliveries(
+  queues: CordexState['queues'],
+  tasks: CordexState['tasks'],
+): void {
+  for (const task of Object.values(tasks)) {
+    if (task.status !== 'running') continue
+    const prefix = `scheduled:${task.id}:queued:`
+    const legacy = queues[task.threadId]
+      ?.filter((prompt) => prompt.authorName === 'scheduled task' && prompt.id.startsWith(prefix))
+      .at(-1)
+    if (legacy) legacy.id = scheduledTaskDeliveryId(task)
+  }
+}
+
 export async function loadState(): Promise<CordexState> {
   const file = await readFile(getStatePath(), 'utf8').catch(() => undefined)
   if (!file) return emptyState()
   const value: unknown = JSON.parse(file)
   if (!isRecord(value)) return emptyState()
+  const queues = parseQueues(value.queues)
+  const tasks = parseTasks(value.tasks)
+  const discordOutboxDeliveredKeys = parseDiscordOutboxDeliveredKeys(
+    value.discordOutboxDeliveredKeys,
+  )
+  alignLegacyRunningTaskDeliveries(queues, tasks)
   return {
     channelModels: isRecord(value.channelModels)
       ? Object.fromEntries(Object.entries(value.channelModels).filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
@@ -257,28 +437,10 @@ export async function loadState(): Promise<CordexState> {
         )
       : {},
     sessions: parseSessions(value.sessions),
-    queues: isRecord(value.queues)
-      ? Object.fromEntries(
-          Object.entries(value.queues).filter(
-            (entry): entry is [string, CordexState['queues'][string]] => Array.isArray(entry[1]),
-          ),
-        )
-      : {},
-    tasks: isRecord(value.tasks)
-      ? Object.fromEntries(
-          Object.entries(value.tasks).filter((entry): entry is [string, CordexState['tasks'][string]] => {
-            if (!isRecord(entry[1])) return false
-            return (
-              typeof entry[1].id === 'string' &&
-              typeof entry[1].threadId === 'string' &&
-              typeof entry[1].prompt === 'string' &&
-              typeof entry[1].runAt === 'string' &&
-              typeof entry[1].createdBy === 'string' &&
-              ['scheduled', 'running', 'completed', 'failed', 'cancelled'].includes(String(entry[1].status))
-            )
-          }),
-        )
-      : {},
+    queues,
+    tasks,
+    discordOutbox: parseDiscordOutbox(value.discordOutbox, discordOutboxDeliveredKeys),
+    discordOutboxDeliveredKeys,
   }
 }
 
@@ -334,10 +496,27 @@ export async function saveManagedConfig(
 
 export async function saveState(state: CordexState): Promise<void> {
   const statePath = getStatePath()
-  const write = stateWriteTail
-    .catch(() => undefined)
-    .then(() => writeJsonAtomic(statePath, state))
-  stateWriteTail = write.catch(() => undefined)
+  const snapshot = structuredClone(state)
+  const queue = stateWriteQueue(statePath)
+  const sequence = ++queue.nextSequence
+  const write = queue.tail.then(async () => {
+    if (sequence <= queue.invalidThrough) {
+      // Include snapshots queued before this invalidation was observed. They
+      // may contain mutations whose callers have not rolled back yet.
+      queue.invalidThrough = Math.max(queue.invalidThrough, queue.nextSequence)
+      throw new StateSaveInvalidatedError(queue.failure)
+    }
+    try {
+      await writeJsonAtomic(statePath, snapshot)
+    } catch (error) {
+      // Every snapshot already issued was captured before this failure could
+      // be observed, so none of them is safe to commit afterward.
+      queue.invalidThrough = Math.max(queue.invalidThrough, queue.nextSequence)
+      queue.failure = error
+      throw error
+    }
+  })
+  queue.tail = write.catch(() => undefined)
   await write
 }
 

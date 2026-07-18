@@ -6,6 +6,7 @@ export type ReasoningEffort =
   | 'medium'
   | 'high'
   | 'xhigh'
+  | 'max'
   | 'ultra'
 
 export type VerbosityLevel = 'tools_and_text' | 'text_and_essential_tools' | 'text_only'
@@ -24,6 +25,7 @@ export type CordexConfig = {
   defaultEffort?: ReasoningEffort
   sandbox: SandboxMode
   approvalPolicy: ApprovalPolicy
+  approvalTimeoutMinutes?: number
   allowAllUsers: boolean
   allowShellCommands: boolean
   allowedUserIds?: string[]
@@ -51,6 +53,7 @@ export type SessionState = {
     branch: string
     merged?: boolean
   }
+  archived?: boolean
   activeTurnId?: string
   contextTokens?: number
   contextWindow?: number
@@ -65,6 +68,7 @@ export type QueuedPrompt = {
   displayText: string
   createdAt: string
   sourceMessageId?: string
+  deliveryKind?: 'direct' | 'queued'
 }
 
 export type ScheduledTask = {
@@ -78,6 +82,18 @@ export type ScheduledTask = {
   lastError?: string
 }
 
+export type DiscordOutboxEntry = {
+  key: string
+  discordThreadId: string
+  codexThreadId: string
+  turnId: string
+  itemKey: string
+  chunkIndex: number
+  content: string
+  nonce: string
+  createdAt: string
+}
+
 export type CordexState = {
   channelModels: Record<string, string>
   channelEfforts: Record<string, ReasoningEffort>
@@ -88,11 +104,30 @@ export type CordexState = {
   sessions: Record<string, SessionState>
   queues: Record<string, QueuedPrompt[]>
   tasks: Record<string, ScheduledTask>
+  discordOutbox?: DiscordOutboxEntry[]
+  discordOutboxDeliveredKeys?: string[]
 }
+
+export type ImageDetail = 'auto' | 'low' | 'high' | 'original'
 
 export type UserInput =
   | { type: 'text'; text: string; text_elements: [] }
-  | { type: 'image'; url: string }
+  | { type: 'image'; url: string; detail?: ImageDetail }
+  | { type: 'localImage'; path: string; detail?: ImageDetail }
+  | { type: 'skill'; name: string; path: string }
+
+export type CodexReasoningEffortOption = {
+  reasoningEffort: ReasoningEffort
+  description: string
+}
+
+export type CodexModelServiceTier = {
+  id: string
+  name: string
+  description: string
+}
+
+export type CodexInputModality = 'text' | 'image'
 
 export type CodexModel = {
   id: string
@@ -102,6 +137,10 @@ export type CodexModel = {
   hidden: boolean
   isDefault: boolean
   defaultReasoningEffort: ReasoningEffort
+  supportedReasoningEfforts?: CodexReasoningEffortOption[]
+  serviceTiers?: CodexModelServiceTier[]
+  defaultServiceTier?: string | null
+  inputModalities?: CodexInputModality[]
 }
 
 export type CodexThreadSummary = {

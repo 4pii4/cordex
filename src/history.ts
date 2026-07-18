@@ -15,6 +15,9 @@ function userMessageText(item: JsonObject): string {
   return item.content.flatMap((content) => {
     if (!isRecord(content)) return []
     if (content.type === 'text' && typeof content.text === 'string') return [content.text]
+    if (content.type === 'skill' && typeof content.name === 'string') {
+      return [`[${content.name} skill]`]
+    }
     if (content.type === 'image') return ['[image attachment]']
     if (content.type === 'localImage') return ['[local image attachment]']
     return []

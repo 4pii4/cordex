@@ -52,6 +52,17 @@ test('tool output follows Kimaki compact symbols and verbosity filtering', () =>
     changes: [{ path: '/project/src/app.ts', diff: '@@\n-old\n+new', kind: { type: 'update' } }],
   }, 'text_and_essential_tools'), '◼︎ apply_patch *app.ts* (+1-1)')
   assert.equal(formatCompletedToolItem({ type: 'reasoning' }, 'tools_and_text'), '┣ thinking')
+  assert.match(formatCompletedToolItem({
+    type: 'collabAgentToolCall',
+    tool: 'spawnAgent',
+    status: 'failed',
+    prompt: 'inspect',
+  }, 'tools_and_text') || '', /^⨯ agent/)
+  assert.equal(formatCompletedToolItem({
+    type: 'imageGeneration',
+    status: 'failed',
+    savedPath: '/tmp/image.png',
+  }, 'tools_and_text'), '⨯ imageGeneration *image.png*')
   assert.equal(formatCompletedToolItem({
     type: 'dynamicToolCall',
     namespace: null,

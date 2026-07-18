@@ -14,3 +14,14 @@ export function isUnknownDiscordChannelError(error: unknown): boolean {
     error.rawError.status === 404
   )
 }
+
+export function isUnknownDiscordMessageError(error: unknown): boolean {
+  if (!isRecord(error)) return false
+  if (error.status === 404) return true
+  if (error.code === 10_008 || error.code === '10008') return true
+  return isRecord(error.rawError) && (
+    error.rawError.code === 10_008 ||
+    error.rawError.code === '10008' ||
+    error.rawError.status === 404
+  )
+}

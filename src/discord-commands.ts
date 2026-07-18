@@ -1,7 +1,15 @@
 import { SlashCommandBuilder } from 'discord.js'
 import type { ReasoningEffort } from './types.js'
 
-const effortChoices: ReasoningEffort[] = ['minimal', 'low', 'medium', 'high', 'xhigh', 'ultra']
+const effortChoices: ReasoningEffort[] = [
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+  'ultra',
+]
 
 export function buildSlashCommands() {
   return [
@@ -158,6 +166,13 @@ export function buildSlashCommands() {
       )
       .setDMPermission(false),
     new SlashCommandBuilder()
+      .setName('rename')
+      .setDescription('Rename the current Discord and Codex session')
+      .addStringOption((option) =>
+        option.setName('name').setDescription('New session name').setRequired(true),
+      )
+      .setDMPermission(false),
+    new SlashCommandBuilder()
       .setName('fork')
       .setDescription('Fork current Codex session into a new Discord thread')
       .setDMPermission(false),
@@ -243,6 +258,23 @@ export function buildSlashCommands() {
       .setName('cancel-task')
       .setDescription('Cancel scheduled prompt')
       .addStringOption((option) => option.setName('id').setDescription('Task ID').setRequired(true))
+      .setDMPermission(false),
+    new SlashCommandBuilder()
+      .setName('skill')
+      .setDescription('Invoke a Codex skill in the current session')
+      .addStringOption((option) =>
+        option
+          .setName('skill')
+          .setDescription('Enabled Codex skill')
+          .setRequired(true)
+          .setAutocomplete(true),
+      )
+      .addStringOption((option) =>
+        option
+          .setName('prompt')
+          .setDescription('Optional instruction for the skill')
+          .setMaxLength(6_000),
+      )
       .setDMPermission(false),
     new SlashCommandBuilder()
       .setName('skills')

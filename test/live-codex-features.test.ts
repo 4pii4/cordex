@@ -63,7 +63,11 @@ test('real Codex supports session list, fork, rename, compact', { skip: !process
       approvalPolicy: 'never',
     })
     threadId = thread.threadId
-    const goal = await codex.setThreadGoal(threadId, 'Complete live feature smoke', 10_000, 'paused')
+    const goal = await codex.setThreadGoal(threadId, {
+      objective: 'Complete live feature smoke',
+      tokenBudget: 10_000,
+      status: 'paused',
+    })
     assert.equal(goal.objective, 'Complete live feature smoke')
     assert.equal(goal.status, 'paused')
     assert.equal((await codex.getThreadGoal(threadId))?.tokenBudget, 10_000)

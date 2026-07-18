@@ -314,10 +314,11 @@ export function formatCompletedToolItem(
   if (type === 'collabAgentToolCall') {
     const tool = text(item.tool) || 'agent'
     const prompt = text(item.prompt)
+    const icon = statusFailed(item) ? '⨯' : '┣'
     if (tool === 'spawnAgent') {
-      return `┣ agent${prompt ? ` **${escapeInlineMarkdown(truncate(normalizeWhitespace(prompt), 100))}**` : ''}`
+      return `${icon} agent${prompt ? ` **${escapeInlineMarkdown(truncate(normalizeWhitespace(prompt), 100))}**` : ''}`
     }
-    return `┣ ${tool}${prompt ? ` _${escapeInlineMarkdown(truncate(normalizeWhitespace(prompt), 100))}_` : ''}`
+    return `${icon} ${tool}${prompt ? ` _${escapeInlineMarkdown(truncate(normalizeWhitespace(prompt), 100))}_` : ''}`
   }
 
   if (type === 'subAgentActivity') {
@@ -338,7 +339,7 @@ export function formatCompletedToolItem(
 
   if (type === 'imageGeneration') {
     const filePath = text(item.savedPath)
-    return `┣ imageGeneration${filePath ? ` ${emphasis(path.basename(filePath) || filePath)}` : ''}`
+    return `${statusFailed(item) ? '⨯' : '┣'} imageGeneration${filePath ? ` ${emphasis(path.basename(filePath) || filePath)}` : ''}`
   }
 
   if (type === 'sleep') {

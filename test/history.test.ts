@@ -31,6 +31,20 @@ test('history replay is chronological and omits reasoning', () => {
   assert.doesNotMatch(rendered, /private|hidden/)
 })
 
+test('history replay renders skill-only user messages', () => {
+  const rendered = formatThreadHistory([{
+    id: 'skill-turn',
+    items: [{
+      type: 'userMessage',
+      id: 'skill-message',
+      clientId: 'interaction-1',
+      content: [{ type: 'skill', name: 'caveman-help', path: '/skills/caveman-help/SKILL.md' }],
+    }],
+  }]).join('\n')
+
+  assert.match(rendered, /\[caveman-help skill\]/)
+})
+
 test('history replay respects Discord and total size limits', () => {
   const turns: CodexThreadTurn[] = Array.from({ length: 8 }, (_, index) => ({
     id: `turn-${index}`,

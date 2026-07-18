@@ -4,8 +4,12 @@ const lines = createInterface({ input: process.stdin })
 let threadGoal = null
 let mcpEnabled = true
 let threadStartParams = null
+let threadResumeParams = null
 let threadSettingsParams = null
+let threadListParams = null
 let turnStartParams = null
+let turnSteerParams = null
+let skillsListParams = null
 const fixtureTurns = [
   {
     id: 'history-turn',
@@ -50,11 +54,20 @@ lines.on('line', (line) => {
     })
   } else if (message.method === 'fixture/threadStartParams') {
     send({ id: message.id, result: threadStartParams })
+  } else if (message.method === 'fixture/threadResumeParams') {
+    send({ id: message.id, result: threadResumeParams })
   } else if (message.method === 'fixture/threadSettingsParams') {
     send({ id: message.id, result: threadSettingsParams })
+  } else if (message.method === 'fixture/threadListParams') {
+    send({ id: message.id, result: threadListParams })
   } else if (message.method === 'fixture/turnStartParams') {
     send({ id: message.id, result: turnStartParams })
+  } else if (message.method === 'fixture/turnSteerParams') {
+    send({ id: message.id, result: turnSteerParams })
+  } else if (message.method === 'fixture/skillsListParams') {
+    send({ id: message.id, result: skillsListParams })
   } else if (message.method === 'thread/resume') {
+    threadResumeParams = message.params
     send({ id: message.id, result: {
       thread: {
         id: message.params.threadId,
@@ -62,6 +75,8 @@ lines.on('line', (line) => {
         preview: 'fixture history question',
       },
       model: 'gpt-test',
+      reasoningEffort: 'medium',
+      serviceTier: 'priority',
       initialTurnsPage: message.params.initialTurnsPage
         ? { data: fixtureTurns, nextCursor: null, backwardsCursor: null }
         : null,
@@ -74,20 +89,38 @@ lines.on('line', (line) => {
   } else if (message.method === 'thread/settings/update') {
     threadSettingsParams = message.params
     send({ id: message.id, result: {} })
-  } else if (message.method === 'thread/compact/start' || message.method === 'thread/name/set' || message.method === 'thread/archive') {
+  } else if (message.method === 'thread/unarchive') {
+    send({
+      id: message.id,
+      result: message.params.threadId === 'missing-thread-response'
+        ? {}
+        : {
+            thread: {
+              id: message.params.threadId,
+              preview: 'fixture unarchived preview',
+              name: 'Fixture unarchived thread',
+              cwd: process.cwd(),
+              updatedAt: 2,
+            },
+          },
+    })
+  } else if (message.method === 'thread/compact/start' || message.method === 'thread/name/set' || message.method === 'thread/archive' || message.method === 'thread/delete') {
     send({ id: message.id, result: {} })
   } else if (message.method === 'review/start') {
     send({ id: message.id, result: { turn: { id: 'review-turn' }, reviewThreadId: message.params.threadId } })
   } else if (message.method === 'thread/rollback') {
     send({ id: message.id, result: { thread: { id: message.params.threadId, turns: [] } } })
   } else if (message.method === 'thread/goal/set') {
+    const previous = threadGoal
     threadGoal = {
       threadId: message.params.threadId,
-      objective: message.params.objective,
-      status: message.params.status || 'active',
-      tokenBudget: message.params.tokenBudget,
-      tokensUsed: 12,
-      timeUsedSeconds: 3,
+      objective: message.params.objective ?? previous?.objective,
+      status: message.params.status ?? previous?.status ?? 'active',
+      tokenBudget: Object.hasOwn(message.params, 'tokenBudget')
+        ? message.params.tokenBudget
+        : previous?.tokenBudget,
+      tokensUsed: previous?.tokensUsed ?? 12,
+      timeUsedSeconds: previous?.timeUsedSeconds ?? 3,
     }
     send({ id: message.id, result: { goal: threadGoal } })
   } else if (message.method === 'thread/goal/get') {
@@ -97,24 +130,49 @@ lines.on('line', (line) => {
     threadGoal = null
     send({ id: message.id, result: { cleared } })
   } else if (message.method === 'thread/list') {
+    threadListParams = message.params
     send({
       id: message.id,
       result: {
-        data: [{ id: 'thread-1', preview: 'fixture preview', cwd: process.cwd(), updatedAt: 1 }],
+        data: [{
+          id: message.params.archived ? 'thread-archived' : 'thread-1',
+          preview: message.params.archived ? 'fixture archived preview' : 'fixture preview',
+          cwd: process.cwd(),
+          updatedAt: 1,
+        }],
         nextCursor: null,
         backwardsCursor: null,
       },
     })
   } else if (message.method === 'thread/read') {
+    const runtimeStatus = message.params.threadId === 'thread-idle'
+      ? { type: 'idle' }
+      : message.params.threadId === 'thread-not-loaded'
+        ? { type: 'notLoaded' }
+        : message.params.threadId === 'thread-system-error'
+          ? { type: 'systemError' }
+          : { type: 'active', activeFlags: ['waitingOnApproval'] }
     send({
       id: message.id,
       result: {
         thread: {
           id: message.params.threadId,
-          turns: [
+          name: 'Fixture thread',
+          preview: 'Fixture thread preview',
+          cwd: process.cwd(),
+          updatedAt: 1,
+          status: runtimeStatus,
+          turns: runtimeStatus.type === 'active' ? [
             {
               id: 'turn-with-subagents',
+              status: 'inProgress',
               items: [
+                {
+                  type: 'userMessage',
+                  id: 'fixture-user-message',
+                  clientId: 'fixture-client-message',
+                  content: [{ type: 'text', text: 'Fixture prompt', text_elements: [] }],
+                },
                 {
                   type: 'collabAgentToolCall',
                   id: 'spawn-1',
@@ -155,7 +213,7 @@ lines.on('line', (line) => {
                 },
               ],
             },
-          ],
+          ] : [],
         },
       },
     })
@@ -188,7 +246,10 @@ lines.on('line', (line) => {
     })
   } else if (message.id === 99) {
     send({ id: message.id, result: {} })
-  } else if (message.method === 'turn/steer' || message.method === 'turn/interrupt') {
+  } else if (message.method === 'turn/steer') {
+    turnSteerParams = message.params
+    send({ id: message.id, result: {} })
+  } else if (message.method === 'turn/interrupt') {
     send({ id: message.id, result: {} })
   } else if (message.method === 'model/list') {
     send({
@@ -238,9 +299,90 @@ lines.on('line', (line) => {
       nextCursor: null,
     } })
   } else if (message.method === 'skills/list') {
+    skillsListParams = message.params
     send({
       id: message.id,
-      result: { data: [{ cwd: process.cwd(), skills: [{ name: 'fixture-skill', description: 'Fixture', enabled: true }], errors: [] }] },
+      result: {
+        data: [
+          {
+            cwd: process.cwd(),
+            skills: [
+              {
+                name: 'fixture-skill',
+                description: 'Fixture skill',
+                shortDescription: 'Fixture',
+                interface: {
+                  displayName: 'Fixture Skill',
+                  shortDescription: 'Fixture interface',
+                  iconSmall: `${process.cwd()}/skills/fixture/icon-small.png`,
+                  iconLarge: `${process.cwd()}/skills/fixture/icon-large.png`,
+                  brandColor: '#123456',
+                  defaultPrompt: 'Run the fixture skill.',
+                },
+                dependencies: {
+                  tools: [
+                    {
+                      type: 'mcp',
+                      value: 'fixture-tool',
+                      description: 'Fixture tool',
+                      transport: 'stdio',
+                      command: 'fixture-command',
+                      url: 'https://example.test/fixture',
+                    },
+                  ],
+                },
+                path: `${process.cwd()}/skills/fixture/SKILL.md`,
+                scope: 'repo',
+                enabled: true,
+              },
+              {
+                name: 'nullable-skill',
+                description: 'Fixture null optionals',
+                shortDescription: null,
+                interface: {
+                  displayName: 'Nullable Skill',
+                  shortDescription: null,
+                  iconSmall: null,
+                  iconLarge: null,
+                  brandColor: null,
+                  defaultPrompt: null,
+                },
+                dependencies: {
+                  tools: [
+                    {
+                      type: 'mcp',
+                      value: 'nullable-tool',
+                      description: null,
+                      transport: null,
+                      command: null,
+                      url: null,
+                    },
+                  ],
+                },
+                path: `${process.cwd()}/skills/nullable/SKILL.md`,
+                scope: 'user',
+                enabled: true,
+              },
+              {
+                name: 'null-containers-skill',
+                description: 'Fixture null containers',
+                shortDescription: null,
+                interface: null,
+                dependencies: null,
+                path: `${process.cwd()}/skills/null-containers/SKILL.md`,
+                scope: 'system',
+                enabled: false,
+              },
+            ],
+            errors: [
+              {
+                path: `${process.cwd()}/skills/broken/SKILL.md`,
+                message: 'Fixture skill error',
+              },
+            ],
+          },
+        ],
+      },
     })
   } else if (message.method === 'mcpServerStatus/list') {
     send({

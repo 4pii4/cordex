@@ -19,8 +19,8 @@ place where the work was requested.
 - Dedicated Discord channels for local projects and optional git worktree isolation
 - Project- or session-level model, reasoning, collaboration mode, and permission controls
 - Queued and scheduled prompts with restart recovery
-- Codex skills, MCP, authentication, account, rate-limit, and context diagnostics
-- Text and image input, code review, diffs, rollback, and controlled shell execution
+- Native Codex skill invocation plus MCP, authentication, account, rate-limit, and context diagnostics
+- Reply-aware text and image input, code review, diffs, rollback, and controlled shell execution
 
 The core mapping is deliberately simple:
 
@@ -162,23 +162,83 @@ Slash commands are registered in the configured Discord server.
 | Area | Commands |
 | --- | --- |
 | Projects | `/add-project`, `/create-new-project`, `/remove-project`, `/project` |
-| Sessions | `/new-session`, `/resume`, `/fork`, `/fork-subagent`, `/btw`, `/abort`, `/archive`, `/compact`, `/last-sessions`, `/session-id`, `/status` |
+| Sessions | `/new-session`, `/resume`, `/rename`, `/fork`, `/fork-subagent`, `/btw`, `/abort`, `/archive`, `/compact`, `/last-sessions`, `/session-id`, `/status` |
 | Models and runtime | `/model`, `/model-variant`, `/unset-model-override`, `/mode`, `/fast`, `/permissions`, `/add-dir`, `/verbosity`, `/context-usage` |
 | Goals | `/goal`, `/clear-goal` |
 | Git and worktrees | `/diff`, `/review`, `/rollback`, `/new-worktree`, `/merge-worktree`, `/toggle-worktrees`, `/worktrees` |
 | Automation | `/queue`, `/clear-queue`, `/schedule`, `/tasks`, `/cancel-task` |
-| Codex services | `/skills`, `/mcp`, `/mcp-status`, `/mcp-login`, `/auth-status`, `/rate-limits`, `/account-usage`, `/login` |
+| Codex services | `/skill`, `/skills`, `/mcp`, `/mcp-status`, `/mcp-login`, `/auth-status`, `/rate-limits`, `/account-usage`, `/login` |
 | Host control | `/run-shell-command`, `!command`, `/yolo` |
 
 Messages ending in `. queue` are queued behind the active turn. Removing that
-suffix in an edit dequeues the message. `/mcp` enable and disable actions update
+suffix in an edit dequeues the message. In an existing session, punctuation
+followed by a final `btw` suffix, such as `check the API too. btw`, forks the
+message into a side session like `/btw`. `/mcp` enable and disable actions update
 the global Codex configuration, not only the current Discord project.
+`/archive` keeps the Discord-to-Codex mapping and session settings so `/resume`
+can reopen the same thread; active goals, turns, queued prompts, and scheduled
+tasks, plus any prompt delivery still awaiting recovery, must be resolved first.
+`/rename` keeps the Discord and Codex titles in sync.
+`/skill` invokes an enabled skill from the current session directory and accepts an
+optional prompt; Cordex resolves the skill path from Codex metadata at submission time.
+`/tasks` includes bounded Run now, Cancel, and Delete controls. Scheduled occurrences
+are persisted before execution, retain stable delivery IDs across restart, and do not
+reappear after a concurrent cancellation or deletion.
+
+Replies include a bounded quote and the referenced Discord author. Text
+attachments use a MIME allowlist; PNG, JPEG, GIF, and WebP images are downloaded
+to a bounded local cache before being sent to Codex. Unsupported, oversized, or
+timed-out attachments are reported in the session instead of being silently
+ignored. The final rendered text input also has an independent aggregate character
+limit so multiple attachments and forwarded context cannot create an unbounded prompt.
+
+Model choices use Codex's model catalog when available. Reasoning effort is validated
+per model, including `max`, and `/fast` selects the model's advertised priority tier
+instead of assuming one fixed service-tier name. Model, effort, Fast, permission, and
+YOLO changes are persisted before they are applied to a live Codex thread.
+
+`/goal` with an objective creates or updates Codex's persistent thread goal.
+Active goal turns, including continuations started directly by Codex, stream to
+the linked Discord thread, resume when Cordex restarts, and can accept queued or
+follow-up messages. Omitted status and token-budget options preserve their
+existing values.
+
+If the Codex app-server exits unexpectedly, Cordex retries it with bounded
+exponential backoff, clears controls belonging to the failed process, reloads
+persistent goal sessions, and resumes eligible queued work. Initialization and
+RPC watchdogs also recycle a child that remains alive but stops responding.
+After an ambiguous turn start or steer failure, Cordex checks Codex's persisted
+client message IDs before retrying so an accepted prompt is not delivered twice.
+Existing-session messages, `/skill`, queued prompts, scheduled occurrences, and
+post-conflict recovery instructions are persisted before Codex delivery and stay
+recorded until that acceptance is confirmed. Scheduled tasks found in `running`
+state after restart retry the same occurrence ID instead of creating a duplicate.
+Completed Discord output and run footers use a separate durable outbox, so a partial
+send or bot restart resumes only missing chunks and does not block the next queued turn.
+
+At startup, Cordex refetches the Discord messages backing `. queue` entries so
+offline edits replace the stored input and offline deletions remove it. Transient
+Discord or attachment failures retain the last durable input, block that thread's
+queued delivery, and retry reconciliation with capped backoff.
+
+Discord prompt ingress is serialized per thread. Slash commands acknowledge
+before waiting behind earlier messages, `/abort` stays on a priority path, and a
+deleted thread is tombstoned and interrupted immediately so blocked preprocessing
+cannot dispatch work after deletion. Startup also removes persisted sessions whose
+Discord thread disappeared while Cordex was offline.
 
 `/yolo` switches the selected scope to approval-free `danger-full-access` mode.
 `/run-shell-command` and the `!command` shortcut execute through the host shell in
 the active project or session directory when `allowShellCommands` is enabled.
 That directory may be an isolated worktree. Restrict both capabilities to
 trusted users.
+
+Starting `/new-session` inside an existing thread inherits that session's directory
+and extra workspace roots without claiming ownership of its worktree. Worktree creation
+refreshes configured remotes, prefers a strictly newer remote ref, and initializes
+submodules recursively. `/merge-worktree` blocks while another live or starting session
+shares the checkout; successful and no-op merges leave the session checkout detached at
+the merged target commit.
 
 ## Configuration
 
@@ -196,6 +256,7 @@ A representative configuration is:
   "guildId": "DISCORD_SERVER_ID",
   "sandbox": "workspace-write",
   "approvalPolicy": "on-request",
+  "approvalTimeoutMinutes": 10,
   "allowAllUsers": false,
   "allowShellCommands": false,
   "allowedUserIds": ["TRUSTED_DISCORD_USER_ID"],
@@ -209,10 +270,16 @@ Project mappings are normally managed by Cordex. Optional `defaultModel` and
 `defaultEffort` fields can set initial preferences; available models come from
 the installed Codex runtime. Valid configured effort values are
 `minimal`, `low`, `medium`, `high`, `xhigh`, and `ultra`.
+`approvalTimeoutMinutes` controls how long Discord approval buttons remain active
+before Cordex denies the request and lets Codex continue; it defaults to 10.
 
 Cordex also persists an internal `categoryId` after creating its managed Discord
 category. Do not edit or remove it manually; if it is missing or invalid, Cordex
 creates a new managed category and re-synchronizes its channels there.
+
+Only one Cordex runtime may use a `CORDEX_HOME` at a time. A process-lifetime
+`runtime.lock` fails fast on duplicate starts and is reclaimed when its recorded
+process no longer exists.
 
 Environment variables override the corresponding configuration or runtime path:
 

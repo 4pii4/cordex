@@ -7,6 +7,7 @@ import { createInterface } from 'node:readline/promises'
 import { stdin, stdout } from 'node:process'
 import { CodexAppServer } from './codex-app-server.js'
 import {
+  acquireRuntimeLock,
   assertDirectory,
   emptyState,
   getConfigPath,
@@ -57,6 +58,9 @@ async function init(): Promise<void> {
       ...(existing?.defaultEffort ? { defaultEffort: existing.defaultEffort } : {}),
       sandbox: existing?.sandbox || 'workspace-write',
       approvalPolicy: existing?.approvalPolicy || 'on-request',
+      ...(existing?.approvalTimeoutMinutes !== undefined
+        ? { approvalTimeoutMinutes: existing.approvalTimeoutMinutes }
+        : {}),
       allowAllUsers: guildChanged ? false : existing?.allowAllUsers ?? false,
       allowShellCommands: guildChanged ? false : existing?.allowShellCommands ?? false,
       ...(!guildChanged && existing?.allowedUserIds
@@ -101,22 +105,33 @@ async function doctor(): Promise<void> {
 
 async function start(verbose = false): Promise<void> {
   const config = await loadConfig()
-  const state = await withManagementLock(async () => {
-    const state = await loadState()
-    // A previous process cannot keep an in-flight turn alive. Treat persisted
-    // active turn IDs as stale so the first new Discord message starts cleanly.
-    for (const session of Object.values(state.sessions)) delete session.activeTurnId
-    await saveState(state)
-    return state
-  })
+  const releaseRuntimeLock = await acquireRuntimeLock()
+  let state: Awaited<ReturnType<typeof loadState>>
+  try {
+    state = await withManagementLock(async () => {
+      const loaded = await loadState()
+      // A previous process cannot keep an in-flight turn alive. Treat persisted
+      // active turn IDs as stale so the first new Discord message starts cleanly.
+      for (const session of Object.values(loaded.sessions)) delete session.activeTurnId
+      await saveState(loaded)
+      return loaded
+    })
+  } catch (error) {
+    await releaseRuntimeLock()
+    throw error
+  }
   const codex = new CodexAppServer({ verbose })
   const bot = new CordexDiscordBot(config, state, codex, { verbose })
   let stopping = false
   const stop = async () => {
     if (stopping) return
     stopping = true
-    await bot.stop()
-    process.exitCode = 0
+    try {
+      await bot.stop()
+      process.exitCode = 0
+    } finally {
+      await releaseRuntimeLock()
+    }
   }
   process.once('SIGINT', () => void stop())
   process.once('SIGTERM', () => void stop())
@@ -124,6 +139,7 @@ async function start(verbose = false): Promise<void> {
     await bot.start()
   } catch (error) {
     await bot.stop().catch(() => undefined)
+    await releaseRuntimeLock()
     throw error
   }
   console.log(`Cordex connected. Guild ${config.guildId}.`)

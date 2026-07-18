@@ -1,8 +1,11 @@
 import { createHash } from 'node:crypto'
-import { mkdir, rm } from 'node:fs/promises'
+import { access, mkdir, rm } from 'node:fs/promises'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
+import { setTimeout as delay } from 'node:timers/promises'
 import type { SessionState } from './types.js'
+
+const SUBMODULE_INIT_TIMEOUT_MS = 10 * 60_000
 
 export type GitResult = { stdout: string; stderr: string; exitCode: number | null }
 
@@ -22,7 +25,7 @@ export async function runGit(cwd: string, args: string[], timeoutMs = 120_000): 
   timer.unref()
   const exitCode = await new Promise<number | null>((resolve, reject) => {
     child.once('error', reject)
-    child.once('exit', resolve)
+    child.once('close', resolve)
   }).finally(() => clearTimeout(timer))
   return { stdout: stdout.trim(), stderr: stderr.trim(), exitCode }
 }
@@ -35,6 +38,14 @@ async function git(cwd: string, args: string[]): Promise<string> {
   const result = await runGit(cwd, args)
   if (result.exitCode !== 0) throw gitError(args, result)
   return result.stdout
+}
+
+async function fetchRemoteBranch(directory: string, remote: string, branch: string): Promise<GitResult> {
+  let result = await runGit(directory, ['fetch', remote, branch], 15_000)
+  if (result.exitCode === 0) return result
+  await delay(25)
+  result = await runGit(directory, ['fetch', remote, branch], 15_000)
+  return result
 }
 
 export function slugifyWorktreeName(name: string): string {
@@ -74,6 +85,169 @@ export function activeWorktreeSessions(sessions: SessionState[]): SessionState[]
     .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
 }
 
+export async function resolveBestBaseRef(options: {
+  directory: string
+  branch: string
+}): Promise<string> {
+  const remotes = await runGit(options.directory, ['remote'])
+  const remoteNames = remotes.exitCode === 0
+    ? new Set(remotes.stdout.split('\n').map((remote) => remote.trim()).filter(Boolean))
+    : new Set<string>()
+  const remoteQualified = options.branch.startsWith('refs/remotes/')
+    ? options.branch.slice('refs/remotes/'.length)
+    : options.branch
+  if (remoteQualified.includes('/')) {
+    const separator = remoteQualified.indexOf('/')
+    const remote = remoteQualified.slice(0, separator)
+    const branch = remoteQualified.slice(separator + 1)
+    if (remoteNames.has(remote) && branch) {
+      await fetchRemoteBranch(options.directory, remote, branch)
+      return options.branch
+    }
+  }
+
+  for (const remote of ['upstream', 'origin']) {
+    const fetched = await fetchRemoteBranch(options.directory, remote, options.branch)
+    if (fetched.exitCode !== 0) continue
+
+    const remoteRef = `${remote}/${options.branch}`
+    const remoteFullRef = `refs/remotes/${remoteRef}`
+    const remoteExists = await runGit(options.directory, ['rev-parse', '--verify', remoteFullRef])
+    if (remoteExists.exitCode !== 0) continue
+
+    const localFullRef = `refs/heads/${options.branch}`
+    const localExists = await runGit(options.directory, ['rev-parse', '--verify', localFullRef])
+    if (localExists.exitCode !== 0) return remoteRef
+
+    const [remoteAhead, localAhead] = await Promise.all([
+      runGit(options.directory, ['rev-list', '--count', `${localFullRef}..${remoteFullRef}`]),
+      runGit(options.directory, ['rev-list', '--count', `${remoteFullRef}..${localFullRef}`]),
+    ])
+    if (remoteAhead.exitCode !== 0 || localAhead.exitCode !== 0) continue
+
+    const remoteAheadCount = Number.parseInt(remoteAhead.stdout, 10)
+    const localAheadCount = Number.parseInt(localAhead.stdout, 10)
+    if (!Number.isFinite(remoteAheadCount) || !Number.isFinite(localAheadCount)) continue
+    if (remoteAheadCount > 0 && localAheadCount > 0) continue
+    if (remoteAheadCount > 0) return remoteRef
+  }
+
+  return options.branch
+}
+
+async function listSubmodulePaths(directory: string): Promise<string[]> {
+  try {
+    await access(path.join(directory, '.gitmodules'))
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+    throw error
+  }
+
+  const args = ['config', '--file', '.gitmodules', '--get-regexp', '^submodule[.].*[.]path$']
+  const result = await runGit(directory, args)
+  if (result.exitCode === 1) return []
+  if (result.exitCode !== 0) throw gitError(args, result)
+
+  const paths = result.stdout.split('\n').map((line) => {
+    const separator = line.search(/\s/)
+    if (separator < 0) throw new Error(`Invalid .gitmodules path entry: ${line}`)
+    return line.slice(separator).trim()
+  })
+  return [...new Set(paths.filter(Boolean))]
+}
+
+function isContainedDirectory(parent: string, candidate: string): boolean {
+  const relative = path.relative(parent, candidate)
+  return relative !== ''
+    && relative !== '..'
+    && !relative.startsWith(`..${path.sep}`)
+    && !path.isAbsolute(relative)
+}
+
+async function sourceSubmoduleReference(
+  projectDirectory: string,
+  submodulePath: string,
+): Promise<string | undefined> {
+  const candidate = path.resolve(projectDirectory, submodulePath)
+  if (!isContainedDirectory(projectDirectory, candidate)) return undefined
+  const result = await runGit(projectDirectory, ['-C', candidate, 'rev-parse', '--show-toplevel'])
+  if (result.exitCode !== 0 || path.resolve(result.stdout) !== candidate) return undefined
+  return candidate
+}
+
+function submoduleUpdateArgs(submodulePath: string, reference?: string): string[] {
+  return [
+    '-c',
+    'protocol.file.allow=always',
+    'submodule',
+    'update',
+    '--init',
+    '--recursive',
+    ...(reference ? ['--reference', reference] : []),
+    '--',
+    submodulePath,
+  ]
+}
+
+async function initializeSubmodules(projectDirectory: string, worktreeDirectory: string): Promise<void> {
+  const submodulePaths = await listSubmodulePaths(worktreeDirectory)
+  for (const submodulePath of submodulePaths) {
+    const reference = await sourceSubmoduleReference(projectDirectory, submodulePath)
+    let referencedFailure: Error | undefined
+    if (reference) {
+      const args = submoduleUpdateArgs(submodulePath, reference)
+      const result = await runGit(worktreeDirectory, args, SUBMODULE_INIT_TIMEOUT_MS)
+      if (result.exitCode === 0) continue
+      referencedFailure = gitError(args, result)
+    }
+
+    const args = submoduleUpdateArgs(submodulePath)
+    const result = await runGit(worktreeDirectory, args, SUBMODULE_INIT_TIMEOUT_MS)
+    if (result.exitCode === 0) continue
+    const failure = gitError(args, result)
+    throw new Error(
+      `Submodule initialization failed for ${submodulePath}: ${failure.message}`
+        + (referencedFailure ? `; local reference attempt failed: ${referencedFailure.message}` : ''),
+      { cause: failure },
+    )
+  }
+}
+
+async function cleanupFailedWorktree(options: {
+  projectDirectory: string
+  directory: string
+  branch: string
+}): Promise<string[]> {
+  await runGit(options.projectDirectory, ['worktree', 'remove', '--force', options.directory])
+  const failures: string[] = []
+  await rm(options.directory, { recursive: true, force: true }).catch((error: unknown) => {
+    failures.push(error instanceof Error ? error.message : String(error))
+  })
+  await runGit(options.projectDirectory, ['worktree', 'prune'])
+  await runGit(options.projectDirectory, ['branch', '-D', options.branch])
+  await runGit(options.projectDirectory, ['worktree', 'prune'])
+
+  const branch = await runGit(options.projectDirectory, [
+    'show-ref',
+    '--verify',
+    '--quiet',
+    `refs/heads/${options.branch}`,
+  ])
+  if (branch.exitCode === 0) failures.push(`branch still exists: ${options.branch}`)
+
+  const worktrees = await runGit(options.projectDirectory, ['worktree', 'list', '--porcelain'])
+  if (worktrees.exitCode !== 0) {
+    failures.push(gitError(['worktree', 'list', '--porcelain'], worktrees).message)
+  } else {
+    const registered = worktrees.stdout
+      .split('\n')
+      .filter((line) => line.startsWith('worktree '))
+      .some((line) => path.resolve(line.slice('worktree '.length)) === path.resolve(options.directory))
+    if (registered) failures.push(`worktree is still registered: ${options.directory}`)
+  }
+  return failures
+}
+
 export async function createWorktree(options: {
   projectDirectory: string
   dataRoot: string
@@ -89,7 +263,9 @@ export async function createWorktree(options: {
   if (!branch) throw new Error('Worktree name has no valid letters or numbers')
   const branchCheck = await runGit(projectDirectory, ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`])
   if (branchCheck.exitCode === 0) throw new Error(`Branch already exists: ${branch}`)
-  const baseRef = options.baseRef || 'HEAD'
+  const baseRef = options.baseRef
+    ? await resolveBestBaseRef({ directory: projectDirectory, branch: options.baseRef })
+    : 'HEAD'
   await git(projectDirectory, ['rev-parse', '--verify', `${baseRef}^{commit}`])
   const directory = getManagedWorktreeDirectory({
     dataRoot: options.dataRoot,
@@ -99,6 +275,16 @@ export async function createWorktree(options: {
   await mkdir(path.dirname(directory), { recursive: true })
   await rm(directory, { recursive: true, force: true })
   await git(projectDirectory, ['worktree', 'add', '-b', branch, directory, baseRef])
+  try {
+    await initializeSubmodules(projectDirectory, directory)
+  } catch (error) {
+    const cleanupFailures = await cleanupFailedWorktree({ projectDirectory, directory, branch })
+    if (cleanupFailures.length > 0) {
+      const message = error instanceof Error ? error.message : String(error)
+      throw new Error(`${message}; cleanup failed: ${cleanupFailures.join('; ')}`, { cause: error })
+    }
+    throw error
+  }
   return { directory, branch, projectDirectory }
 }
 
@@ -118,6 +304,7 @@ export async function removeWorktree(worktree: CreatedWorktree): Promise<void> {
 export type MergeWorktreeResult =
   | { status: 'merged'; targetBranch: string; branch: string; commitCount: number; shortSha: string }
   | { status: 'conflict'; targetBranch: string; message: string }
+  | { status: 'nothing-to-merge'; targetBranch: string; branch: string }
 
 async function isRebaseInProgress(directory: string): Promise<boolean> {
   for (const name of ['rebase-merge', 'rebase-apply']) {
@@ -129,27 +316,60 @@ async function isRebaseInProgress(directory: string): Promise<boolean> {
   return false
 }
 
+async function checkedOutWorktreeForBranch(
+  projectDirectory: string,
+  branch: string,
+): Promise<string | undefined> {
+  const output = await git(projectDirectory, ['worktree', 'list', '--porcelain'])
+  let worktreeDirectory: string | undefined
+  for (const line of output.split('\n')) {
+    if (line.startsWith('worktree ')) {
+      worktreeDirectory = line.slice('worktree '.length)
+      continue
+    }
+    if (line === `branch refs/heads/${branch}`) return worktreeDirectory
+  }
+  return undefined
+}
+
+async function deleteBranchRef(
+  projectDirectory: string,
+  branch: string,
+  expectedHead: string,
+): Promise<void> {
+  await git(projectDirectory, ['update-ref', '-d', `refs/heads/${branch}`, expectedHead])
+}
+
 export async function mergeWorktree(options: {
   projectDirectory: string
   worktreeDirectory: string
   branch: string
   targetBranch?: string
 }): Promise<MergeWorktreeResult> {
-  const mainStatus = await git(options.projectDirectory, ['status', '--porcelain'])
-  if (mainStatus) throw new Error('Main worktree has uncommitted changes')
   const worktreeStatus = await git(options.worktreeDirectory, ['status', '--porcelain'])
   if (worktreeStatus) throw new Error('Worktree has uncommitted changes; commit them first')
   const currentBranch = await git(options.projectDirectory, ['branch', '--show-current'])
-  if (!currentBranch) throw new Error('Main worktree is detached; checkout merge target first')
+  if (!currentBranch && !options.targetBranch) {
+    throw new Error('Main worktree is detached; specify a merge target')
+  }
   const targetBranch = options.targetBranch || currentBranch
-  if (options.targetBranch) {
-    await git(options.projectDirectory, ['rev-parse', '--verify', `refs/heads/${targetBranch}`])
-    if (currentBranch !== targetBranch) await git(options.projectDirectory, ['checkout', targetBranch])
+  await git(options.projectDirectory, ['rev-parse', '--verify', `refs/heads/${targetBranch}`])
+  if (currentBranch === targetBranch) {
+    const mainStatus = await git(options.projectDirectory, ['status', '--porcelain'])
+    if (mainStatus) throw new Error('Main worktree has uncommitted changes')
+  } else {
+    const checkedOutAt = await checkedOutWorktreeForBranch(options.projectDirectory, targetBranch)
+    if (checkedOutAt) {
+      throw new Error(`Merge target ${targetBranch} is checked out at ${checkedOutAt}`)
+    }
   }
   const worktreeBranch = await git(options.worktreeDirectory, ['branch', '--show-current'])
+  if (!worktreeBranch) throw new Error('Worktree is detached; checkout its branch before merging')
   if (worktreeBranch && worktreeBranch !== options.branch) {
-    throw new Error(`Worktree branch changed: expected ${options.branch}, found ${worktreeBranch}`)
+      throw new Error(`Worktree branch changed: expected ${options.branch}, found ${worktreeBranch}`)
   }
+  const targetHead = await git(options.projectDirectory, ['rev-parse', `refs/heads/${targetBranch}`])
+  const worktreeHead = await git(options.worktreeDirectory, ['rev-parse', 'HEAD'])
   const countText = await git(options.worktreeDirectory, [
     'rev-list',
     '--count',
@@ -157,7 +377,9 @@ export async function mergeWorktree(options: {
   ])
   const commitCount = Number(countText)
   if (!Number.isFinite(commitCount) || commitCount < 1) {
-    throw new Error(`Nothing to merge into ${targetBranch}`)
+    await git(options.worktreeDirectory, ['checkout', '--detach', targetHead])
+    await deleteBranchRef(options.projectDirectory, options.branch, worktreeHead)
+    return { status: 'nothing-to-merge', targetBranch, branch: options.branch }
   }
   const rebase = await runGit(options.worktreeDirectory, ['rebase', targetBranch], 10 * 60_000)
   if (rebase.exitCode !== 0) {
@@ -170,9 +392,29 @@ export async function mergeWorktree(options: {
     }
     throw gitError(['rebase', targetBranch], rebase)
   }
-  await git(options.projectDirectory, ['merge', '--ff-only', options.branch])
-  const shortSha = await git(options.projectDirectory, ['rev-parse', '--short', 'HEAD'])
-  await git(options.worktreeDirectory, ['checkout', '--detach'])
-  await git(options.projectDirectory, ['branch', '-d', options.branch])
+  const rebasedHead = await git(options.worktreeDirectory, ['rev-parse', 'HEAD'])
+  if (currentBranch === targetBranch) {
+    await git(options.projectDirectory, ['merge', '--ff-only', options.branch])
+  } else {
+    const ancestor = await runGit(options.projectDirectory, [
+      'merge-base',
+      '--is-ancestor',
+      targetHead,
+      rebasedHead,
+    ])
+    if (ancestor.exitCode !== 0) {
+      throw new Error(`Rebased worktree is not a fast-forward of ${targetBranch}`)
+    }
+    await git(options.projectDirectory, [
+      'update-ref',
+      `refs/heads/${targetBranch}`,
+      rebasedHead,
+      targetHead,
+    ])
+  }
+  const mergedHead = await git(options.projectDirectory, ['rev-parse', `refs/heads/${targetBranch}`])
+  const shortSha = await git(options.projectDirectory, ['rev-parse', '--short', mergedHead])
+  await git(options.worktreeDirectory, ['checkout', '--detach', mergedHead])
+  await deleteBranchRef(options.projectDirectory, options.branch, rebasedHead)
   return { status: 'merged', targetBranch, branch: options.branch, commitCount, shortSha }
 }
