@@ -6,6 +6,13 @@ versioning once tagged releases begin.
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-07-19
+
+### Fixed
+
+- Made inherited-session and worktree-race tests independent of an existing
+  user-level Cordex configuration so clean CI homes exercise the intended logic.
+
 ## [0.1.4] - 2026-07-19
 
 ### Added

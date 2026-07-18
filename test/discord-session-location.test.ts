@@ -32,6 +32,7 @@ type InitialSessionLocation = {
 
 type InternalBot = {
   runs: Map<string, { typingTimer: NodeJS.Timeout }>
+  refreshProjectsSafely(): Promise<void>
   handleNewSessionCommand(interaction: ChatInputCommandInteraction): Promise<void>
   handleMergeWorktreeCommand(interaction: ChatInputCommandInteraction): Promise<void>
   createAutomaticWorktree(parentChannelId: string, sessionName: string): Promise<unknown>
@@ -113,6 +114,7 @@ test('/new-session in a thread inherits its working directory without claiming t
     new FakeCodex() as unknown as CodexAppServer,
   )
   const internal = bot as unknown as InternalBot
+  internal.refreshProjectsSafely = async () => undefined
   let automaticWorktrees = 0
   let threadName = ''
   let location: InitialSessionLocation | undefined
@@ -186,6 +188,7 @@ test('/merge-worktree cannot race a child session inheriting the same directory'
     new FakeCodex() as unknown as CodexAppServer,
   )
   const internal = bot as unknown as InternalBot
+  internal.refreshProjectsSafely = async () => undefined
   const sessionThreadStarted = deferred()
   const allowSessionThread = deferred()
   const createdThread = {
