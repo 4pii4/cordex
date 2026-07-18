@@ -1,9 +1,13 @@
-# Cordex
+<div align="center">
+  <h1>Cordex</h1>
+  <p>Run persistent OpenAI Codex sessions from Discord.</p>
+</div>
 
-Cordex runs persistent Codex sessions from Discord. A Discord channel maps to a
-local project, and each Discord thread stays attached to one Codex session.
-Responses, tool activity, approvals, and follow-up questions stream back to the
-place where the work was requested.
+Cordex turns Discord into a control surface for
+[OpenAI Codex](https://developers.openai.com/codex/cli/). Each Discord channel
+maps to a local project, and each thread is a persistent Codex session. Send a
+message and Codex can read, edit, test, and run commands on the machine hosting
+Cordex.
 
 > [!WARNING]
 > Cordex can read and modify local files, run shell commands, and—when explicitly
@@ -12,7 +16,62 @@ place where the work was requested.
 > default `workspace-write` sandbox with `on-request` approvals unless you fully
 > understand the consequences.
 
-## What Cordex provides
+## Quick Start
+
+Requires Node.js 22 or newer and Git.
+
+1. Install the Codex CLI, then authenticate it on the machine that will run
+   Cordex:
+
+   ```bash
+   npm install -g @openai/codex
+   codex login
+   codex --version
+   ```
+
+2. Create a Discord application and collect its bot token, application ID, and
+   server ID using the [Discord bot setup](#discord-bot-setup) below.
+
+3. Start Cordex with one command:
+
+   ```bash
+   npx -y @4pii4/cordex@latest
+   ```
+
+   On the first run, Cordex asks for the three Discord values, saves its config,
+   registers the slash commands, and starts the bot. Keep this process running.
+
+4. As the Discord server owner, open the managed general channel (`#cordex` when
+   the bot is named Cordex) and send a task. Cordex creates a thread for the new
+   Codex session. Add an existing repository with `/add-project` or from another
+   terminal:
+
+   ```bash
+   npx -y @4pii4/cordex@latest project add /absolute/path/to/project
+   ```
+
+For a permanent `cordex` command, install the package globally:
+
+```bash
+npm install -g @4pii4/cordex
+cordex
+```
+
+## What is Cordex?
+
+Cordex maps Discord's project and conversation structure directly onto the local
+Codex runtime:
+
+| Discord | Local Codex runtime |
+| --- | --- |
+| Project channel | Local project directory |
+| Thread in that channel | Persistent Codex session |
+
+Send a message in a project channel to start a session thread. Continue chatting
+in that thread to keep working in the same Codex context. Switch projects by
+switching channels, and switch tasks by switching threads.
+
+## Core Features
 
 - Remote Codex prompting from Discord with persistent, resumable sessions
 - Live responses, compact tool activity, approvals, and structured user questions
@@ -22,17 +81,9 @@ place where the work was requested.
 - Native Codex skill invocation plus MCP, authentication, account, rate-limit, and context diagnostics
 - Reply-aware text and image input, code review, diffs, rollback, and controlled shell execution
 
-The core mapping is deliberately simple:
+## Setup
 
-| Discord | Local Codex runtime |
-| --- | --- |
-| Project channel | Local project directory |
-| Thread in that channel | Persistent Codex session |
-
-Send a message in a project channel to start a session thread. Continue chatting
-in the thread to keep working in the same Codex context.
-
-## Requirements
+### Requirements
 
 - Node.js 22 or newer
 - A Codex CLI installation with app-server support
@@ -50,7 +101,7 @@ codex --version
 Cordex uses Codex's app-server interface, which is currently experimental. A
 Codex CLI update can therefore require a corresponding Cordex update.
 
-## Discord setup
+### Discord bot setup
 
 1. Create an application in the [Discord Developer Portal](https://discord.com/developers/applications).
 2. Open **Bot**, create the bot user, and enable the **Message Content Intent**.
@@ -65,8 +116,14 @@ Codex CLI update can therefore require a corresponding Cordex update.
    - Manage Channels
    - Manage Roles (shown as **Manage Permissions** in some Discord clients)
    - Read Message History
-   - Add Reactions
-   - Use Application Commands
+   - Attach Files
+
+   The combined permission integer is `326686051344`. To skip selecting each
+   permission manually, replace `APPLICATION_ID` in this invite URL:
+
+   ```text
+   https://discord.com/oauth2/authorize?client_id=APPLICATION_ID&permissions=326686051344&scope=bot%20applications.commands
+   ```
 5. Install the bot into the intended Discord server.
 6. Copy the bot token, application ID, and server ID for `cordex init`. Enable
    Discord Developer Mode if you need to copy the server ID.
@@ -74,7 +131,7 @@ Codex CLI update can therefore require a corresponding Cordex update.
 Treat the bot token like a password. Never commit it, paste it into a Discord
 channel, or expose it in logs.
 
-## Install
+### Install
 
 Install the published CLI globally:
 
@@ -91,19 +148,12 @@ npx -y @4pii4/cordex@latest init
 npx -y @4pii4/cordex@latest start
 ```
 
-For local source development from a checkout of this repository:
+The remaining examples use the global `cordex` command for brevity. Without a
+global install, replace it with `npx -y @4pii4/cordex@latest`.
 
-```bash
-npm ci
-npm run build
-npm link
-```
+### Initialize and run
 
-`npm link` makes the `cordex` command available on the current machine.
-
-## Quick start
-
-Write the initial configuration, validate the local setup, and start the bot:
+If you installed Cordex globally, the explicit setup flow is:
 
 ```bash
 cordex init
@@ -176,9 +226,29 @@ cordex start --verbose
 Verbose logs can include prompts, tool calls, commands, file paths, and Codex
 protocol traffic. Store and share them accordingly.
 
-## Command overview
+## Commands
 
 Slash commands are registered in the configured Discord server.
+
+| Command | Description |
+| --- | --- |
+| `/add-project` | Map an existing local repository to a Discord channel |
+| `/new-session` | Start another session, inheriting the current checkout when used in a thread |
+| `/resume` | Reopen a previous active or archived Codex session |
+| `/abort` | Stop the current Codex turn |
+| `/model` | Change the model and reasoning settings for a channel or session |
+| `/permissions` | List or select a Codex permission profile for the current session |
+| `/queue` | Run a prompt after the current turn finishes |
+| `/btw` | Fork the current context into a side session |
+| `/new-worktree` | Fork the current session into an isolated Git worktree |
+| `/merge-worktree` | Merge a completed worktree back into its target branch |
+| `/diff` | Show or attach the complete current Git patch |
+| `/status` | Show the active project, session, model, permissions, and queue state |
+
+<details>
+<summary>Full command inventory and behavior</summary>
+
+### Commands by area
 
 | Area | Commands |
 | --- | --- |
@@ -285,6 +355,19 @@ archived, or starting session still references it. A persisted removal intent le
 startup finish an interruption between Git deletion and the final state update, after
 which the session reloads at the mapped project root.
 
+</details>
+
+## Troubleshooting
+
+- Run `cordex doctor` to confirm the config file, Codex executable, and mapped
+  project directories can be read.
+- Run `codex login` again if Codex itself reports an authentication failure.
+- Rerun `cordex init` to update the Discord bot token, application ID, or server ID.
+- Check that **Message Content Intent** is enabled and the bot has every permission
+  listed in [Discord bot setup](#discord-bot-setup).
+- Run `cordex start --verbose` when diagnosing startup, Discord, or Codex app-server
+  failures. Verbose logs can contain prompts, commands, and local file paths.
+
 ## Configuration
 
 The default home is `~/.cordex`. Cordex stores its configuration in
@@ -326,7 +409,9 @@ Only one Cordex runtime may use a `CORDEX_HOME` at a time. A process-lifetime
 `runtime.lock` fails fast on duplicate starts and is reclaimed when its recorded
 process no longer exists.
 
-Environment variables override the corresponding configuration or runtime path:
+Environment variables override the corresponding configuration or runtime path.
+Credential overrides cannot bootstrap a missing config file; create one with
+`cordex init` or create the file referenced by `CORDEX_CONFIG` first.
 
 | Variable | Purpose |
 | --- | --- |
@@ -381,7 +466,10 @@ Install dependencies and run the build plus local test suite:
 ```bash
 npm ci
 npm run check
+npm link
 ```
+
+`npm link` makes the checkout's `cordex` command available on the current machine.
 
 The live suites launch real Codex integrations and may create Discord messages,
 channels, sessions, worktrees, files, or account flows:

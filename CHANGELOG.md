@@ -8,6 +8,13 @@ versioning once tagged releases begin.
 
 ## [0.1.5] - 2026-07-19
 
+### Changed
+
+- Reworked the README around a one-command npm quick start, concise common-command
+  guidance, corrected Discord permissions, and collapsed advanced runtime details.
+- Replaced the init-only command hint with invocation-neutral startup guidance
+  that is also accurate during a bare `npx` first run.
+
 ### Fixed
 
 - Made inherited-session and worktree-race tests independent of an existing

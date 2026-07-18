@@ -95,7 +95,7 @@ async function init(): Promise<void> {
     })
     console.log(`Saved ${getConfigPath()}`)
     if (guildChanged) console.log('Discord server changed; cleared old mappings and session state.')
-    console.log('Run: cordex')
+    console.log('Cordex starts when invoked without a subcommand.')
   } finally {
     prompt.close()
   }
