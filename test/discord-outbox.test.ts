@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -8,6 +9,11 @@ import type { ThreadChannel } from 'discord.js'
 import type { CodexAppServer } from '../src/codex-app-server.js'
 import { emptyState, loadState } from '../src/config.js'
 import { CordexDiscordBot } from '../src/discord-bot.js'
+import {
+  createDiscordOutboxEntries,
+  discordOutboxNonce,
+  parseDiscordOutbox,
+} from '../src/discord-outbox.js'
 import {
   formatAssistantText,
   splitMarkdownForDiscord,
@@ -148,6 +154,32 @@ async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<voi
   }
 }
 
+test('Discord outbox nonces fit the message API limit', () => {
+  const nonce = discordOutboxNonce('durable-output-key')
+
+  assert.equal(nonce.length, 25)
+})
+
+test('persisted legacy outbox nonces are normalized without dropping output', () => {
+  const [entry] = createDiscordOutboxEntries({
+    discordThreadId: 'discord-thread',
+    codexThreadId: 'codex-thread',
+    turnId: 'turn',
+    itemKey: 'message',
+    chunks: ['Pending output.'],
+    createdAt: new Date(0).toISOString(),
+  })
+  assert.ok(entry)
+  const legacyNonce = `cx${createHash('sha256').update(entry.key).digest('hex').slice(0, 30)}`
+
+  const parsed = parseDiscordOutbox([{ ...entry, nonce: legacyNonce }])
+
+  assert.equal(parsed.length, 1)
+  assert.equal(parsed[0]?.content, entry.content)
+  assert.equal(parsed[0]?.nonce, discordOutboxNonce(entry.key))
+  assert.notEqual(parsed[0]?.nonce, legacyNonce)
+})
+
 test('completed output is persisted before send and duplicate item notifications do not resend', async () => {
   await withFixture(async ({ directory, state, session }) => {
     const payloads: Array<Exclude<SendPayload, string>> = []
@@ -189,7 +221,7 @@ test('completed output is persisted before send and duplicate item notifications
       assert.equal(payloads[0]?.content, 'Durable response.')
       assert.equal(payloads[0]?.enforceNonce, true)
       assert.equal(typeof payloads[0]?.nonce, 'string')
-      assert.ok(String(payloads[0]?.nonce).length <= 32)
+      assert.ok(String(payloads[0]?.nonce).length <= 25)
       assert.deepEqual(state.discordOutbox, [])
       assert.equal(state.discordOutboxDeliveredKeys?.length, 2)
       const deliveredKey = state.discordOutboxDeliveredKeys?.find((key) => key.includes('chunk:0')) || ''
@@ -288,7 +320,7 @@ test('a crash after a partial chunk send recovers only unsent chunks with stable
       )
       assert.equal(recoveredPayloads[0]?.nonce, failedNonce)
       assert.ok(recoveredPayloads.every((payload) => payload.enforceNonce === true))
-      assert.ok(recoveredPayloads.every((payload) => String(payload.nonce).length <= 32))
+      assert.ok(recoveredPayloads.every((payload) => String(payload.nonce).length <= 25))
       assert.deepEqual(recoveredState.discordOutbox, [])
       assert.equal(recoveredState.discordOutboxDeliveredKeys?.length, expectedChunks.length + 1)
       assert.deepEqual((await loadState()).discordOutbox, [])

@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto'
 import type { CordexState, DiscordOutboxEntry } from './types.js'
 
 export const maxDiscordOutboxDeliveredKeys = 2_048
+const maxDiscordOutboxNonceLength = 25
+const legacyDiscordOutboxNonceLength = 32
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -35,8 +37,12 @@ export function discordOutboxOutputKey(options: {
   ].join('|')
 }
 
+function discordOutboxNonceForLength(key: string, length: number): string {
+  return `cx${createHash('sha256').update(key).digest('hex').slice(0, length - 2)}`
+}
+
 export function discordOutboxNonce(key: string): string {
-  return `cx${createHash('sha256').update(key).digest('hex').slice(0, 30)}`
+  return discordOutboxNonceForLength(key, maxDiscordOutboxNonceLength)
 }
 
 export function createDiscordOutboxEntries(options: {
@@ -94,21 +100,25 @@ export function parseDiscordOutbox(
       typeof raw.content !== 'string' ||
       typeof raw.nonce !== 'string' ||
       raw.nonce.length === 0 ||
-      raw.nonce.length > 32 ||
+      raw.nonce.length > legacyDiscordOutboxNonceLength ||
       typeof raw.createdAt !== 'string'
     ) return []
     const entry = raw as unknown as DiscordOutboxEntry
     const expectedKey = discordOutboxKey(entry)
     const outputKey = discordOutboxOutputKey(entry)
+    const expectedNonce = discordOutboxNonce(expectedKey)
     if (
       entry.key !== expectedKey ||
-      entry.nonce !== discordOutboxNonce(expectedKey) ||
+      (
+        entry.nonce !== expectedNonce &&
+        entry.nonce !== discordOutboxNonceForLength(expectedKey, legacyDiscordOutboxNonceLength)
+      ) ||
       delivered.has(entry.key) ||
       delivered.has(outputKey) ||
       pending.has(entry.key)
     ) return []
     pending.add(entry.key)
-    return [{ ...entry }]
+    return [{ ...entry, nonce: expectedNonce }]
   })
 }
 

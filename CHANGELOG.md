@@ -6,6 +6,13 @@ versioning once tagged releases begin.
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-08-01
+
+### Fixed
+
+- Kept durable Discord output within the 25-character nonce limit and normalized
+  pending entries written with the legacy 32-character nonce format.
+
 ## [0.1.5] - 2026-07-19
 
 ### Changed
