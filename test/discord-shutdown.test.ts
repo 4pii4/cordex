@@ -25,7 +25,7 @@ type InternalBot = {
   state: CordexState
   projectMutationQueue: KeyedSerialQueue
   discordOutboxStateQueue: KeyedSerialQueue
-  scheduler: { start(): void }
+  scheduler: { start(): void; stopAndDrain(): Promise<void> }
   pruneAttachmentCache(): Promise<void>
   handleAutocomplete(interaction: AutocompleteInteraction): Promise<void>
   enqueueNotification(notification: ServerNotification, generation: number): Promise<void>
@@ -326,4 +326,66 @@ test('stop drains title retry work whose timer already fired', async () => {
   assert.equal(internal.pendingBackgroundWork.size, 0)
   assert.equal(codex.closeCalls, 1)
   assert.equal(destroyed(), 1)
+})
+
+test('stop attempts every teardown leg when scheduler shutdown fails', async () => {
+  const { bot, codex, internal, destroyed } = fixture()
+  internal.scheduler.stopAndDrain = async () => {
+    throw new Error('fixture scheduler shutdown failed')
+  }
+
+  await assert.rejects(bot.stop(), /scheduler shutdown failed/)
+
+  assert.equal(codex.closeCalls, 1)
+  assert.equal(destroyed(), 1)
+})
+
+test('stop destroys Discord when Codex close fails', async () => {
+  const codex = new ShutdownCodex(() => {
+    throw new Error('fixture Codex close failed')
+  })
+  const { bot, destroyed } = fixture(codex)
+
+  await assert.rejects(bot.stop(), /Codex close failed/)
+
+  assert.equal(codex.closeCalls, 1)
+  assert.equal(destroyed(), 1)
+})
+
+test('verbose mode logs Discord lifecycle events and warnings with structured context', async () => {
+  const lines: string[] = []
+  const originalError = console.error
+  console.error = (...values: unknown[]) => {
+    lines.push(values.map(String).join(' '))
+  }
+  const codex = new ShutdownCodex()
+  const bot = new CordexDiscordBot(
+    makeConfig(),
+    makeState(),
+    codex as unknown as CodexAppServer,
+    { verbose: true },
+  )
+
+  try {
+    const emitter = bot.client as unknown as EventEmitter
+    emitter.emit(Events.Warn, 'fixture gateway warning')
+    emitter.emit(Events.ShardReconnecting, 2)
+    await bot.stop()
+
+    const records = lines.flatMap((line) => {
+      try {
+        return [JSON.parse(line) as { component?: string; event?: string; level?: string }]
+      } catch {
+        return []
+      }
+    }).filter((record) => record.component === 'discord-bot')
+    assert.ok(records.some((record) =>
+      record.event === 'discord_warning' && record.level === 'warn'))
+    assert.ok(records.some((record) => record.event === 'shard_reconnecting'))
+    assert.ok(records.some((record) => record.event === 'shutdown_start'))
+    assert.ok(records.some((record) => record.event === 'shutdown_complete'))
+  } finally {
+    console.error = originalError
+    bot.client.destroy()
+  }
 })

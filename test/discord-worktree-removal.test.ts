@@ -31,6 +31,12 @@ class WorktreeCodex extends EventEmitter {
 }
 
 type InternalBot = {
+  codexEventQueue: {
+    run<T>(key: string, task: () => Promise<T>): Promise<T>
+  }
+  promptQueue: {
+    run<T>(key: string, task: () => Promise<T>): Promise<T>
+  }
   loadedThreads: Set<string>
   pendingSessionDirectoryReservations: Map<string, number>
   handleMergeWorktreeCommand(interaction: ChatInputCommandInteraction): Promise<void>
@@ -193,6 +199,57 @@ test('/merge-worktree recovers when Git succeeded but the merged marker was not 
     await rm(recoveryHome, { recursive: true, force: true })
     await rm(fixture.root, { recursive: true, force: true })
     await rm(fixture.dataRoot, { recursive: true, force: true })
+  }
+})
+
+test('/delete-worktree takes the Codex event lock before the prompt lock', async () => {
+  const current: SessionState = {
+    discordThreadId: 'thread-1',
+    parentChannelId: 'parent-1',
+    directory: process.cwd(),
+    codexThreadId: 'codex-thread-1',
+    updatedAt: new Date(0).toISOString(),
+  }
+  const state = emptyState()
+  state.sessions[current.discordThreadId] = current
+  const bot = new CordexDiscordBot(
+    config(process.cwd()),
+    state,
+    new WorktreeCodex() as unknown as CodexAppServer,
+  )
+  const internal = bot as unknown as InternalBot
+  let releaseCodex: () => void = () => undefined
+  let markCodexHeld!: () => void
+  const codexHeld = new Promise<void>((resolve) => { markCodexHeld = resolve })
+  const heldCodexQueue = internal.codexEventQueue.run(current.codexThreadId, async () => {
+    markCodexHeld()
+    await new Promise<void>((resolve) => { releaseCodex = resolve })
+  })
+
+  try {
+    await codexHeld
+    const deletion = internal.handleDeleteWorktreeCommand(interaction(current, []))
+    deletion.catch(() => undefined)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+
+    let promptProbeFinished = false
+    const promptProbe = internal.promptQueue.run(current.discordThreadId, async () => {
+      promptProbeFinished = true
+    })
+    const timeout = new Promise<void>((_resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('prompt queue remained locked')), 500)
+      timer.unref()
+    })
+    await Promise.race([promptProbe, timeout])
+    assert.equal(promptProbeFinished, true)
+
+    releaseCodex()
+    await heldCodexQueue
+    await assert.rejects(deletion, /not associated with a worktree/)
+  } finally {
+    releaseCodex()
+    await heldCodexQueue.catch(() => undefined)
+    bot.client.destroy()
   }
 })
 

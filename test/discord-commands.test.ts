@@ -1,6 +1,30 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { buildSlashCommands } from '../src/discord-commands.js'
+import { buildSlashCommands, discordDescription } from '../src/discord-commands.js'
+
+test('Discord command descriptions are centrally limited to 100 characters', () => {
+  assert.equal(discordDescription('short description'), 'short description')
+  assert.equal(discordDescription('x'.repeat(101)), 'x'.repeat(100))
+
+  const descriptions: string[] = []
+  const visit = (entry: {
+    description?: string | undefined
+    options?: unknown[] | undefined
+  }) => {
+    if (entry.description) descriptions.push(entry.description)
+    for (const option of entry.options || []) {
+      if (typeof option === 'object' && option !== null) {
+        visit(option as {
+          description?: string | undefined
+          options?: unknown[] | undefined
+        })
+      }
+    }
+  }
+  for (const command of buildSlashCommands()) visit(command)
+  assert.ok(descriptions.length > 0)
+  assert.ok(descriptions.every((description) => description.length <= 100))
+})
 
 test('Discord command registry includes core and ported controls', () => {
   const names = buildSlashCommands().map((command) => command.name)
@@ -102,4 +126,13 @@ test('Discord command registry includes core and ported controls', () => {
   assert.match(legacyProject?.description || '', /Legacy/)
   const createProject = buildSlashCommands().find((command) => command.name === 'create-new-project')
   assert.match(createProject?.description || '', /Create a git project/)
+
+  for (const [commandName, optionName] of [
+    ['new-worktree', 'base-branch'],
+    ['merge-worktree', 'target-branch'],
+  ] as const) {
+    const command = buildSlashCommands().find((entry) => entry.name === commandName)
+    const branch = command?.options?.find((option) => option.name === optionName)
+    assert.ok(branch && 'autocomplete' in branch && branch.autocomplete)
+  }
 })

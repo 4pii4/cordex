@@ -101,6 +101,10 @@ test('config and session state round trip', async () => {
         kind: 'archive',
         requestedAt: new Date(0).toISOString(),
       },
+      abortIntent: {
+        requestedAt: new Date(1).toISOString(),
+        turnId: 'turn',
+      },
       activeTurnId: 'turn',
       workspaceRoots: [path.join(directory, 'extra')],
       permissions: ':read-only',
@@ -289,12 +293,22 @@ test('state loading accepts only exact session lifecycle intent variants', async
             directory: '/untrusted',
           },
         },
+        deletion: {
+          ...baseSession,
+          discordThreadId: 'thread-deletion',
+          codexThreadId: 'codex-thread-deletion',
+          lifecycleIntent: {
+            kind: 'delete-thread',
+            requestedAt: '2026-07-19T03:04:05.006Z',
+            remoteAction: 'archive',
+          },
+        },
         badKind: {
           ...baseSession,
           discordThreadId: 'thread-bad-kind',
           codexThreadId: 'codex-thread-bad-kind',
           lifecycleIntent: {
-            kind: 'delete-thread',
+            kind: 'unknown',
             requestedAt: '2026-07-19T03:04:05.006Z',
           },
         },
@@ -319,8 +333,118 @@ test('state loading accepts only exact session lifecycle intent variants', async
       kind: 'remove-worktree',
       requestedAt: '2026-07-19T02:03:04.005Z',
     })
+    assert.deepEqual(state.sessions.deletion?.lifecycleIntent, {
+      kind: 'delete-thread',
+      requestedAt: '2026-07-19T03:04:05.006Z',
+      remoteAction: 'archive',
+    })
     assert.equal(state.sessions.badKind?.lifecycleIntent, undefined)
     assert.equal(state.sessions.badTimestamp?.lifecycleIntent, undefined)
+  } finally {
+    if (oldHome === undefined) delete process.env.CORDEX_HOME
+    else process.env.CORDEX_HOME = oldHome
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('state loading sanitizes guild-scoped root channel tombstones', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'cordex-root-tombstones-'))
+  const oldHome = process.env.CORDEX_HOME
+  process.env.CORDEX_HOME = directory
+  try {
+    await writeFile(getStatePath(), JSON.stringify({
+      rootChannelTombstones: {
+        guild: {
+          channelId: 'deleted-root',
+          projectDirectory: '/tmp/cordex-root',
+          deletedAt: '2026-08-01T00:00:00.000Z',
+          ignored: true,
+        },
+        badTimestamp: {
+          channelId: 'deleted-root-2',
+          projectDirectory: '/tmp/cordex-root-2',
+          deletedAt: 'invalid',
+        },
+        badShape: 'deleted-root-3',
+      },
+    }))
+
+    const state = await loadState()
+    assert.deepEqual(state.rootChannelTombstones, {
+      guild: {
+        channelId: 'deleted-root',
+        projectDirectory: path.resolve('/tmp/cordex-root'),
+        deletedAt: '2026-08-01T00:00:00.000Z',
+      },
+    })
+  } finally {
+    if (oldHome === undefined) delete process.env.CORDEX_HOME
+    else process.env.CORDEX_HOME = oldHome
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('state loading accepts only valid session abort intents', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'cordex-abort-state-'))
+  const oldHome = process.env.CORDEX_HOME
+  process.env.CORDEX_HOME = directory
+  const baseSession = {
+    discordThreadId: 'thread',
+    parentChannelId: 'channel',
+    directory,
+    codexThreadId: 'codex-thread',
+    updatedAt: new Date(0).toISOString(),
+  }
+  try {
+    await writeFile(getStatePath(), JSON.stringify({
+      sessions: {
+        pending: {
+          ...baseSession,
+          abortIntent: {
+            requestedAt: '2026-07-19T01:02:03.004Z',
+            turnId: 'turn-1',
+            phase: 'untrusted-extra',
+          },
+        },
+        pendingStart: {
+          ...baseSession,
+          discordThreadId: 'thread-pending-start',
+          codexThreadId: 'codex-thread-pending-start',
+          abortIntent: {
+            requestedAt: '2026-07-19T02:03:04.005Z',
+          },
+        },
+        badTimestamp: {
+          ...baseSession,
+          discordThreadId: 'thread-bad-time',
+          codexThreadId: 'codex-thread-bad-time',
+          abortIntent: {
+            requestedAt: 'not-a-date',
+            turnId: 'turn-2',
+          },
+        },
+        badTurn: {
+          ...baseSession,
+          discordThreadId: 'thread-bad-turn',
+          codexThreadId: 'codex-thread-bad-turn',
+          abortIntent: {
+            requestedAt: '2026-07-19T03:04:05.006Z',
+            turnId: '',
+          },
+        },
+      },
+    }))
+
+    const state = await loadState()
+    assert.deepEqual(state.sessions.pending?.abortIntent, {
+      requestedAt: '2026-07-19T01:02:03.004Z',
+      turnId: 'turn-1',
+    })
+    assert.deepEqual(state.sessions.pendingStart?.abortIntent, {
+      requestedAt: '2026-07-19T02:03:04.005Z',
+    })
+    assert.equal(state.sessions.badTimestamp?.abortIntent, undefined)
+    assert.equal(state.sessions.badTurn?.abortIntent, undefined)
   } finally {
     if (oldHome === undefined) delete process.env.CORDEX_HOME
     else process.env.CORDEX_HOME = oldHome

@@ -51,6 +51,7 @@ export function createDiscordOutboxEntries(options: {
   turnId: string
   itemKey: string
   chunks: string[]
+  suppressNotifications: boolean
   createdAt?: string
 }): DiscordOutboxEntry[] {
   const createdAt = options.createdAt || new Date().toISOString()
@@ -67,6 +68,7 @@ export function createDiscordOutboxEntries(options: {
       key,
       ...identity,
       content,
+      suppressNotifications: options.suppressNotifications,
       nonce: discordOutboxNonce(key),
       createdAt,
     }
@@ -98,6 +100,7 @@ export function parseDiscordOutbox(
       !Number.isSafeInteger(raw.chunkIndex) ||
       Number(raw.chunkIndex) < 0 ||
       typeof raw.content !== 'string' ||
+      (raw.suppressNotifications !== undefined && typeof raw.suppressNotifications !== 'boolean') ||
       typeof raw.nonce !== 'string' ||
       raw.nonce.length === 0 ||
       raw.nonce.length > legacyDiscordOutboxNonceLength ||
@@ -118,7 +121,11 @@ export function parseDiscordOutbox(
       pending.has(entry.key)
     ) return []
     pending.add(entry.key)
-    return [{ ...entry, nonce: expectedNonce }]
+    return [{
+      ...entry,
+      suppressNotifications: raw.suppressNotifications === true,
+      nonce: expectedNonce,
+    }]
   })
 }
 

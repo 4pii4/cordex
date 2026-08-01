@@ -23,6 +23,10 @@ import type {
 class FakeCodex extends EventEmitter {
   readonly responses: Array<{ id: string | number; result: unknown }> = []
   readonly interrupts: Array<{ threadId: string; turnId: string }> = []
+  runtime: { status: 'active'; activeTurnId: string } | { status: 'idle' } = {
+    status: 'active',
+    activeTurnId: 'turn-1',
+  }
 
   respond(id: string | number, result: unknown): void {
     this.responses.push({ id, result })
@@ -30,6 +34,15 @@ class FakeCodex extends EventEmitter {
 
   async interruptTurn(threadId: string, turnId: string): Promise<void> {
     this.interrupts.push({ threadId, turnId })
+    this.runtime = { status: 'idle' }
+  }
+
+  async getThreadRuntimeState() {
+    return this.runtime
+  }
+
+  async getThreadGoal(): Promise<null> {
+    return null
   }
 }
 
@@ -55,10 +68,12 @@ type InternalBot = {
   approvals: Map<string, unknown>
   pendingActionButtons: Map<string, unknown>
   pendingUserInputs: Map<string, unknown>
+  pendingMcpElicitations: Map<string, unknown>
   pendingRequestControls: Map<string, unknown>
   handleServerRequest(request: ServerRequest): Promise<void>
   handleNotification(notification: ServerNotification): Promise<void>
   handleAbortCommand(interaction: ChatInputCommandInteraction): Promise<void>
+  prepareSessionForUserPrompt(session: SessionState, channel: ThreadChannel): Promise<void>
   requireAccess(interaction: ButtonInteraction): Promise<boolean>
   handleButton(interaction: ButtonInteraction): Promise<void>
   onTurnCompleted(run: unknown, params: JsonObject): Promise<void>
@@ -262,6 +277,79 @@ function actionButtonsRequest(id: string | number): ServerRequest {
     },
   }
 }
+
+function mcpElicitationRequest(id: string | number): ServerRequest {
+  return {
+    id,
+    method: 'mcpServer/elicitation/request',
+    params: {
+      threadId: 'codex-thread-1',
+      turnId: 'turn-1',
+      serverName: 'fixture',
+      mode: 'form',
+      message: 'Provide a value?',
+      requestedSchema: {
+        type: 'object',
+        properties: {
+          value: { type: 'string', title: 'Value' },
+        },
+      },
+    },
+  }
+}
+
+test('new user prompt aborts blocking controls and dismisses every interactive UI', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'cordex-request-replacement-'))
+  const oldHome = process.env.CORDEX_HOME
+  process.env.CORDEX_HOME = home
+  const { bot, internal, codex, session, channel, messages, typingTimer } = makeHarness()
+  try {
+    await internal.handleServerRequest(approvalRequest('approval-replaced'))
+    await internal.handleServerRequest(userInputRequest('input-replaced'))
+    await internal.handleServerRequest(mcpElicitationRequest('mcp-replaced'))
+    await internal.handleServerRequest(actionButtonsRequest('action-replaced'))
+
+    await internal.prepareSessionForUserPrompt(session, channel)
+
+    assert.deepEqual(codex.interrupts, [{
+      threadId: session.codexThreadId,
+      turnId: 'turn-1',
+    }])
+    assert.deepEqual(codex.responses.map((response) => response.id), ['action-replaced'])
+    assert.equal(session.abortIntent, undefined)
+    assert.equal(session.activeTurnId, undefined)
+    assert.equal(internal.approvals.size, 0)
+    assert.equal(internal.pendingUserInputs.size, 0)
+    assert.equal(internal.pendingMcpElicitations.size, 0)
+    assert.equal(internal.pendingActionButtons.size, 0)
+    assert.equal(internal.pendingRequestControls.size, 0)
+    assert.ok(messages.length >= 4)
+    assert.equal(messages.every((message) => message.edits.at(-1)?.components.length === 0), true)
+  } finally {
+    clearInterval(typingTimer)
+    bot.client.destroy()
+    if (oldHome === undefined) delete process.env.CORDEX_HOME
+    else process.env.CORDEX_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('new user prompt cancels action buttons without aborting the turn', async () => {
+  const { bot, internal, codex, session, channel, typingTimer } = makeHarness()
+  try {
+    await internal.handleServerRequest(actionButtonsRequest('action-only'))
+
+    await internal.prepareSessionForUserPrompt(session, channel)
+
+    assert.deepEqual(codex.interrupts, [])
+    assert.deepEqual(codex.responses.map((response) => response.id), ['action-only'])
+    assert.equal(session.activeTurnId, 'turn-1')
+    assert.equal(internal.pendingActionButtons.size, 0)
+  } finally {
+    clearInterval(typingTimer)
+    bot.client.destroy()
+  }
+})
 
 test('serverRequest/resolved retires every pending Discord control without responding', async () => {
   const { bot, internal, codex, messages, typingTimer } = makeHarness()

@@ -23,6 +23,7 @@ import type {
   CordexState,
   QueuedPrompt,
   ServerNotification,
+  ServerRequest,
   SessionState,
   UserInput,
 } from '../src/types.js'
@@ -45,6 +46,7 @@ type InternalRun = {
 }
 
 type InternalBot = {
+  approvals: Map<string, unknown>
   blockedQueuedSourceThreads: Set<string>
   codexRecoveryPromise: Promise<void> | undefined
   pendingCodexDeletionCleanups: Set<Promise<void>>
@@ -74,10 +76,12 @@ type InternalBot = {
   enqueuePrompt(threadId: string, prompt: QueuedPrompt): Promise<number>
   handleClearQueueCommand(interaction: ChatInputCommandInteraction): Promise<void>
   handleMessage(message: DiscordMessage): Promise<void>
+  handleServerRequest(request: ServerRequest): Promise<void>
   handleNotification(notification: ServerNotification): Promise<void>
   handleResumeCommand(interaction: ChatInputCommandInteraction): Promise<void>
   handleStatusCommand(interaction: ChatInputCommandInteraction): Promise<void>
   memberAllowed(userId: string): Promise<boolean>
+  prepareSessionForUserPrompt(session: SessionState, channel: ThreadChannel): Promise<void>
   reconcilePersistedQueuedSources(): Promise<void>
   recoverPersistedPrompts(session: SessionState, channel: ThreadChannel): Promise<void>
   refreshProjectsSafely(): Promise<void>
@@ -88,6 +92,7 @@ type InternalBot = {
     allowWithoutGoal: boolean,
     knownGoalStatus?: string,
   ): void
+  startRun(session: SessionState, channel: ThreadChannel): InternalRun
   synchronizeCodexThreadTitle(threadId: string, value: string): Promise<string>
   synchronizeThreadTitle(
     session: SessionState,
@@ -156,6 +161,20 @@ class ResumeRecoveryCodex extends RecoveryCodex {
       name: 'Ingress recovery session',
       turns: [],
     }
+  }
+}
+
+class FailedInteractiveAbortCodex extends RecoveryCodex {
+  readonly responses: Array<{ id: string | number; result: unknown }> = []
+  readonly interrupts: Array<{ threadId: string; turnId: string }> = []
+
+  respond(id: string | number, result: unknown): void {
+    this.responses.push({ id, result })
+  }
+
+  async interruptTurn(threadId: string, turnId: string): Promise<void> {
+    this.interrupts.push({ threadId, turnId })
+    throw new Error('interrupt transport unavailable')
   }
 }
 
@@ -524,7 +543,10 @@ test('direct ledger entries are hidden from queued position, status, and clear o
       assert.match(replyContent(replies.shift()), /Queue: 1/)
 
       await fixture.internal.handleClearQueueCommand(makeCommandInteraction(channel, replies, 1))
-      assert.equal(replyContent(replies.shift()), 'Cleared queued message 1.')
+      assert.equal(
+        replyContent(replies.shift()),
+        'Cleared 1 queued message:\n1. First queued.',
+      )
       assert.deepEqual(fixture.state.queues[channel.id], [direct])
 
       assert.equal(await fixture.internal.enqueuePrompt(
@@ -537,8 +559,46 @@ test('direct ledger entries are hidden from queued position, status, and clear o
       ), 2)
       await fixture.internal.handleClearQueueCommand(makeCommandInteraction(channel, replies))
 
-      assert.equal(replyContent(replies.shift()), 'Cleared 2 queued messages.')
+      assert.equal(
+        replyContent(replies.shift()),
+        'Cleared 2 queued messages:\n1. Second queued.\n2. Third queued.',
+      )
       assert.deepEqual(fixture.state.queues[channel.id], [direct])
+    } finally {
+      clearRunTimers(fixture.internal)
+      fixture.bot.client.destroy()
+    }
+  })
+})
+
+test('clear-queue reply stays bounded and preserves multiline prompt order', async () => {
+  await withTemporaryHome(async (directory) => {
+    const fixture = makeFixture(directory, [
+      makePrompt({
+        id: 'clear-long-one',
+        text: `First line\n${'a'.repeat(1_200)}\nLast line`,
+        deliveryKind: 'queued',
+      }),
+      makePrompt({
+        id: 'clear-long-two',
+        text: `Second line\n${'b'.repeat(1_200)}\nLast line`,
+        deliveryKind: 'queued',
+      }),
+    ])
+    const channel = makeChannel(fixture.session)
+    const replies: unknown[] = []
+
+    try {
+      await fixture.internal.handleClearQueueCommand(
+        makeCommandInteraction(channel, replies),
+      )
+      const reply = replies.shift()
+      const content = replyContent(reply)
+      assert.ok(content.length <= 1_900)
+      assert.match(content, /^Cleared 2 queued messages:\n1\. First line/)
+      assert.match(content, /\n2\. Second line/)
+      assert.doesNotMatch(content, /Direct ledger/)
+      assert.deepEqual((reply as { allowedMentions?: unknown }).allowedMentions, { parse: [] })
     } finally {
       clearRunTimers(fixture.internal)
       fixture.bot.client.destroy()
@@ -662,9 +722,16 @@ test('external unarchive recovers direct input and re-arms blocked queued source
 
 test('leading mentions to another user become passive context without starting a turn', async () => {
   await withTemporaryHome(async (directory) => {
-    const fixture = makeFixture(directory)
-    const channel = makeChannel(fixture.session)
-    fixture.internal.loadedThreads.add(fixture.session.codexThreadId)
+      const fixture = makeFixture(directory)
+      const channel = makeChannel(fixture.session)
+      fixture.internal.loadedThreads.add(fixture.session.codexThreadId)
+      const prepareSessionForUserPrompt = fixture.internal.prepareSessionForUserPrompt
+        .bind(fixture.internal)
+      let preparationCalls = 0
+      fixture.internal.prepareSessionForUserPrompt = async (session, target) => {
+        preparationCalls += 1
+        await prepareSessionForUserPrompt(session, target)
+      }
 
     try {
       await fixture.internal.handleMessage(makeMessage({
@@ -679,17 +746,174 @@ test('leading mentions to another user become passive context without starting a
         JSON.stringify(fixture.codex.injected[0]?.items),
         /did not request a Cordex response/,
       )
-      assert.equal(fixture.codex.started.length, 0)
-      assert.equal(fixture.codex.steered.length, 0)
-      assert.deepEqual(channel.sent, [])
+        assert.equal(fixture.codex.started.length, 0)
+        assert.equal(fixture.codex.steered.length, 0)
+        assert.equal(preparationCalls, 0)
+        assert.deepEqual(channel.sent, [])
 
       await fixture.internal.handleMessage(makeMessage({
         id: 'next-real-turn',
         content: 'Summarize the deployment update.',
         channel,
       }))
-      assert.deepEqual(fixture.codex.events, ['inject', 'turn'])
-      assert.equal(fixture.codex.started.length, 1)
+        assert.deepEqual(fixture.codex.events, ['inject', 'turn'])
+        assert.equal(fixture.codex.started.length, 1)
+        assert.equal(preparationCalls, 1)
+    } finally {
+      clearRunTimers(fixture.internal)
+      fixture.bot.client.destroy()
+    }
+  })
+})
+
+test('failed interactive abort retains the new user prompt in the durable direct ledger', async () => {
+  await withTemporaryHome(async (directory) => {
+    const codex = new FailedInteractiveAbortCodex({
+      status: 'active',
+      activeTurnId: 'turn-blocked',
+    })
+    const fixture = makeFixture(directory, [], codex)
+    fixture.session.activeTurnId = 'turn-blocked'
+    const channel = makeChannel(fixture.session)
+    fixture.internal.startRun(fixture.session, channel)
+    const message = makeMessage({
+      id: 'replacement-user-message',
+      content: 'Continue with this instead.',
+      channel,
+    })
+      await fixture.internal.handleServerRequest({
+      id: 'blocking-approval',
+      method: 'item/commandExecution/requestApproval',
+      params: {
+        threadId: fixture.session.codexThreadId,
+        turnId: 'turn-blocked',
+        command: 'printf blocked',
+        },
+      })
+      const enqueuePrompt = fixture.internal.enqueuePrompt.bind(fixture.internal)
+      let abortWasDurableBeforeEnqueue = false
+      fixture.internal.enqueuePrompt = async (threadId, prompt) => {
+        const persisted = await loadState()
+        abortWasDurableBeforeEnqueue =
+          persisted.sessions[fixture.session.discordThreadId]?.abortIntent?.turnId ===
+            'turn-blocked'
+        return enqueuePrompt(threadId, prompt)
+      }
+
+      try {
+        await fixture.internal.handleMessage(message)
+
+      assert.deepEqual(codex.started, [])
+      assert.deepEqual(codex.steered, [])
+      assert.deepEqual(codex.interrupts, [{
+        threadId: fixture.session.codexThreadId,
+        turnId: 'turn-blocked',
+      }])
+      assert.equal(fixture.session.abortIntent?.turnId, 'turn-blocked')
+      assert.deepEqual(
+        fixture.state.queues[fixture.session.discordThreadId]?.map((prompt) => ({
+          sourceMessageId: prompt.sourceMessageId,
+          deliveryKind: prompt.deliveryKind,
+        })),
+        [{ sourceMessageId: message.id, deliveryKind: 'direct' }],
+      )
+      const persisted = await loadState()
+      assert.equal(
+        persisted.sessions[fixture.session.discordThreadId]?.abortIntent?.turnId,
+        'turn-blocked',
+      )
+        assert.equal(
+          persisted.queues[fixture.session.discordThreadId]?.[0]?.sourceMessageId,
+          message.id,
+        )
+        assert.equal(abortWasDurableBeforeEnqueue, true)
+      } finally {
+      clearRunTimers(fixture.internal)
+      fixture.bot.client.destroy()
+    }
+  })
+})
+
+test('real-user ingress dismisses blocking controls before preprocessing fails', async () => {
+  await withTemporaryHome(async (directory) => {
+    const codex = new FailedInteractiveAbortCodex({
+      status: 'active',
+      activeTurnId: 'turn-blocked',
+    })
+    const fixture = makeFixture(directory, [], codex)
+    fixture.session.activeTurnId = 'turn-blocked'
+    const channel = makeChannel(fixture.session)
+    fixture.internal.startRun(fixture.session, channel)
+    fixture.internal.buildInput = async () => {
+      throw new Error('fixture preprocessing failed')
+    }
+    await fixture.internal.handleServerRequest({
+      id: 'preprocessing-approval',
+      method: 'item/commandExecution/requestApproval',
+      params: {
+        threadId: fixture.session.codexThreadId,
+        turnId: 'turn-blocked',
+        command: 'printf blocked',
+      },
+    })
+
+    try {
+      await fixture.internal.handleMessage(makeMessage({
+        id: 'preprocessing-failure-message',
+        content: 'Read the unavailable attachment.',
+        channel,
+      }))
+
+      assert.deepEqual(codex.interrupts, [{
+        threadId: fixture.session.codexThreadId,
+        turnId: 'turn-blocked',
+      }])
+      assert.equal(fixture.internal.approvals.size, 0)
+      assert.equal(fixture.session.abortIntent?.turnId, 'turn-blocked')
+      assert.equal(codex.started.length, 0)
+      assert.equal(codex.steered.length, 0)
+    } finally {
+      clearRunTimers(fixture.internal)
+      fixture.bot.client.destroy()
+    }
+  })
+})
+
+test('real-user ingress dismisses blocking controls before rejecting a shell message', async () => {
+  await withTemporaryHome(async (directory) => {
+    const codex = new FailedInteractiveAbortCodex({
+      status: 'active',
+      activeTurnId: 'turn-blocked',
+    })
+    const fixture = makeFixture(directory, [], codex)
+    fixture.session.activeTurnId = 'turn-blocked'
+    const channel = makeChannel(fixture.session)
+    fixture.internal.startRun(fixture.session, channel)
+    await fixture.internal.handleServerRequest({
+      id: 'shell-approval',
+      method: 'item/commandExecution/requestApproval',
+      params: {
+        threadId: fixture.session.codexThreadId,
+        turnId: 'turn-blocked',
+        command: 'printf blocked',
+      },
+    })
+
+    try {
+      await fixture.internal.handleMessage(makeMessage({
+        id: 'disabled-shell-message',
+        content: '!printf should-not-run',
+        channel,
+      }))
+
+      assert.deepEqual(codex.interrupts, [{
+        threadId: fixture.session.codexThreadId,
+        turnId: 'turn-blocked',
+      }])
+      assert.equal(fixture.internal.approvals.size, 0)
+      assert.equal(fixture.session.abortIntent?.turnId, 'turn-blocked')
+      assert.equal(codex.started.length, 0)
+      assert.equal(codex.steered.length, 0)
     } finally {
       clearRunTimers(fixture.internal)
       fixture.bot.client.destroy()

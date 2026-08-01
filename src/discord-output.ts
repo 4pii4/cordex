@@ -41,116 +41,313 @@ export function formatAssistantText(value: string): string {
   return rewriteLocalFileLinks(value || '…')
 }
 
+type MarkdownFence = {
+  marker: string
+  info: string
+}
+
 type MarkdownLine = {
   text: string
-  inCodeBlock: boolean
-  language: string
+  fenceBefore: MarkdownFence | null
+  fenceAfter: MarkdownFence | null
   openingFence: boolean
   closingFence: boolean
+}
+
+const DISCORD_MESSAGE_LIMIT = 1_900
+const DISCORD_SEMANTIC_TARGET = 1_300
+
+function renderOpeningFence(fence: MarkdownFence): string {
+  return `${fence.marker}${fence.info}\n`
+}
+
+function renderClosingFence(fence: MarkdownFence): string {
+  return `${fence.marker}\n`
+}
+
+function unnestListCodeFences(content: string): string {
+  const rawLines = content.match(/[^\n]*\n|[^\n]+$/g) || []
+  const output: string[] = []
+  let listIndent: string | null = null
+  let fenceIndent: string | null = null
+  let fenceMarker: string | null = null
+
+  for (const rawLine of rawLines) {
+    if (fenceIndent !== null) {
+      const line = rawLine.startsWith(fenceIndent) ? rawLine.slice(fenceIndent.length) : rawLine
+      output.push(line)
+      const closing = line.trim().match(/^(`{3,})$/)
+      if (closing && fenceMarker && closing[1]!.length >= fenceMarker.length) {
+        fenceIndent = null
+        fenceMarker = null
+      }
+      continue
+    }
+
+    const listItem = rawLine.match(/^([ \t]*)(?:[-+*]|\d+[.)])\s+/)
+    if (listItem) {
+      listIndent = listItem[1] || ''
+      output.push(rawLine)
+      continue
+    }
+
+    const nestedFence = rawLine.match(/^([ \t]+)(`{3,})([^`\r\n]*)(?:\r?\n)?$/)
+    const nestedIndent = nestedFence?.[1]
+    if (nestedIndent !== undefined && listIndent !== null && nestedIndent.length > listIndent.length) {
+      if (output.length > 0 && output[output.length - 1]?.trim()) output.push('\n')
+      fenceIndent = nestedIndent
+      fenceMarker = nestedFence?.[2] || null
+      output.push(rawLine.slice(nestedIndent.length))
+      continue
+    }
+
+    if (rawLine.trim()) {
+      const indentation = rawLine.match(/^[ \t]*/)?.[0] || ''
+      if (listIndent === null || indentation.length <= listIndent.length) listIndent = null
+    }
+    output.push(rawLine)
+  }
+
+  return output.join('')
 }
 
 function markdownLines(content: string): MarkdownLine[] {
   const rawLines = content.match(/[^\n]*\n|[^\n]+$/g) || []
   const lines: MarkdownLine[] = []
-  let inCodeBlock = false
-  let language = ''
+  let activeFence: MarkdownFence | null = null
   for (const rawLine of rawLines) {
-    const fence = rawLine.trimStart().match(/^```([^\s`]*)/)
-    if (fence && !inCodeBlock) {
-      language = fence[1] || ''
-      lines.push({ text: rawLine, inCodeBlock: false, language, openingFence: true, closingFence: false })
-      inCodeBlock = true
-    } else if (fence && inCodeBlock) {
-      lines.push({ text: rawLine, inCodeBlock: false, language, openingFence: false, closingFence: true })
-      inCodeBlock = false
-      language = ''
+    const opening = rawLine.trimStart().match(/^(`{3,})([^`\r\n]*)(?:\r?\n)?$/)
+    const closing = rawLine.trim().match(/^(`{3,})$/)
+    const fenceBefore = activeFence
+    if (opening && activeFence === null) {
+      activeFence = { marker: opening[1]!, info: opening[2] || '' }
+      lines.push({
+        text: rawLine,
+        fenceBefore,
+        fenceAfter: activeFence,
+        openingFence: true,
+        closingFence: false,
+      })
+    } else if (activeFence !== null && closing && closing[1]!.length >= activeFence.marker.length) {
+      activeFence = null
+      lines.push({
+        text: rawLine,
+        fenceBefore,
+        fenceAfter: activeFence,
+        openingFence: false,
+        closingFence: true,
+      })
     } else {
-      lines.push({ text: rawLine, inCodeBlock, language, openingFence: false, closingFence: false })
+      const normalizedText = activeFence === null
+        ? rawLine.replace(/^(\s{0,3})#{4,6}(\s+)/, '$1###$2')
+        : rawLine
+      lines.push({
+        text: normalizedText,
+        fenceBefore,
+        fenceAfter: activeFence,
+        openingFence: false,
+        closingFence: false,
+      })
     }
   }
   return lines
 }
 
-export function splitMarkdownForDiscord(content: string, maxLength = 2_000): string[] {
-  if (!content) return ['…']
-  if (content.length <= maxLength) return [content]
-  const lines = markdownLines(content)
+function splitAtCodePointBoundary(value: string, index: number): number {
+  if (index <= 0 || index >= value.length) return index
+  const previous = value.charCodeAt(index - 1)
+  const next = value.charCodeAt(index)
+  return previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff
+    ? index - 1
+    : index
+}
+
+function splitLine(value: string, limit: number, preferWhitespace: boolean): string[] {
+  const pieces: string[] = []
+  let remaining = value
+  while (remaining.length > limit) {
+    let splitAt = limit
+    if (preferWhitespace) {
+      const space = remaining.lastIndexOf(' ', limit - 1)
+      if (space > limit / 2) splitAt = space + 1
+    }
+    splitAt = splitAtCodePointBoundary(remaining, splitAt)
+    if (splitAt === 0) {
+      throw new RangeError(`maxLength ${limit} cannot contain one Unicode character`)
+    }
+    pieces.push(remaining.slice(0, splitAt))
+    remaining = remaining.slice(splitAt)
+  }
+  if (remaining) pieces.push(remaining)
+  return pieces
+}
+
+function plainTextFallback(content: string, hardLimit: number, semanticTarget: number): string[] {
+  const plain = content.replaceAll('`', 'ˋ')
+  const chunks = splitLine(plain, Math.min(hardLimit, semanticTarget), true)
+    .filter((chunk) => chunk.trim())
+  return chunks.length > 0 ? chunks : ['…']
+}
+
+function fencedLinesFit(lines: MarkdownLine[], hardLimit: number): boolean {
+  return lines.every((line) => {
+    const prefix = line.fenceBefore === null ? 0 : renderOpeningFence(line.fenceBefore).length
+    const suffix = line.fenceAfter === null ? 0 : renderClosingFence(line.fenceAfter).length
+    const available = hardLimit - prefix - suffix
+    if (line.openingFence || line.closingFence) return line.text.length <= available
+    if (available < 1) return false
+    return available > 1 || !/[\uD800-\uDBFF][\uDC00-\uDFFF]/.test(line.text)
+  })
+}
+
+function splitOversizedMarkdownLines(
+  lines: MarkdownLine[],
+  hardLimit: number,
+  semanticTarget: number,
+): MarkdownLine[] {
+  return lines.flatMap((line) => {
+    if (line.openingFence || line.closingFence) return [line]
+    const overhead = (line.fenceBefore === null ? 0 : renderOpeningFence(line.fenceBefore).length) +
+      (line.fenceAfter === null ? 0 : renderClosingFence(line.fenceAfter).length)
+    const available = Math.max(1, Math.min(hardLimit - overhead, semanticTarget - overhead))
+    if (line.text.length <= available) return [line]
+    return splitLine(line.text, available, line.fenceBefore === null).map((text) => ({
+      ...line,
+      text,
+    }))
+  })
+}
+
+type BreakKind = 'heading' | 'paragraph' | 'list' | 'table' | 'tableRow' | 'code' | 'line'
+
+function isHeading(line: MarkdownLine): boolean {
+  return line.fenceBefore === null && /^\s{0,3}#{1,6}(?:\s+|$)/.test(line.text)
+}
+
+function isTableRow(line: MarkdownLine): boolean {
+  return line.fenceBefore === null && /^\s*\|.*\|\s*$/.test(line.text.trimEnd())
+}
+
+function breakKind(lines: MarkdownLine[], end: number): BreakKind | null {
+  const previous = lines[end - 1]
+  const next = lines[end]
+  if (!previous || !next || previous.openingFence || next.closingFence) return null
+  if (previous.fenceAfter !== null && next.fenceBefore !== null) return 'code'
+  if (isHeading(next)) return 'heading'
+  if (/^\s*(?:[-+*]|\d+[.)])\s+/.test(next.text)) return 'list'
+  if (!previous.text.trim()) return 'paragraph'
+  if (isTableRow(next)) return isTableRow(previous) ? 'tableRow' : 'table'
+  return 'line'
+}
+
+function wouldOrphanHeading(lines: MarkdownLine[], start: number, end: number): boolean {
+  for (let index = end - 1; index >= start; index--) {
+    const line = lines[index]
+    if (!line || !line.text.trim()) continue
+    return isHeading(line)
+  }
+  return false
+}
+
+function breakPriority(kind: BreakKind): number {
+  if (kind === 'heading') return 3
+  if (kind === 'paragraph' || kind === 'list') return 2
+  if (kind === 'table') return 1
+  return 0
+}
+
+export function splitMarkdownForDiscord(content: string, maxLength = DISCORD_MESSAGE_LIMIT): string[] {
+  if (!content.trim()) return ['…']
+  const hardLimit = Math.max(1, Math.min(Math.floor(maxLength), DISCORD_MESSAGE_LIMIT))
+  const semanticTarget = Math.min(hardLimit, DISCORD_SEMANTIC_TARGET)
+  const normalized = unnestListCodeFences(content)
+  const parsedLines = markdownLines(normalized)
+  if (!fencedLinesFit(parsedLines, hardLimit)) {
+    return plainTextFallback(normalized, hardLimit, semanticTarget)
+  }
+  const lines = splitOversizedMarkdownLines(parsedLines, hardLimit, semanticTarget)
+  if (lines.length === 0) return ['…']
+
+  const textLengths = [0]
+  for (const line of lines) textLengths.push((textLengths[textLengths.length - 1] || 0) + line.text.length)
+
+  const rangeLength = (start: number, end: number): number => {
+    const first = lines[start]
+    const last = lines[end - 1]
+    if (!first || !last) return 0
+    const prefix = first.fenceBefore === null ? 0 : renderOpeningFence(first.fenceBefore).length
+    const suffix = last.fenceAfter === null ? 0 : renderClosingFence(last.fenceAfter).length
+    return prefix + (textLengths[end] || 0) - (textLengths[start] || 0) + suffix
+  }
+
+  const renderRange = (start: number, end: number): string => {
+    const first = lines[start]
+    const last = lines[end - 1]
+    if (!first || !last) return ''
+    const prefix = first.fenceBefore === null ? '' : renderOpeningFence(first.fenceBefore)
+    const suffix = last.fenceAfter === null ? '' : renderClosingFence(last.fenceAfter)
+    return prefix + lines.slice(start, end).map((line) => line.text).join('') + suffix
+  }
+
   const chunks: string[] = []
-  const closingFence = '```\n'
-  let current = ''
-  let activeLanguage: string | null = null
-
-  const splitLongLine = (value: string, available: number, inCode: boolean): string[] => {
-    const pieces: string[] = []
-    let remaining = value
-    while (remaining.length > available) {
-      let splitAt = available
-      if (!inCode) {
-        const space = remaining.lastIndexOf(' ', available)
-        if (space > available / 2) splitAt = space + 1
-      }
-      pieces.push(remaining.slice(0, splitAt))
-      remaining = remaining.slice(splitAt)
-    }
-    if (remaining) pieces.push(remaining)
-    return pieces
+  const pushChunk = (chunk: string): void => {
+    if (chunk.trim()) chunks.push(chunk)
   }
-
-  for (const line of lines) {
-    const openingSize = current.length === 0 && (line.inCodeBlock || line.openingFence)
-      ? (`\`\`\`${line.language}\n`).length
-      : 0
-    const lineLength = line.openingFence && current.length === 0 ? 0 : line.text.length
-    const closingSize = activeLanguage !== null || openingSize > 0 ? closingFence.length : 0
-    const exceeds = current.length + openingSize + lineLength + closingSize > maxLength
-
-    if (!exceeds) {
-      current += line.text
-      if (line.inCodeBlock || line.openingFence) activeLanguage = line.language
-      else if (line.closingFence) activeLanguage = null
-      continue
+  let start = 0
+  while (start < lines.length) {
+    const remainingLength = rangeLength(start, lines.length)
+    if (remainingLength <= semanticTarget) {
+      pushChunk(renderRange(start, lines.length))
+      break
     }
 
-    if (line.text.length > maxLength) {
-      if (current) {
-        if (activeLanguage !== null) current += closingFence
-        chunks.push(current)
-        current = ''
-      }
-      const overhead = line.inCodeBlock
-        ? (`\`\`\`${line.language}\n`).length + closingFence.length
-        : 0
-      const available = Math.max(10, maxLength - overhead - 10)
-      for (const piece of splitLongLine(line.text, available, line.inCodeBlock)) {
-        chunks.push(line.inCodeBlock
-          ? `\`\`\`${line.language}\n${piece}${closingFence}`
-          : piece)
-      }
-      activeLanguage = null
-      continue
+    const candidates: Array<{ end: number; kind: BreakKind; length: number }> = []
+    let farthestEnd = start
+    for (let end = start + 1; end <= lines.length; end++) {
+      const length = rangeLength(start, end)
+      if (length > hardLimit) break
+      farthestEnd = end
+      if (end === lines.length || wouldOrphanHeading(lines, start, end)) continue
+      const kind = breakKind(lines, end)
+      if (kind) candidates.push({ end, kind, length })
     }
 
-    if (current) {
-      if (activeLanguage !== null) current += closingFence
-      chunks.push(current)
+    const targetCandidates = remainingLength <= hardLimit
+      ? candidates.filter((candidate) => candidate.kind !== 'tableRow')
+      : candidates
+    const minimumPreferredLength = Math.floor(semanticTarget / 2)
+    const beforeTarget = targetCandidates.filter((candidate) =>
+      candidate.length >= minimumPreferredLength && candidate.length <= semanticTarget)
+    const preferredBeforeTarget = beforeTarget.filter((candidate) => breakPriority(candidate.kind) > 0)
+    const beforePool = preferredBeforeTarget.length > 0 ? preferredBeforeTarget : beforeTarget
+    beforePool.sort((left, right) =>
+      breakPriority(right.kind) - breakPriority(left.kind) || right.length - left.length)
+
+    let selected = beforePool[0]
+    if (!selected) {
+      const afterTarget = targetCandidates.filter((candidate) => candidate.length > semanticTarget)
+      const preferredAfterTarget = afterTarget.filter((candidate) => breakPriority(candidate.kind) > 0)
+      const afterPool = preferredAfterTarget.length > 0 ? preferredAfterTarget : afterTarget
+      afterPool.sort((left, right) =>
+        breakPriority(right.kind) - breakPriority(left.kind) || left.length - right.length)
+      selected = afterPool[0]
     }
-    if (line.closingFence && activeLanguage !== null) {
-      current = ''
-      activeLanguage = null
-    } else if (line.inCodeBlock || line.openingFence) {
-      current = `\`\`\`${line.language}\n${line.openingFence ? '' : line.text}`
-      activeLanguage = line.language
-    } else {
-      current = line.text
-      activeLanguage = null
+
+    if (!selected && remainingLength <= hardLimit) {
+      pushChunk(renderRange(start, lines.length))
+      break
     }
+
+    const end = selected?.end ?? farthestEnd
+    if (end <= start) {
+      const raw = renderRange(start, lines.length)
+      for (const chunk of plainTextFallback(raw, hardLimit, semanticTarget)) pushChunk(chunk)
+      break
+    }
+    pushChunk(renderRange(start, end))
+    start = end
   }
-
-  if (current) {
-    if (activeLanguage !== null) current += closingFence
-    chunks.push(current)
-  }
-  return chunks
+  return chunks.length > 0 ? chunks : ['…']
 }
 
 function summarizeFields(value: unknown): string {

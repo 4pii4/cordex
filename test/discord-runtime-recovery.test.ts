@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -9,7 +9,9 @@ import {
   CodexAppServer,
   type CodexThreadRuntimeState,
 } from '../src/codex-app-server.js'
+import { loadState, saveState } from '../src/config.js'
 import { CordexDiscordBot } from '../src/discord-bot.js'
+import { createDiscordOutboxEntries } from '../src/discord-outbox.js'
 import type {
   CordexConfig,
   CordexState,
@@ -33,10 +35,17 @@ type SteerTurnOptions = {
 type InternalRun = {
   turnId?: string
   typingTimer: NodeJS.Timeout
+  visibleOutput: boolean
 }
 
 type InternalBot = {
   codexEventQueue: {
+    run<T>(key: string, task: () => Promise<T>): Promise<T>
+  }
+  promptQueue: {
+    run<T>(key: string, task: () => Promise<T>): Promise<T>
+  }
+  discordOutboxStateQueue: {
     run<T>(key: string, task: () => Promise<T>): Promise<T>
   }
   discordIngressQueue: {
@@ -47,6 +56,12 @@ type InternalBot = {
   pendingTurnStarts: Set<string>
   runs: Map<string, InternalRun>
   startRun(session: SessionState, channel: ThreadChannel): InternalRun
+  adoptActiveTurn(session: SessionState, channel: ThreadChannel, activeTurnId: string): Promise<void>
+  adoptCodexStartedRun(params: Record<string, unknown>): Promise<InternalRun | undefined>
+  cleanupProjectMapping(channelId: string, archiveSessions: boolean): Promise<number>
+  finalizeDeletedDiscordThread(session: SessionState): Promise<void>
+  onWarning(params: Record<string, unknown>): Promise<void>
+  stageDurableDiscordOutput(options: Record<string, unknown>): Promise<void>
   enqueuePrompt(threadId: string, prompt: CordexState['queues'][string][number]): Promise<number>
   dispatchInputUnlocked(
     channel: ThreadChannel,
@@ -56,6 +71,7 @@ type InternalBot = {
   ): Promise<void>
   steerNextQueuedPrompt(run: InternalRun): Promise<void>
   pruneOrphanedState(): Promise<void>
+  reconcileDeletedThreadIntents(): Promise<void>
 }
 
 class ReconciliationCodex extends EventEmitter {
@@ -115,17 +131,30 @@ class LifecycleCodex extends EventEmitter {
 class OrphanRecoveryCodex extends EventEmitter {
   readonly interrupted: Array<{ threadId: string; turnId: string }> = []
   readonly archived: string[] = []
+  private active = true
 
   async getThreadRuntimeState(): Promise<CodexThreadRuntimeState> {
-    return { status: 'active', activeTurnId: 'offline-active-turn' }
+    return this.active
+      ? { status: 'active', activeTurnId: 'offline-active-turn' }
+      : { status: 'idle' }
   }
 
   async interruptTurn(threadId: string, turnId: string): Promise<void> {
     this.interrupted.push({ threadId, turnId })
+    this.active = false
   }
 
   async archiveThread(threadId: string): Promise<void> {
     this.archived.push(threadId)
+  }
+
+  async getThreadGoal(): Promise<null> {
+    return null
+  }
+
+  async listAllThreads(options: { archived?: boolean } = {}) {
+    if (options.archived) return []
+    return [{ id: 'codex-thread', preview: 'Orphan', cwd: process.cwd(), updatedAt: 1 }]
   }
 }
 
@@ -273,7 +302,7 @@ class PendingStartCodex extends EventEmitter {
   private resolveStart!: (turnId: string) => void
   private rejectStart!: (error: Error) => void
 
-  constructor(private readonly runtime: CodexThreadRuntimeState) {
+  constructor(private runtime: CodexThreadRuntimeState) {
     super()
     this.startCalled = new Promise<void>((resolve) => {
       this.markStartCalled = resolve
@@ -303,6 +332,7 @@ class PendingStartCodex extends EventEmitter {
 
   async interruptTurn(threadId: string, turnId: string): Promise<void> {
     this.interrupted.push({ threadId, turnId })
+    this.runtime = { status: 'idle' }
   }
 
   async archiveThread(threadId: string): Promise<void> {
@@ -314,6 +344,8 @@ class EmptyThreadDeletionCodex extends EventEmitter {
   readonly deleted: string[] = []
   readonly archived: string[] = []
   readonly startCalled: Promise<void>
+  deleteError: Error | undefined
+  private exists = true
   private markStartCalled!: () => void
   private resolveStart!: () => void
 
@@ -338,10 +370,21 @@ class EmptyThreadDeletionCodex extends EventEmitter {
 
   async deleteThread(threadId: string): Promise<void> {
     this.deleted.push(threadId)
+    if (this.deleteError) throw this.deleteError
+    this.exists = false
   }
 
   async archiveThread(threadId: string): Promise<void> {
     this.archived.push(threadId)
+  }
+
+  async getThreadRuntimeState(): Promise<CodexThreadRuntimeState> {
+    return { status: 'idle' }
+  }
+
+  async listAllThreads(options: { archived?: boolean } = {}) {
+    if (options.archived || !this.exists) return []
+    return [{ id: 'empty-codex-thread', preview: '', cwd: process.cwd(), updatedAt: 1 }]
   }
 }
 
@@ -396,6 +439,7 @@ class DeletionCodex extends EventEmitter {
   readonly steered: SteerTurnOptions[] = []
   readonly interrupted: Array<{ threadId: string; turnId: string }> = []
   readonly archived: string[] = []
+  private active = true
 
   async startTurn(options: StartTurnOptions): Promise<string> {
     this.started.push(options)
@@ -408,6 +452,15 @@ class DeletionCodex extends EventEmitter {
 
   async interruptTurn(threadId: string, turnId: string): Promise<void> {
     this.interrupted.push({ threadId, turnId })
+    this.active = false
+  }
+
+  async getThreadRuntimeState(): Promise<CodexThreadRuntimeState> {
+    return this.active ? { status: 'active', activeTurnId: 'stale-turn' } : { status: 'idle' }
+  }
+
+  async getThreadGoal(): Promise<null> {
+    return null
   }
 
   async archiveThread(threadId: string): Promise<void> {
@@ -418,14 +471,22 @@ class DeletionCodex extends EventEmitter {
 class StaleDeletionCodex extends EventEmitter {
   readonly interrupted: Array<{ threadId: string; turnId: string }> = []
   readonly archived: string[] = []
+  private activeTurnId: string | undefined = 'newer-automatic-turn'
 
   async interruptTurn(threadId: string, turnId: string): Promise<void> {
     this.interrupted.push({ threadId, turnId })
     if (turnId === 'stale-turn') throw new Error('Fixture stale turn id')
+    if (turnId === this.activeTurnId) this.activeTurnId = undefined
   }
 
   async getThreadRuntimeState(): Promise<CodexThreadRuntimeState> {
-    return { status: 'active', activeTurnId: 'newer-automatic-turn' }
+    return this.activeTurnId
+      ? { status: 'active', activeTurnId: this.activeTurnId }
+      : { status: 'idle' }
+  }
+
+  async getThreadGoal(): Promise<null> {
+    return null
   }
 
   async archiveThread(threadId: string): Promise<void> {
@@ -433,11 +494,77 @@ class StaleDeletionCodex extends EventEmitter {
   }
 }
 
-class CommandOrderingCodex extends IngressCodex {
+class DurableDeletionCodex extends EventEmitter {
   readonly interrupted: Array<{ threadId: string; turnId: string }> = []
+  readonly archived: string[] = []
+  persistedIntentAtArchive: unknown
+  interruptError: Error | undefined = new Error('interrupt transport unavailable')
+  archiveError: Error | undefined
+  remoteState: 'active' | 'archived' | 'missing' = 'active'
+  runtimeTurnActive = true
+  persistedIntentAtInterrupt: unknown
+
+  async getThreadGoal(): Promise<null> {
+    return null
+  }
+
+  async getThreadRuntimeState(): Promise<CodexThreadRuntimeState> {
+    return this.remoteState === 'active' && this.runtimeTurnActive
+      ? { status: 'active', activeTurnId: 'stale-turn' }
+      : { status: 'idle' }
+  }
 
   async interruptTurn(threadId: string, turnId: string): Promise<void> {
     this.interrupted.push({ threadId, turnId })
+    this.persistedIntentAtInterrupt = (await loadState())
+      .sessions['discord-thread']?.lifecycleIntent
+    if (this.interruptError) throw this.interruptError
+    this.runtimeTurnActive = false
+  }
+
+  async archiveThread(threadId: string): Promise<void> {
+    this.archived.push(threadId)
+    this.persistedIntentAtArchive = (await loadState())
+      .sessions['discord-thread']?.lifecycleIntent
+    if (this.archiveError) throw this.archiveError
+    this.remoteState = 'archived'
+  }
+
+  async deleteThread(threadId: string): Promise<void> {
+    if (this.archiveError) throw this.archiveError
+    this.remoteState = 'missing'
+  }
+
+  async listAllThreads(options: { archived?: boolean } = {}) {
+    const match = options.archived
+      ? this.remoteState === 'archived'
+      : this.remoteState === 'active'
+    return match
+      ? [{ id: 'codex-thread', preview: 'Deletion fixture', cwd: process.cwd(), updatedAt: 1 }]
+      : []
+  }
+}
+
+class CommandOrderingCodex extends IngressCodex {
+  readonly interrupted: Array<{ threadId: string; turnId: string }> = []
+  readonly started: StartTurnOptions[] = []
+  private activeTurnId: string | undefined = 'stale-turn'
+
+  override async getThreadRuntimeState(): Promise<CodexThreadRuntimeState> {
+    return this.activeTurnId
+      ? { status: 'active', activeTurnId: this.activeTurnId }
+      : { status: 'idle' }
+  }
+
+  async interruptTurn(threadId: string, turnId: string): Promise<void> {
+    this.interrupted.push({ threadId, turnId })
+    if (this.activeTurnId === turnId) this.activeTurnId = undefined
+  }
+
+  async startTurn(options: StartTurnOptions): Promise<string> {
+    this.started.push(options)
+    this.activeTurnId = 'replacement-after-abort'
+    return this.activeTurnId
   }
 }
 
@@ -558,13 +685,15 @@ async function waitFor(condition: () => boolean, timeoutMs = 1_000): Promise<voi
   }
 }
 
-async function withTemporaryHome(run: (directory: string) => Promise<void>): Promise<void> {
+async function withTemporaryHome(
+  run: (directory: string, home: string) => Promise<void>,
+): Promise<void> {
   const home = await mkdtemp(path.join(tmpdir(), 'cordex-runtime-recovery-home-'))
   const directory = await mkdtemp(path.join(tmpdir(), 'cordex-runtime-recovery-project-'))
   const oldHome = process.env.CORDEX_HOME
   process.env.CORDEX_HOME = home
   try {
-    await run(directory)
+    await run(directory, home)
   } finally {
     if (oldHome === undefined) delete process.env.CORDEX_HOME
     else process.env.CORDEX_HOME = oldHome
@@ -1113,6 +1242,55 @@ test('ThreadDelete deletes a newly started Codex thread before its first turn', 
   })
 })
 
+test('failed empty-thread deletion remains durable and retries on reconciliation', async () => {
+  await withTemporaryHome(async (directory) => {
+    const state = makeState([])
+    const codex = new EmptyThreadDeletionCodex()
+    codex.deleteError = new Error('delete transport unavailable')
+    const channel = makeChannel('new-discord-thread-delete-failure')
+    const bot = new CordexDiscordBot(makeConfig(directory), state, codex as unknown as CodexAppServer)
+    const internal = bot as unknown as InternalBot
+    const dispatch = internal.discordIngressQueue.run(
+      channel.id,
+      () => internal.dispatchInputUnlocked(
+        channel,
+        'parent-1',
+        [{ type: 'text', text: 'Never materialize this.', text_elements: [] }],
+        'empty-thread-delete-failure',
+      ),
+    )
+    try {
+      await codex.startCalled
+      ;(bot.client as unknown as EventEmitter).emit('threadDelete', { id: channel.id })
+      codex.releaseStart()
+
+      await assert.rejects(dispatch, /delete transport unavailable/)
+      assert.equal(state.sessions[channel.id]?.lifecycleIntent?.kind, 'delete-thread')
+      assert.deepEqual(state.sessions[channel.id]?.lifecycleIntent, {
+        kind: 'delete-thread',
+        requestedAt: state.sessions[channel.id]?.lifecycleIntent?.requestedAt,
+        remoteAction: 'delete',
+      })
+      assert.equal(
+        (await loadState()).sessions[channel.id]?.lifecycleIntent?.kind,
+        'delete-thread',
+      )
+
+      codex.deleteError = undefined
+      await internal.reconcileDeletedThreadIntents()
+
+      assert.equal(codex.deleted.length, 2)
+      assert.equal(state.sessions[channel.id], undefined)
+      assert.equal((await loadState()).sessions[channel.id], undefined)
+    } finally {
+      codex.releaseStart()
+      await dispatch.catch(() => undefined)
+      clearRunTimers(internal)
+      bot.client.destroy()
+    }
+  })
+})
+
 test('ThreadDelete reconciles and interrupts an accepted start with a lost response', async () => {
   await withTemporaryHome(async (directory) => {
     const session = makeSession(directory)
@@ -1144,7 +1322,7 @@ test('ThreadDelete reconciles and interrupts an accepted start with a lost respo
       assert.deepEqual(codex.interrupted, [])
 
       codex.fail()
-      await assert.rejects(dispatch, /lost the response/)
+      await assert.rejects(dispatch, /Discord thread was deleted/)
       await waitFor(() => state.sessions[session.discordThreadId] === undefined)
 
       assert.deepEqual(codex.interrupted, [{
@@ -1224,6 +1402,133 @@ test('ThreadDelete retries a stale immediate interrupt against the authoritative
       ])
       assert.deepEqual(codex.archived, [session.codexThreadId])
     } finally {
+      clearRunTimers(internal)
+      bot.client.destroy()
+    }
+  })
+})
+
+for (const failure of ['interrupt', 'archive'] as const) {
+  test(`ThreadDelete retains durable cleanup state across ${failure} failure`, async () => {
+    await withTemporaryHome(async (directory) => {
+      const session = makeSession(directory)
+      const state = makeState([session])
+      state.queues[session.discordThreadId] = [{
+        id: 'retained-prompt',
+        authorId: 'user-1',
+        authorName: 'Queue User',
+        input: [{ type: 'text', text: 'Retain me.', text_elements: [] }],
+        displayText: 'Retain me.',
+        createdAt: new Date(0).toISOString(),
+        deliveryKind: 'queued',
+      }]
+      state.tasks['retained-task'] = {
+        id: 'retained-task',
+        threadId: session.discordThreadId,
+        prompt: 'Retain task.',
+        runAt: new Date(Date.now() + 60_000).toISOString(),
+        createdBy: 'user-1',
+        status: 'scheduled',
+      }
+      const codex = new DurableDeletionCodex()
+      if (failure === 'archive') {
+        codex.interruptError = undefined
+        codex.archiveError = new Error('archive transport unavailable')
+      }
+      const bot = new CordexDiscordBot(
+        makeConfig(directory),
+        state,
+        codex as unknown as CodexAppServer,
+      )
+      const internal = bot as unknown as InternalBot
+
+      try {
+        ;(bot.client as unknown as EventEmitter).emit('threadDelete', {
+          id: session.discordThreadId,
+        })
+        await waitFor(() => codex.interrupted.length > 0)
+        await internal.discordIngressQueue.run(session.discordThreadId, async () => undefined)
+
+        assert.deepEqual(codex.persistedIntentAtInterrupt, {
+          kind: 'delete-thread',
+          requestedAt: state.sessions[session.discordThreadId]?.lifecycleIntent?.requestedAt,
+          remoteAction: 'archive',
+        })
+        assert.equal(
+          state.sessions[session.discordThreadId]?.lifecycleIntent?.kind,
+          'delete-thread',
+        )
+        assert.equal(state.queues[session.discordThreadId]?.[0]?.id, 'retained-prompt')
+        assert.equal(state.tasks['retained-task']?.id, 'retained-task')
+        assert.equal(
+          (await loadState()).sessions[session.discordThreadId]?.lifecycleIntent?.kind,
+          'delete-thread',
+        )
+
+        codex.interruptError = undefined
+        codex.archiveError = undefined
+        await internal.reconcileDeletedThreadIntents()
+
+        assert.equal(state.sessions[session.discordThreadId], undefined)
+        assert.equal(state.queues[session.discordThreadId], undefined)
+        assert.equal(state.tasks['retained-task'], undefined)
+        assert.equal((await loadState()).sessions[session.discordThreadId], undefined)
+      } finally {
+        clearRunTimers(internal)
+        bot.client.destroy()
+      }
+    })
+  })
+}
+
+test('deleted-thread reconciliation does not hold prompt state while waiting for Codex events', async () => {
+  await withTemporaryHome(async (directory) => {
+    const session = makeSession(directory)
+    delete session.activeTurnId
+    session.archived = true
+    session.lifecycleIntent = {
+      kind: 'delete-thread',
+      requestedAt: new Date(0).toISOString(),
+      remoteAction: 'archive',
+    }
+    const state = makeState([session])
+    const codex = new DurableDeletionCodex()
+    codex.remoteState = 'archived'
+    codex.runtimeTurnActive = false
+    codex.interruptError = undefined
+    const bot = new CordexDiscordBot(
+      makeConfig(directory),
+      state,
+      codex as unknown as CodexAppServer,
+    )
+    const internal = bot as unknown as InternalBot
+    await saveState(state)
+
+    let releaseCodex!: () => void
+    let markCodexHeld!: () => void
+    const codexReady = new Promise<void>((resolve) => { markCodexHeld = resolve })
+    const codexHeld = internal.codexEventQueue.run(session.codexThreadId, async () => {
+      markCodexHeld()
+      await new Promise<void>((resolve) => { releaseCodex = resolve })
+    })
+
+    let reconciliation: Promise<void> | undefined
+    try {
+      await codexReady
+      reconciliation = internal.reconcileDeletedThreadIntents()
+      await sleep(10)
+      let promptProbeFinished = false
+      const promptProbe = internal.promptQueue.run(session.discordThreadId, async () => {
+        promptProbeFinished = true
+      })
+      await waitFor(() => promptProbeFinished, 500)
+      releaseCodex()
+      await Promise.all([codexHeld, reconciliation, promptProbe])
+      assert.equal(state.sessions[session.discordThreadId], undefined)
+    } finally {
+      releaseCodex()
+      await codexHeld.catch(() => undefined)
+      await reconciliation?.catch(() => undefined)
       clearRunTimers(internal)
       bot.client.destroy()
     }
@@ -1588,15 +1893,16 @@ test('prompt slash command waits behind MessageCreate while abort bypasses ingre
       assert.deepEqual(queueResponseMethods, [])
       assert.equal(state.queues[session.discordThreadId], undefined)
       assert.equal(codex.steered.length, 0)
+      assert.equal(codex.started.length, 0)
 
       releaseReference()
-      await waitFor(() => codex.steered.length === 1)
+      await waitFor(() => codex.started.length === 1)
       await waitFor(() => state.queues[session.discordThreadId]?.length === 1)
       await waitFor(() => queueReplies.length === 1)
 
-      assert.equal(codex.steered[0]?.clientUserMessageId, message.id)
+      assert.equal(codex.started[0]?.clientUserMessageId, message.id)
       assert.match(
-        codex.steered[0]?.input[0]?.type === 'text' ? codex.steered[0].input[0].text : '',
+        codex.started[0]?.input[0]?.type === 'text' ? codex.started[0].input[0].text : '',
         /Message prompt first\./,
       )
       assert.equal(state.queues[session.discordThreadId]?.[0]?.displayText, 'Slash prompt second.')
@@ -1803,7 +2109,7 @@ test('startup prunes a persisted session whose Discord thread was deleted offlin
   })
 })
 
-test('app-server lifecycle events clear stale state then resume goals and queued work once', async () => {
+test('app-server recovery clears stale state and resumes queued work without auto-resuming goals', async () => {
   await withTemporaryHome(async (directory) => {
     const goalSession = makeSession(directory, 'discord-goal', 'codex-goal')
     const queuedSession = makeSession(directory, 'discord-queued', 'codex-queued')
@@ -1858,8 +2164,9 @@ test('app-server lifecycle events clear stale state then resume goals and queued
         (messages) => messages.filter((message) => message === '✓ Codex runtime recovered.').length === 1,
       ))
 
-      assert.ok(codex.resumed.includes(goalSession.codexThreadId))
-      assert.ok(codex.resumed.includes(queuedSession.codexThreadId))
+      assert.deepEqual(codex.resumed, [queuedSession.codexThreadId])
+      assert.equal(internal.loadedThreads.has(goalSession.codexThreadId), false)
+      assert.equal(internal.loadedThreads.has(queuedSession.codexThreadId), true)
       assert.strictEqual(codex.started[0]?.input, queuedInput)
       assert.equal(state.queues[queuedSession.discordThreadId]?.length, 0)
       assert.equal(queuedSession.activeTurnId, 'recovered-queued-turn')
@@ -2006,6 +2313,455 @@ test('terminal app-server failure without restarting clears runtime state before
     } finally {
       clearInterval(typingTimer)
       clearTimeout(controlTimeout)
+      clearRunTimers(internal)
+      bot.client.destroy()
+    }
+  })
+})
+
+test('failed app-server recovery keeps mutation ingress fail-closed', async () => {
+  await withTemporaryHome(async (directory) => {
+    const state = makeState([])
+    const codex = new LifecycleCodex()
+    const bot = new CordexDiscordBot(makeConfig(directory), state, codex as unknown as CodexAppServer)
+    const internal = bot as unknown as InternalBot & {
+      pendingCodexLifecycle: Set<Promise<void>>
+      onCodexRestarting(): Promise<void>
+      waitForMutationIngressReady(): Promise<void>
+    }
+    internal.onCodexRestarting = async () => {
+      throw new Error('fixture recovery state save failed')
+    }
+
+    try {
+      codex.emit('restarting', {
+        attempt: 1,
+        delayMs: 5,
+        error: new Error('fixture app-server exit'),
+      })
+      codex.emit('ready', { restartAttempt: 1 })
+      await waitFor(() => internal.pendingCodexLifecycle.size === 0)
+
+      await assert.rejects(
+        internal.waitForMutationIngressReady(),
+        /recovery state save failed|runtime unavailable/i,
+      )
+    } finally {
+      clearRunTimers(internal)
+      bot.client.destroy()
+    }
+  })
+})
+
+test('turn adoption clears output visibility for every replacement turn path', async () => {
+  await withTemporaryHome(async (directory) => {
+    const session = makeSession(directory)
+    const state = makeState([session])
+    const codex = new ReconciliationCodex({ status: 'idle' })
+    const channel = makeChannel(session.discordThreadId)
+    const bot = new CordexDiscordBot(
+      makeConfig(directory),
+      state,
+      codex as unknown as CodexAppServer,
+    )
+    const internal = bot as unknown as InternalBot
+    const run = internal.startRun(session, channel)
+
+    try {
+      run.visibleOutput = true
+      await internal.adoptActiveTurn(session, channel, 'replacement-by-runtime')
+      assert.equal(run.visibleOutput, false)
+
+      run.visibleOutput = true
+      await internal.adoptCodexStartedRun({
+        threadId: session.codexThreadId,
+        turnId: 'replacement-by-notification',
+      })
+      assert.equal(run.visibleOutput, false)
+    } finally {
+      clearRunTimers(internal)
+      bot.client.destroy()
+    }
+  })
+})
+
+test('unrouted Codex diagnostics never print stderr or warning payloads', async () => {
+  await withTemporaryHome(async (directory) => {
+    const state = makeState([])
+    const codex = new EventEmitter()
+    const lines: string[] = []
+    const originalError = console.error
+    console.error = (...values: unknown[]) => lines.push(values.map(String).join(' '))
+    const bot = new CordexDiscordBot(
+      makeConfig(directory),
+      state,
+      codex as unknown as CodexAppServer,
+      { verbose: true },
+    )
+    const internal = bot as unknown as InternalBot
+    const secret = 'diagnostic-payload-secret'
+
+    try {
+      codex.emit('stderr', `fatal ${secret}`)
+      await internal.onWarning({
+        threadId: 'missing-codex-thread',
+        message: `warning ${secret}`,
+      })
+      assert.doesNotMatch(lines.join('\n'), /diagnostic-payload-secret/)
+      const records = lines.map((line) => JSON.parse(line) as {
+        event: string
+        metadata?: Record<string, unknown>
+      })
+      assert.ok(records.some((record) => record.event === 'codex_stderr'))
+      assert.ok(records.some((record) => record.event === 'codex_warning_unrouted'))
+    } finally {
+      console.error = originalError
+      bot.client.destroy()
+    }
+  })
+})
+
+test('deleted project cleanup stages per-session intent and retains state across archive failure', async () => {
+  await withTemporaryHome(async (directory) => {
+    const session = makeSession(directory)
+    const state = makeState([session])
+    state.queues[session.discordThreadId] = [{
+      id: 'project-queued-prompt',
+      authorId: 'user-1',
+      authorName: 'Queue User',
+      input: [{ type: 'text', text: 'Keep this prompt.', text_elements: [] }],
+      displayText: 'Keep this prompt.',
+      createdAt: new Date(0).toISOString(),
+      deliveryKind: 'queued',
+    }]
+    state.tasks['project-task'] = {
+      id: 'project-task',
+      threadId: session.discordThreadId,
+      prompt: 'Keep this task.',
+      runAt: new Date(Date.now() + 60_000).toISOString(),
+      createdBy: 'user-1',
+      status: 'scheduled',
+    }
+    const [outboxEntry] = createDiscordOutboxEntries({
+      discordThreadId: session.discordThreadId,
+      codexThreadId: session.codexThreadId,
+      turnId: 'stale-turn',
+      itemKey: 'output',
+      chunks: ['Keep this output.'],
+      suppressNotifications: false,
+    })
+    state.discordOutbox = outboxEntry ? [outboxEntry] : []
+    state.discordOutboxDeliveredKeys = []
+    const codex = new DurableDeletionCodex()
+    codex.interruptError = undefined
+    codex.archiveError = new Error('archive transport unavailable')
+    const config = makeConfig(directory)
+    const bot = new CordexDiscordBot(
+      config,
+      state,
+      codex as unknown as CodexAppServer,
+    )
+    const internal = bot as unknown as InternalBot
+    await saveState(state)
+
+    try {
+      await assert.rejects(
+        internal.cleanupProjectMapping('parent-1', true),
+        /archive transport unavailable/,
+      )
+      assert.ok(config.projects['parent-1'])
+      const pendingIntent = state.sessions[session.discordThreadId]?.lifecycleIntent
+      assert.equal(pendingIntent?.kind, 'delete-thread')
+      assert.equal(
+        pendingIntent?.kind === 'delete-thread' ? pendingIntent.remoteAction : undefined,
+        'archive',
+      )
+      assert.equal(state.queues[session.discordThreadId]?.[0]?.id, 'project-queued-prompt')
+      assert.equal(state.tasks['project-task']?.id, 'project-task')
+      assert.equal(state.discordOutbox?.[0]?.itemKey, 'output')
+      const persisted = await loadState()
+      assert.equal(persisted.sessions[session.discordThreadId]?.lifecycleIntent?.kind, 'delete-thread')
+      assert.equal(persisted.queues[session.discordThreadId]?.[0]?.id, 'project-queued-prompt')
+
+      codex.archiveError = undefined
+      await internal.cleanupProjectMapping('parent-1', true)
+      assert.equal(config.projects['parent-1'], undefined)
+      assert.equal(state.sessions[session.discordThreadId], undefined)
+      assert.equal(state.queues[session.discordThreadId], undefined)
+      assert.equal(state.tasks['project-task'], undefined)
+      assert.deepEqual(state.discordOutbox, [])
+      assert.equal((await loadState()).sessions[session.discordThreadId], undefined)
+    } finally {
+      clearRunTimers(internal)
+      bot.client.destroy()
+    }
+  })
+})
+
+test('/remove-project stages archive intent before Codex and prunes outbox on retry', async () => {
+  await withTemporaryHome(async (directory) => {
+    const session = makeSession(directory)
+    delete session.activeTurnId
+    const state = makeState([session])
+    state.queues[session.discordThreadId] = [{
+      id: 'remove-project-prompt',
+      authorId: 'user-1',
+      authorName: 'Queue User',
+      input: [{ type: 'text', text: 'Keep until removal.', text_elements: [] }],
+      displayText: 'Keep until removal.',
+      createdAt: new Date(0).toISOString(),
+      deliveryKind: 'queued',
+    }]
+    state.tasks['remove-project-task'] = {
+      id: 'remove-project-task',
+      threadId: session.discordThreadId,
+      prompt: 'Keep this scheduled task.',
+      runAt: new Date(Date.now() + 60_000).toISOString(),
+      createdBy: 'user-1',
+      status: 'scheduled',
+    }
+    const [outboxEntry] = createDiscordOutboxEntries({
+      discordThreadId: session.discordThreadId,
+      codexThreadId: session.codexThreadId,
+      turnId: 'stale-turn',
+      itemKey: 'remove-project-output',
+      chunks: ['Pending output.'],
+      suppressNotifications: false,
+    })
+    state.discordOutbox = outboxEntry ? [outboxEntry] : []
+    state.discordOutboxDeliveredKeys = []
+    const codex = new DurableDeletionCodex()
+    codex.interruptError = undefined
+    codex.archiveError = new Error('archive transport unavailable')
+    const config = makeConfig(directory)
+    const bot = new CordexDiscordBot(
+      config,
+      state,
+      codex as unknown as CodexAppServer,
+    )
+    const internal = bot as unknown as InternalBot & {
+      handleRemoveProjectCommand(interaction: unknown): Promise<void>
+      refreshProjectsFromDisk(): Promise<void>
+    }
+    internal.refreshProjectsFromDisk = async () => undefined
+    const childChannel = {
+      ...makeChannel(session.discordThreadId),
+      async setArchived() {},
+    }
+    let projectChannelDeleted = false
+    const projectChannel = {
+      id: 'parent-1',
+      guildId: 'guild-1',
+      async delete() {
+        projectChannelDeleted = true
+      },
+    }
+    ;(bot.client.channels as unknown as {
+      fetch(id: string): Promise<unknown>
+    }).fetch = async (id: string) => id === 'parent-1' ? projectChannel : childChannel
+    const interaction = {
+      options: {
+        getString(name: string) {
+          return name === 'project' ? 'parent-1' : null
+        },
+        getBoolean() {
+          return true
+        },
+      },
+      async deferReply() {},
+      async editReply() {},
+    }
+    await saveState(state)
+
+    try {
+      await assert.rejects(
+        internal.handleRemoveProjectCommand(interaction),
+        /archive transport unavailable/,
+      )
+      assert.equal(projectChannelDeleted, false)
+      assert.equal(config.projects['parent-1']?.directory, directory)
+      const firstIntent = state.sessions[session.discordThreadId]?.lifecycleIntent
+      assert.equal(firstIntent?.kind, 'delete-thread')
+      assert.equal(
+        firstIntent?.kind === 'delete-thread' ? firstIntent.remoteAction : undefined,
+        'archive',
+      )
+      assert.equal(
+        (codex.persistedIntentAtArchive as { kind?: string; remoteAction?: string })?.kind,
+        'delete-thread',
+      )
+      assert.equal(
+        (codex.persistedIntentAtArchive as { kind?: string; remoteAction?: string })?.remoteAction,
+        'archive',
+      )
+      assert.equal(state.discordOutbox?.[0]?.itemKey, 'remove-project-output')
+      assert.equal((await loadState()).sessions[session.discordThreadId]?.lifecycleIntent?.kind, 'delete-thread')
+
+      codex.archiveError = undefined
+      await internal.handleRemoveProjectCommand(interaction)
+
+      assert.equal(projectChannelDeleted, true)
+      assert.equal(config.projects['parent-1'], undefined)
+      assert.equal(state.sessions[session.discordThreadId], undefined)
+      assert.equal(state.queues[session.discordThreadId], undefined)
+      assert.equal(state.tasks['remove-project-task'], undefined)
+      assert.deepEqual(state.discordOutbox, [])
+      assert.equal((await loadState()).sessions[session.discordThreadId], undefined)
+      assert.deepEqual((await loadState()).discordOutbox, [])
+    } finally {
+      clearRunTimers(internal)
+      bot.client.destroy()
+    }
+  })
+})
+
+test('deleted-thread finalization serializes prompt and outbox state and rolls back failed saves', async () => {
+  await withTemporaryHome(async (directory, home) => {
+    const session = makeSession(directory)
+    session.lifecycleIntent = {
+      kind: 'delete-thread',
+      requestedAt: new Date(0).toISOString(),
+      remoteAction: 'archive',
+    }
+    const state = makeState([session])
+    state.queues[session.discordThreadId] = [{
+      id: 'rollback-prompt',
+      authorId: 'user-1',
+      authorName: 'Queue User',
+      input: [{ type: 'text', text: 'Rollback me.', text_elements: [] }],
+      displayText: 'Rollback me.',
+      createdAt: new Date(0).toISOString(),
+      deliveryKind: 'queued',
+    }]
+    state.tasks['rollback-task'] = {
+      id: 'rollback-task',
+      threadId: session.discordThreadId,
+      prompt: 'Rollback task.',
+      runAt: new Date(Date.now() + 60_000).toISOString(),
+      createdBy: 'user-1',
+      status: 'scheduled',
+    }
+    const [outboxEntry] = createDiscordOutboxEntries({
+      discordThreadId: session.discordThreadId,
+      codexThreadId: session.codexThreadId,
+      turnId: 'stale-turn',
+      itemKey: 'rollback-output',
+      chunks: ['Rollback output.'],
+      suppressNotifications: false,
+    })
+    state.discordOutbox = outboxEntry ? [outboxEntry] : []
+    state.discordOutboxDeliveredKeys = []
+    const bot = new CordexDiscordBot(
+      makeConfig(directory),
+      state,
+      new ReconciliationCodex({ status: 'idle' }) as unknown as CodexAppServer,
+    )
+    const internal = bot as unknown as InternalBot
+    await saveState(state)
+
+    try {
+      let markPromptStarted!: () => void
+      let releasePrompt!: () => void
+      const promptStarted = new Promise<void>((resolve) => {
+        markPromptStarted = resolve
+      })
+      const promptGate = new Promise<void>((resolve) => { releasePrompt = resolve })
+      const heldPrompt = internal.promptQueue.run(session.discordThreadId, async () => {
+        markPromptStarted()
+        await promptGate
+      })
+      await promptStarted
+
+      let markOutboxStarted!: () => void
+      let releaseOutbox!: () => void
+      const outboxStarted = new Promise<void>((resolve) => {
+        markOutboxStarted = resolve
+      })
+      const outboxGate = new Promise<void>((resolve) => { releaseOutbox = resolve })
+      const heldOutbox = internal.discordOutboxStateQueue.run('state', async () => {
+        markOutboxStarted()
+        await outboxGate
+      })
+      await outboxStarted
+
+      const finalization = internal.finalizeDeletedDiscordThread(session)
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      assert.ok(state.sessions[session.discordThreadId])
+      releasePrompt()
+      await heldPrompt
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      assert.ok(state.sessions[session.discordThreadId])
+      releaseOutbox()
+      await heldOutbox
+      await finalization
+      assert.equal(state.sessions[session.discordThreadId], undefined)
+      assert.deepEqual(state.discordOutbox, [])
+
+      // A late output stage after deletion must be ignored rather than recreating an outbox row.
+      await internal.stageDurableDiscordOutput({
+        channel: makeChannel(session.discordThreadId),
+        codexThreadId: session.codexThreadId,
+        turnId: 'late-turn',
+        itemKey: 'late-output',
+        value: 'Must not return.',
+        suppressNotifications: false,
+        format: false,
+      })
+      assert.deepEqual(state.discordOutbox, [])
+
+      // Recreate the fixture and make only the final persistence write fail.
+      const retrySession = makeSession(directory)
+      retrySession.lifecycleIntent = session.lifecycleIntent
+      const retryState = makeState([retrySession])
+      retryState.queues[retrySession.discordThreadId] = state.queues[retrySession.discordThreadId] || [{
+        id: 'rollback-prompt',
+        authorId: 'user-1',
+        authorName: 'Queue User',
+        input: [{ type: 'text', text: 'Rollback me.', text_elements: [] }],
+        displayText: 'Rollback me.',
+        createdAt: new Date(0).toISOString(),
+        deliveryKind: 'queued',
+      }]
+      retryState.tasks['rollback-task'] = {
+        id: 'rollback-task',
+        threadId: retrySession.discordThreadId,
+        prompt: 'Rollback task.',
+        runAt: new Date(Date.now() + 60_000).toISOString(),
+        createdBy: 'user-1',
+        status: 'scheduled',
+      }
+      const [retryEntry] = createDiscordOutboxEntries({
+        discordThreadId: retrySession.discordThreadId,
+        codexThreadId: retrySession.codexThreadId,
+        turnId: 'stale-turn',
+        itemKey: 'rollback-output',
+        chunks: ['Rollback output.'],
+        suppressNotifications: false,
+      })
+      retryState.discordOutbox = retryEntry ? [retryEntry] : []
+      retryState.discordOutboxDeliveredKeys = []
+      const retryBot = new CordexDiscordBot(
+        makeConfig(directory),
+        retryState,
+        new ReconciliationCodex({ status: 'idle' }) as unknown as CodexAppServer,
+      )
+      const retryInternal = retryBot as unknown as InternalBot
+      await saveState(retryState)
+      const backup = `${home}-backup`
+      await rename(home, backup)
+      await writeFile(home, 'state home is unavailable')
+      await assert.rejects(retryInternal.finalizeDeletedDiscordThread(retrySession))
+      assert.equal(retryState.sessions[retrySession.discordThreadId], retrySession)
+      assert.equal(retryState.queues[retrySession.discordThreadId]?.[0]?.id, 'rollback-prompt')
+      assert.equal(retryState.tasks['rollback-task']?.id, 'rollback-task')
+      assert.equal(retryState.discordOutbox?.[0]?.itemKey, 'rollback-output')
+      await rm(home, { force: true })
+      await rename(backup, home)
+      assert.equal((await loadState()).sessions[retrySession.discordThreadId]?.lifecycleIntent?.kind, 'delete-thread')
+      await retryInternal.finalizeDeletedDiscordThread(retrySession)
+      assert.equal(retryState.sessions[retrySession.discordThreadId], undefined)
+      retryBot.client.destroy()
+    } finally {
       clearRunTimers(internal)
       bot.client.destroy()
     }

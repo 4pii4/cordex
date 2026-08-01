@@ -35,9 +35,20 @@ export type CordexConfig = {
   projects: Record<string, ProjectConfig>
 }
 
-export type SessionLifecycleIntent = {
-  kind: 'archive' | 'resume' | 'remove-worktree'
+export type SessionLifecycleIntent =
+  | {
+      kind: 'archive' | 'resume' | 'remove-worktree'
+      requestedAt: string
+    }
+  | {
+      kind: 'delete-thread'
+      requestedAt: string
+      remoteAction: 'archive' | 'delete'
+    }
+
+export type SessionAbortIntent = {
   requestedAt: string
+  turnId?: string
 }
 
 export type SessionState = {
@@ -60,6 +71,7 @@ export type SessionState = {
   }
   archived?: boolean
   lifecycleIntent?: SessionLifecycleIntent
+  abortIntent?: SessionAbortIntent
   activeTurnId?: string
   contextTokens?: number
   contextWindow?: number
@@ -96,8 +108,15 @@ export type DiscordOutboxEntry = {
   itemKey: string
   chunkIndex: number
   content: string
+  suppressNotifications: boolean
   nonce: string
   createdAt: string
+}
+
+export type RootChannelTombstone = {
+  channelId: string
+  projectDirectory: string
+  deletedAt: string
 }
 
 export type CordexState = {
@@ -110,6 +129,7 @@ export type CordexState = {
   sessions: Record<string, SessionState>
   queues: Record<string, QueuedPrompt[]>
   tasks: Record<string, ScheduledTask>
+  rootChannelTombstones?: Record<string, RootChannelTombstone>
   discordOutbox?: DiscordOutboxEntry[]
   discordOutboxDeliveredKeys?: string[]
 }

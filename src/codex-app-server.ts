@@ -14,11 +14,13 @@ import type {
   ServerRequest,
   UserInput,
 } from './types.js'
+import { createLogger, type StructuredLogger } from './logger.js'
 import { packageVersion } from './version.js'
 
 type PendingRequest = {
   child: ChildProcessWithoutNullStreams
   method: string
+  startedAt: number
   timer?: NodeJS.Timeout
   resolve(value: unknown): void
   reject(error: Error): void
@@ -1334,6 +1336,7 @@ export class CodexAppServer extends EventEmitter {
   private readiness = deferred<void>()
   private state: 'starting' | 'ready' | 'restarting' | 'failed' | 'closing' | 'closed' = 'starting'
   private readonly verbose: boolean
+  private readonly logger: StructuredLogger
   private readonly command: string
   private readonly args: string[]
   private readonly initializeTimeoutMs: number
@@ -1353,6 +1356,7 @@ export class CodexAppServer extends EventEmitter {
   constructor(options: CodexAppServerOptions = {}) {
     super()
     this.verbose = options.verbose === true
+    this.logger = createLogger('codex-app-server', { verbose: this.verbose })
     this.command = options.command || process.env.CORDEX_CODEX_BIN || 'codex'
     this.args = [...(options.args || ['app-server', '--stdio'])]
     this.initializeTimeoutMs = this.timeoutOption(
@@ -1455,6 +1459,11 @@ export class CodexAppServer extends EventEmitter {
     }
 
     this.childProcess = child
+    this.logger.info('spawn', {
+      processGeneration: generation,
+      command: this.command,
+      ...(child.pid !== undefined ? { pid: child.pid } : {}),
+    })
     let failed = false
     const stdout = createInterface({ input: child.stdout })
     const fail = (error: Error) => {
@@ -1500,11 +1509,13 @@ export class CodexAppServer extends EventEmitter {
         this.state = 'ready'
         this.readiness.resolve()
         this.armRestartReset()
-        this.emit('ready', {
+        const event = {
           generation: ++this.lifecycleGeneration,
           ...(child.pid !== undefined ? { pid: child.pid } : {}),
           restartAttempt: this.restartAttempt,
-        } satisfies CodexAppServerReadyEvent)
+        } satisfies CodexAppServerReadyEvent
+        this.logger.info('ready', event)
+        this.emit('ready', event)
       },
       (cause) => {
         const error = cause instanceof Error ? cause : new Error(String(cause))
@@ -1565,6 +1576,12 @@ export class CodexAppServer extends EventEmitter {
       delayMs,
       error,
     }
+    this.logger.warn('restart_scheduled', {
+      generation: event.generation,
+      attempt: event.attempt,
+      delayMs: event.delayMs,
+      error,
+    })
     this.emit('restarting', event)
     this.restartTimer = setTimeout(() => {
       this.restartTimer = undefined
@@ -1586,6 +1603,10 @@ export class CodexAppServer extends EventEmitter {
     this.state = 'failed'
     this.readiness.reject(error)
     this.rejectPending(error)
+    this.logger.error('terminal_failure', error, {
+      lifecycleGeneration: this.lifecycleGeneration,
+      restartAttempts: this.restartAttempt,
+    })
     this.emit('failed', error)
     this.emitClose(error)
   }
@@ -1655,7 +1676,6 @@ export class CodexAppServer extends EventEmitter {
       throw this.unavailableError()
     }
     const line = JSON.stringify(message)
-    if (this.verbose) console.error(`[codex ->] ${line}`)
     child.stdin.write(`${line}\n`)
   }
 
@@ -1677,12 +1697,12 @@ export class CodexAppServer extends EventEmitter {
   }
 
   private handleLine(child: ChildProcessWithoutNullStreams, line: string): void {
-    if (this.verbose) console.error(`[codex <-] ${line}`)
     let value: unknown
     try {
       value = JSON.parse(line)
     } catch {
-      this.emit('protocolError', new Error(`Invalid JSON from Codex: ${line.slice(0, 200)}`))
+      this.logger.warn('protocol_error', { direction: 'inbound', reason: 'invalid_json' })
+      this.emit('protocolError', new Error('Invalid JSON from Codex app-server'))
       return
     }
     if (!isRecord(value)) return
@@ -1694,14 +1714,30 @@ export class CodexAppServer extends EventEmitter {
       if (!pending || pending.child !== child) return
       this.pending.delete(responseId)
       if (pending.timer) clearTimeout(pending.timer)
+      const latencyMs = Math.max(0, Math.round(performance.now() - pending.startedAt))
       if (isRecord(object.error)) {
+        this.logger.warn('rpc_failed', {
+          direction: 'inbound',
+          method: pending.method,
+          id: responseId,
+          latencyMs,
+          errorCode: String(object.error.code ?? 'error'),
+        })
         pending.reject(
           new Error(
             `Codex RPC ${String(object.error.code ?? 'error')}: ${String(object.error.message ?? 'Unknown error')}`,
           ),
         )
       }
-      else pending.resolve(object.result)
+      else {
+        this.logger.info('rpc_complete', {
+          direction: 'inbound',
+          method: pending.method,
+          id: responseId,
+          latencyMs,
+        })
+        pending.resolve(object.result)
+      }
       return
     }
     const method = typeof object.method === 'string' ? object.method : undefined
@@ -1710,9 +1746,11 @@ export class CodexAppServer extends EventEmitter {
     if (responseId !== undefined) {
       const request = { id: responseId, method, params } satisfies ServerRequest
       this.serverRequestOwners.set(request, child)
+      this.logger.info('rpc_server_request', { direction: 'inbound', method, id: responseId })
       this.emit('serverRequest', request)
       return
     }
+    this.logger.info('rpc_notification', { direction: 'inbound', method })
     this.emit('notification', { method, params } satisfies ServerNotification)
   }
 
@@ -1725,16 +1763,24 @@ export class CodexAppServer extends EventEmitter {
     const id = this.nextId++
     let pending!: PendingRequest
     const promise = new Promise<unknown>((resolve, reject) => {
-      pending = { child, method, resolve, reject }
+      pending = { child, method, startedAt: performance.now(), resolve, reject }
       this.pending.set(id, pending)
     })
     pending.timer = setTimeout(() => this.handleRequestTimeout(id, pending, timeoutMs), timeoutMs)
+    this.logger.info('rpc_request', { direction: 'outbound', method, id, timeoutMs })
     try {
       this.sendToChild(child, { id, method, params })
     } catch (error) {
       this.pending.delete(id)
       clearTimeout(pending.timer)
       delete pending.timer
+      this.logger.warn('rpc_send_failed', {
+        direction: 'outbound',
+        method,
+        id,
+        latencyMs: Math.max(0, Math.round(performance.now() - pending.startedAt)),
+        error: error instanceof Error ? error : new Error(String(error)),
+      })
       pending.reject(error instanceof Error ? error : new Error(String(error)))
       return promise
     }
@@ -1750,6 +1796,13 @@ export class CodexAppServer extends EventEmitter {
     this.pending.delete(id)
     delete pending.timer
     const error = new Error(`Codex RPC ${pending.method} timed out after ${timeoutMs}ms`)
+    this.logger.warn('rpc_timeout', {
+      direction: 'outbound',
+      method: pending.method,
+      id,
+      timeoutMs,
+      latencyMs: Math.max(0, Math.round(performance.now() - pending.startedAt)),
+    })
     pending.reject(error)
     this.childFailureHandlers.get(pending.child)?.(error)
   }
@@ -2613,6 +2666,10 @@ export class CodexAppServer extends EventEmitter {
   private async closeInternal(): Promise<void> {
     if (this.state === 'closed') return
     const child = this.childProcess
+    this.logger.info('shutdown_start', {
+      state: this.state,
+      ...(child?.pid !== undefined ? { pid: child.pid } : {}),
+    })
     this.state = 'closing'
     if (this.restartTimer) {
       clearTimeout(this.restartTimer)
@@ -2656,6 +2713,7 @@ export class CodexAppServer extends EventEmitter {
 
     if (this.childProcess === child) this.childProcess = null
     this.state = 'closed'
+    this.logger.info('shutdown_complete')
     this.emitClose()
   }
 }

@@ -12,7 +12,7 @@ import {
 import type { AccessPolicy } from './access.js'
 import { assertDirectory, getProjectsDirectory } from './config.js'
 import { runGit } from './worktrees.js'
-import type { CordexConfig, ProjectConfig } from './types.js'
+import type { CordexConfig, ProjectConfig, RootChannelTombstone } from './types.js'
 
 type ManagedCategoryConfig = AccessPolicy & {
   categoryId?: string
@@ -189,6 +189,7 @@ export async function ensureRootChannel(options: {
     | 'categoryId'
   >
   botName?: string
+  tombstone?: RootChannelTombstone
 }): Promise<RootChannelResult | undefined> {
   const configuredRoot = rootProjectDirectory(options.config)
   await initializeRootDirectory(configuredRoot)
@@ -212,6 +213,11 @@ export async function ensureRootChannel(options: {
       return { textChannel: channel, projectDirectory, created: false }
     }
   }
+
+  if (
+    options.tombstone &&
+    path.resolve(options.tombstone.projectDirectory) === projectDirectory
+  ) return undefined
 
   const expectedName = rootChannelName(options.botName)
   const unowned = options.guild.channels.cache.find(

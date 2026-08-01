@@ -6,6 +6,31 @@ versioning once tagged releases begin.
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-08-01
+
+### Added
+
+- Structured Discord and Codex runtime logging with bounded, secret-safe
+  diagnostics.
+- Markdown-aware, Unicode-safe Discord output splitting with semantic and hard
+  size limits.
+
+### Changed
+
+- Disabled passive goal and session auto-resume during startup and recovery;
+  queued follow-ups remain recoverable without silently restarting work.
+- Suppressed follow-up notifications only when an actual queued prompt exists,
+  and omitted footers for empty successful turns.
+
+### Fixed
+
+- Made abort, Discord-thread deletion, and project removal crash-durable across
+  Codex RPC failures, state-write failures, and restart reconciliation.
+- Hardened prompt and outbox locking, rollback, late-output guards, and bounded
+  deletion cleanup.
+- Added root-channel tombstones, branch autocomplete, clamped command
+  descriptions, and bounded `/clear-queue` details.
+
 ## [0.1.6] - 2026-08-01
 
 ### Fixed

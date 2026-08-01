@@ -25,6 +25,38 @@ const restartFixture = path.join(
   'restarting-codex.mjs',
 )
 
+type StructuredLogRecord = {
+  timestamp: string
+  level: 'debug' | 'info' | 'warn' | 'error'
+  component: string
+  event: string
+  metadata?: Record<string, unknown>
+  error?: { name: string; message: string; stack?: string }
+}
+
+function captureConsoleErrors(): { lines: string[]; restore(): void } {
+  const lines: string[] = []
+  const original = console.error
+  console.error = (...values: unknown[]) => lines.push(values.map(String).join(' '))
+  return {
+    lines,
+    restore() {
+      console.error = original
+    },
+  }
+}
+
+function structuredLogs(lines: string[]): StructuredLogRecord[] {
+  return lines.flatMap((line) => {
+    if (!line.startsWith('{')) return []
+    try {
+      return [JSON.parse(line) as StructuredLogRecord]
+    } catch {
+      return []
+    }
+  })
+}
+
 const dynamicTools: DynamicToolSpec[] = [
   {
     type: 'function',
@@ -50,6 +82,118 @@ test('Codex app-server validates RPC watchdog timeouts before spawning', () => {
     () => new CodexAppServer({ requestTimeoutMs: 1.5 }),
     /requestTimeoutMs must be an integer >= 1/,
   )
+})
+
+test('Codex app-server logs verbose lifecycle and payload-free RPC diagnostics', async () => {
+  const captured = captureConsoleErrors()
+  const codex = new CodexAppServer({
+    command: process.execPath,
+    args: [fixture],
+    verbose: true,
+  })
+
+  try {
+    assert.equal(await codex.request('fixture/threadStartParams', {
+      prompt: 'structured-log-secret',
+      toolInput: { command: 'do not log this' },
+    }), null)
+    await codex.close()
+
+    const records = structuredLogs(captured.lines)
+    assert.ok(records.every((record) => record.component === 'codex-app-server'))
+    assert.ok(records.every((record) => !Number.isNaN(Date.parse(record.timestamp))))
+    assert.ok(records.some((record) => record.level === 'info' && record.event === 'spawn'))
+    assert.ok(records.some((record) => record.level === 'info' && record.event === 'ready'))
+    assert.ok(records.some((record) => record.level === 'info' && record.event === 'shutdown_start'))
+    assert.ok(records.some((record) => record.level === 'info' && record.event === 'shutdown_complete'))
+
+    const request = records.find((record) => (
+      record.event === 'rpc_request' && record.metadata?.method === 'fixture/threadStartParams'
+    ))
+    assert.equal(request?.metadata?.direction, 'outbound')
+    assert.equal(typeof request?.metadata?.id, 'number')
+    assert.equal(typeof request?.metadata?.timeoutMs, 'number')
+    const response = records.find((record) => (
+      record.event === 'rpc_complete' && record.metadata?.method === 'fixture/threadStartParams'
+    ))
+    assert.equal(response?.metadata?.direction, 'inbound')
+    assert.equal(response?.metadata?.id, request?.metadata?.id)
+    assert.equal(typeof response?.metadata?.latencyMs, 'number')
+    assert.ok(Number(response?.metadata?.latencyMs) >= 0)
+    assert.doesNotMatch(captured.lines.join('\n'), /structured-log-secret|do not log this/)
+  } finally {
+    await codex.close()
+    captured.restore()
+  }
+})
+
+test('Codex app-server reports malformed protocol input without logging its payload', async () => {
+  const captured = captureConsoleErrors()
+  const codex = new CodexAppServer({
+    command: process.execPath,
+    args: [fixture],
+    verbose: true,
+  })
+  const protocolErrors: Error[] = []
+  codex.on('protocolError', (error: Error) => protocolErrors.push(error))
+  const malformedPayload = 'malformed-protocol-secret'
+
+  try {
+    await codex.request('fixture/threadStartParams', {})
+    const internal = codex as unknown as {
+      handleLine(child: unknown, line: string): void
+    }
+    internal.handleLine(codex.child, malformedPayload)
+
+    assert.equal(protocolErrors.length, 1)
+    assert.equal(protocolErrors[0]?.message, 'Invalid JSON from Codex app-server')
+    const protocolRecord = structuredLogs(captured.lines).find(
+      (record) => record.event === 'protocol_error',
+    )
+    assert.deepEqual(protocolRecord?.metadata, {
+      direction: 'inbound',
+      reason: 'invalid_json',
+    })
+    assert.doesNotMatch(
+      `${captured.lines.join('\n')}\n${protocolErrors.map((error) => error.message).join('\n')}`,
+      /malformed-protocol-secret/,
+    )
+  } finally {
+    await codex.close()
+    captured.restore()
+  }
+})
+
+test('Codex app-server always logs restart and terminal failure diagnostics', async () => {
+  const captured = captureConsoleErrors()
+  const command = path.join(os.tmpdir(), `missing-cordex-log-${process.pid}-${Date.now()}`)
+  const codex = new CodexAppServer({
+    command,
+    restart: { maxAttempts: 1, initialDelayMs: 1, maxDelayMs: 1, resetAfterMs: 1_000 },
+  })
+  const failed = once(codex, 'failed')
+
+  try {
+    await assert.rejects(
+      codex.request('fixture/ping', {}),
+      /Codex app-server restart attempts exhausted after 1 attempt/,
+    )
+    await failed
+
+    const records = structuredLogs(captured.lines)
+    const restart = records.find((record) => record.event === 'restart_scheduled')
+    assert.equal(restart?.level, 'warn')
+    assert.equal(restart?.metadata?.attempt, 1)
+    assert.equal(restart?.metadata?.delayMs, 1)
+    const failure = records.find((record) => record.event === 'terminal_failure')
+    assert.equal(failure?.level, 'error')
+    assert.match(failure?.error?.message ?? '', /restart attempts exhausted/)
+    assert.match(failure?.error?.stack ?? '', /Codex app-server restart attempts exhausted/)
+    assert.equal(records.some((record) => record.event === 'spawn'), false)
+  } finally {
+    await codex.close()
+    captured.restore()
+  }
 })
 
 test('Codex app-server client covers thread, turn, stream, model, steer, interrupt', async () => {

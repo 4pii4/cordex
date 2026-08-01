@@ -142,6 +142,58 @@ test('root channel uses the configured projects directory and is idempotent', as
   }
 })
 
+test('root channel tombstone suppresses recreation only for its guild and directory', async () => {
+  const projectsDirectory = await mkdtemp(path.join(tmpdir(), 'cordex-root-tombstone-'))
+  const otherProjectsDirectory = await mkdtemp(path.join(tmpdir(), 'cordex-root-tombstone-other-'))
+  const tombstone = {
+    channelId: 'deleted-root',
+    projectDirectory: path.join(projectsDirectory, 'cordex'),
+    deletedAt: '2026-08-01T00:00:00.000Z',
+  }
+  try {
+    const blocked = fakeGuild()
+    const blockedConfig: CordexConfig = {
+      token: 'token',
+      applicationId: 'app',
+      guildId: 'guild',
+      sandbox: 'workspace-write',
+      approvalPolicy: 'on-request',
+      allowAllUsers: false,
+      allowShellCommands: false,
+      projectsDirectory,
+      projects: {},
+    }
+    assert.equal(
+      await ensureRootChannel({ guild: blocked.guild, config: blockedConfig, tombstone }),
+      undefined,
+    )
+    assert.equal(
+      [...blocked.channels.values()].filter((channel) => channel.type === ChannelType.GuildText).length,
+      0,
+    )
+
+    const changedDirectory = fakeGuild()
+    const changedConfig = { ...blockedConfig, projectsDirectory: otherProjectsDirectory, projects: {} }
+    const recreated = await ensureRootChannel({
+      guild: changedDirectory.guild,
+      config: changedConfig,
+      tombstone,
+    })
+    assert.equal(recreated?.created, true)
+
+    const live = fakeGuild()
+    const liveConfig = { ...blockedConfig, projects: {} }
+    const existing = await ensureRootChannel({ guild: live.guild, config: liveConfig })
+    assert.ok(existing)
+    const retained = await ensureRootChannel({ guild: live.guild, config: liveConfig, tombstone })
+    assert.equal(retained?.textChannel.id, existing.textChannel.id)
+    assert.equal(retained?.created, false)
+  } finally {
+    await rm(projectsDirectory, { recursive: true, force: true })
+    await rm(otherProjectsDirectory, { recursive: true, force: true })
+  }
+})
+
 test('root setup does not adopt an unmapped same-name channel', async () => {
   const { guild, channels } = fakeGuild()
   const projectsDirectory = await mkdtemp(path.join(tmpdir(), 'cordex-unowned-root-'))

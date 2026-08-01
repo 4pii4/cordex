@@ -4,7 +4,13 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import type { ChatInputCommandInteraction, ThreadChannel } from 'discord.js'
+import {
+  ChannelType,
+  Collection,
+  type ChatInputCommandInteraction,
+  type Guild,
+  type ThreadChannel,
+} from 'discord.js'
 import { CodexAppServer, type CodexThreadRuntimeState } from '../src/codex-app-server.js'
 import { CordexDiscordBot } from '../src/discord-bot.js'
 import {
@@ -54,6 +60,8 @@ class FakeCodex extends EventEmitter {
   }
 
   async updateThreadSettings(): Promise<void> {}
+
+  async close(): Promise<void> {}
 }
 
 class GoalRaceCodex extends FakeCodex {
@@ -165,7 +173,21 @@ type DispatchInternalBot = InternalBot & {
 type GoalInternalBot = InternalBot & {
   loadedThreads: Set<string>
   handleGoalCommand(interaction: ChatInputCommandInteraction): Promise<void>
-  resumeActiveGoalSessions(): Promise<void>
+}
+
+type StartupInternalBot = InternalBot & {
+  loadedThreads: Set<string>
+  pruneAttachmentCache(): Promise<void>
+  registerCommands(): Promise<void>
+  reconcileSessionLifecycleIntents(): Promise<void>
+  reconcileWorktreeRemovalIntents(): Promise<void>
+  refreshProjectsFromDisk(): Promise<void>
+  pruneDeletedProjectMappings(): Promise<void>
+  pruneOrphanedState(): Promise<void>
+  recoverDiscordOutbox(): Promise<void>
+  reconcilePersistedQueuedSources(): Promise<void>
+  reconcileSessionTitles(): Promise<void>
+  recoverPersistedPromptQueues(): Promise<void>
 }
 
 function sleep(milliseconds: number): Promise<void> {
@@ -207,6 +229,39 @@ function makeState(session: SessionState): CordexState {
     queues: {},
     tasks: {},
   }
+}
+
+function makeStartupGuild(rootChannelId: string): Guild {
+  const channels = new Collection<string, any>()
+  const category = {
+    id: 'category-1',
+    type: ChannelType.GuildCategory,
+    permissionOverwrites: { async set() {} },
+  }
+  const rootChannel = {
+    id: rootChannelId,
+    type: ChannelType.GuildText,
+    parentId: category.id,
+    async lockPermissions() {
+      return this
+    },
+  }
+  channels.set(category.id, category)
+  channels.set(rootChannel.id, rootChannel)
+  return {
+    id: 'guild-1',
+    ownerId: 'owner-1',
+    client: { user: { id: 'bot-1' } },
+    channels: {
+      cache: channels,
+      async fetch() {
+        return channels
+      },
+      async create() {
+        throw new Error('Unexpected channel creation')
+      },
+    },
+  } as unknown as Guild
 }
 
 test('Codex notifications for a thread preserve Discord message order', async () => {
@@ -892,8 +947,11 @@ test('a Cordex-started queue drain does not steer the next queued prompt into th
   }
 })
 
-test('startup resumes active persisted goals without loading paused goals', async () => {
+test('passive startup does not load a persisted session solely because its goal is active', async () => {
+  const home = await mkdtemp(path.join(tmpdir(), 'cordex-startup-goal-home-'))
   const directory = await mkdtemp(path.join(tmpdir(), 'cordex-startup-goal-project-'))
+  const oldHome = process.env.CORDEX_HOME
+  process.env.CORDEX_HOME = home
   const activeSession: SessionState = {
     discordThreadId: 'discord-startup-active',
     parentChannelId: 'parent-1',
@@ -901,30 +959,48 @@ test('startup resumes active persisted goals without loading paused goals', asyn
     codexThreadId: 'codex-startup-active',
     updatedAt: new Date(0).toISOString(),
   }
-  const pausedSession: SessionState = {
-    discordThreadId: 'discord-startup-paused',
-    parentChannelId: 'parent-1',
-    directory,
-    codexThreadId: 'codex-startup-paused',
-    updatedAt: new Date(0).toISOString(),
-  }
   const state = makeState(activeSession)
-  state.sessions[pausedSession.discordThreadId] = pausedSession
   const codex = new StartupGoalCodex()
+  const config = makeConfig(directory)
+  const rootChannelId = 'root-channel'
+  const rootDirectory = path.join(directory, 'cordex')
+  config.projectsDirectory = directory
+  config.categoryId = 'category-1'
+  config.projects[rootChannelId] = { directory: rootDirectory, kind: 'root' }
   const bot = new CordexDiscordBot(
-    makeConfig(directory),
+    config,
     state,
     codex as unknown as CodexAppServer,
   )
-  const internal = bot as unknown as GoalInternalBot
+  const internal = bot as unknown as StartupInternalBot
+  const guild = makeStartupGuild(rootChannelId)
+  Object.defineProperty(bot.client, 'login', {
+    configurable: true,
+    value: async () => 'fixture-token',
+  })
+  ;(bot.client.guilds as unknown as { fetch(id: string): Promise<Guild> }).fetch = async () => guild
+  internal.pruneAttachmentCache = async () => undefined
+  internal.registerCommands = async () => undefined
+  internal.reconcileSessionLifecycleIntents = async () => undefined
+  internal.reconcileWorktreeRemovalIntents = async () => undefined
+  internal.refreshProjectsFromDisk = async () => undefined
+  internal.pruneDeletedProjectMappings = async () => undefined
+  internal.pruneOrphanedState = async () => undefined
+  internal.recoverDiscordOutbox = async () => undefined
+  internal.reconcilePersistedQueuedSources = async () => undefined
+  internal.reconcileSessionTitles = async () => undefined
+  internal.recoverPersistedPromptQueues = async () => undefined
 
   try {
-    await internal.resumeActiveGoalSessions()
-    assert.deepEqual(codex.resumed, [activeSession.codexThreadId])
-    assert.equal(internal.loadedThreads.has(activeSession.codexThreadId), true)
-    assert.equal(internal.loadedThreads.has(pausedSession.codexThreadId), false)
+    await bot.start()
+
+    assert.deepEqual(codex.resumed, [])
+    assert.equal(internal.loadedThreads.has(activeSession.codexThreadId), false)
   } finally {
-    bot.client.destroy()
+    await bot.stop()
+    if (oldHome === undefined) delete process.env.CORDEX_HOME
+    else process.env.CORDEX_HOME = oldHome
+    await rm(home, { recursive: true, force: true })
     await rm(directory, { recursive: true, force: true })
   }
 })

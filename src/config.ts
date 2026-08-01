@@ -14,7 +14,9 @@ import type {
   CordexState,
   QueuedPrompt,
   ReasoningEffort,
+  SessionAbortIntent,
   SessionLifecycleIntent,
+  RootChannelTombstone,
   VerbosityLevel,
 } from './types.js'
 
@@ -192,6 +194,7 @@ export const emptyState = (): CordexState => ({
   sessions: {},
   queues: {},
   tasks: {},
+  rootChannelTombstones: {},
   discordOutbox: [],
   discordOutboxDeliveredKeys: [],
 })
@@ -312,6 +315,9 @@ function parseSessions(value: unknown): CordexState['sessions'] {
     const lifecycleIntent = parseSessionLifecycleIntent(raw.lifecycleIntent)
     if (lifecycleIntent) session.lifecycleIntent = lifecycleIntent
     else delete session.lifecycleIntent
+    const abortIntent = parseSessionAbortIntent(raw.abortIntent)
+    if (abortIntent) session.abortIntent = abortIntent
+    else delete session.abortIntent
     if (!isContextTokenCount(raw.contextTokens)) {
       delete session.contextTokens
       delete session.contextWindow
@@ -332,13 +338,60 @@ function parseSessionLifecycleIntent(value: unknown): SessionLifecycleIntent | u
     !isRecord(value) ||
     (value.kind !== 'archive' &&
       value.kind !== 'resume' &&
-      value.kind !== 'remove-worktree') ||
+      value.kind !== 'remove-worktree' &&
+      value.kind !== 'delete-thread') ||
     typeof value.requestedAt !== 'string' ||
-    !Number.isFinite(Date.parse(value.requestedAt))
+    !Number.isFinite(Date.parse(value.requestedAt)) ||
+    (value.kind === 'delete-thread' &&
+      value.remoteAction !== 'archive' &&
+      value.remoteAction !== 'delete')
   ) return undefined
+  if (value.kind === 'delete-thread') {
+    return {
+      kind: value.kind,
+      requestedAt: value.requestedAt,
+      remoteAction: value.remoteAction as 'archive' | 'delete',
+    }
+  }
   return {
     kind: value.kind,
     requestedAt: value.requestedAt,
+  }
+}
+
+function parseRootChannelTombstones(
+  value: unknown,
+): Record<string, RootChannelTombstone> {
+  if (!isRecord(value)) return {}
+  return Object.fromEntries(Object.entries(value).flatMap(([guildId, raw]) => {
+    if (
+      !guildId ||
+      !isRecord(raw) ||
+      typeof raw.channelId !== 'string' ||
+      !raw.channelId ||
+      typeof raw.projectDirectory !== 'string' ||
+      !raw.projectDirectory ||
+      typeof raw.deletedAt !== 'string' ||
+      !Number.isFinite(Date.parse(raw.deletedAt))
+    ) return []
+    return [[guildId, {
+      channelId: raw.channelId,
+      projectDirectory: path.resolve(raw.projectDirectory),
+      deletedAt: raw.deletedAt,
+    }]]
+  }))
+}
+
+function parseSessionAbortIntent(value: unknown): SessionAbortIntent | undefined {
+  if (
+    !isRecord(value) ||
+    typeof value.requestedAt !== 'string' ||
+    !Number.isFinite(Date.parse(value.requestedAt)) ||
+    (value.turnId !== undefined && (typeof value.turnId !== 'string' || !value.turnId))
+  ) return undefined
+  return {
+    requestedAt: value.requestedAt,
+    ...(typeof value.turnId === 'string' ? { turnId: value.turnId } : {}),
   }
 }
 
@@ -458,6 +511,7 @@ export async function loadState(): Promise<CordexState> {
     sessions: parseSessions(value.sessions),
     queues,
     tasks,
+    rootChannelTombstones: parseRootChannelTombstones(value.rootChannelTombstones),
     discordOutbox: parseDiscordOutbox(value.discordOutbox, discordOutboxDeliveredKeys),
     discordOutboxDeliveredKeys,
   }

@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
-import type { ThreadChannel } from 'discord.js'
+import { MessageFlags, type ThreadChannel } from 'discord.js'
 import type { CodexAppServer } from '../src/codex-app-server.js'
 import { emptyState, loadState } from '../src/config.js'
 import { CordexDiscordBot } from '../src/discord-bot.js'
@@ -35,6 +35,7 @@ class FakeCodex extends EventEmitter {
 
 type SendPayload = string | {
   content?: string
+  flags?: number
   nonce?: string | number
   enforceNonce?: boolean
 }
@@ -49,12 +50,14 @@ type TestRun = {
   startedAt: number
   agentText: Map<string, string>
   typingTimer: NodeJS.Timeout
+  visibleOutput: boolean
   lastError?: string
 }
 
 type InternalBot = {
   runs: Map<string, TestRun>
   onItemCompleted(run: TestRun, params: JsonObject): Promise<void>
+  onTurnError(run: TestRun, params: JsonObject): Promise<void>
   onTurnCompleted(run: TestRun, params: JsonObject, generation?: number): Promise<void>
   recoverDiscordOutbox(): Promise<void>
   scheduleQueueDrain(...args: unknown[]): void
@@ -62,6 +65,7 @@ type InternalBot = {
   beginCodexRecovery(generation: number): void
   finishIngressBarrier(): void
   finishCodexRecovery(generation: number): void
+  waitForMutationIngressReady(): Promise<void>
   handleButton(interaction: unknown): Promise<void>
   handlePriorityCommand(interaction: unknown): Promise<void>
   handleUserInputSelect(interaction: unknown): Promise<void>
@@ -120,6 +124,7 @@ function makeRun(session: SessionState, channel: ThreadChannel): TestRun {
     startedAt: Date.now() - 1_000,
     agentText: new Map(),
     typingTimer,
+    visibleOutput: false,
   }
 }
 
@@ -167,6 +172,7 @@ test('persisted legacy outbox nonces are normalized without dropping output', ()
     turnId: 'turn',
     itemKey: 'message',
     chunks: ['Pending output.'],
+    suppressNotifications: false,
     createdAt: new Date(0).toISOString(),
   })
   assert.ok(entry)
@@ -178,6 +184,28 @@ test('persisted legacy outbox nonces are normalized without dropping output', ()
   assert.equal(parsed[0]?.content, entry.content)
   assert.equal(parsed[0]?.nonce, discordOutboxNonce(entry.key))
   assert.notEqual(parsed[0]?.nonce, legacyNonce)
+})
+
+test('Discord outbox preserves notification policy and defaults legacy entries to notifying', () => {
+  const [silentEntry] = createDiscordOutboxEntries({
+    discordThreadId: 'discord-thread',
+    codexThreadId: 'codex-thread',
+    turnId: 'turn',
+    itemKey: 'message',
+    chunks: ['Pending output.'],
+    createdAt: new Date(0).toISOString(),
+    suppressNotifications: true,
+  })
+  assert.ok(silentEntry)
+
+  const [parsedSilent] = parseDiscordOutbox([silentEntry])
+  const [parsedLegacy] = parseDiscordOutbox([{
+    ...silentEntry,
+    suppressNotifications: undefined,
+  }])
+
+  assert.equal(parsedSilent?.suppressNotifications, true)
+  assert.equal(parsedLegacy?.suppressNotifications, false)
 })
 
 test('completed output is persisted before send and duplicate item notifications do not resend', async () => {
@@ -219,6 +247,7 @@ test('completed output is persisted before send and duplicate item notifications
 
       assert.equal(payloads.length, 1)
       assert.equal(payloads[0]?.content, 'Durable response.')
+      assert.equal(payloads[0]?.flags, MessageFlags.SuppressNotifications)
       assert.equal(payloads[0]?.enforceNonce, true)
       assert.equal(typeof payloads[0]?.nonce, 'string')
       assert.ok(String(payloads[0]?.nonce).length <= 25)
@@ -320,6 +349,9 @@ test('a crash after a partial chunk send recovers only unsent chunks with stable
       )
       assert.equal(recoveredPayloads[0]?.nonce, failedNonce)
       assert.ok(recoveredPayloads.every((payload) => payload.enforceNonce === true))
+      assert.ok(recoveredPayloads.every(
+        (payload) => payload.flags === MessageFlags.SuppressNotifications,
+      ))
       assert.ok(recoveredPayloads.every((payload) => String(payload.nonce).length <= 25))
       assert.deepEqual(recoveredState.discordOutbox, [])
       assert.equal(recoveredState.discordOutboxDeliveredKeys?.length, expectedChunks.length + 1)
@@ -355,6 +387,7 @@ test('footer is durable before turn finalization and delivery cannot hold queue 
       dismissPendingControlsForChannel(): Promise<void>
     }
     const run = makeRun(session, channel)
+    run.visibleOutput = true
     internal.runs.set(session.codexThreadId, run)
     let drainCalls = 0
     let stagedState: CordexState | undefined
@@ -387,6 +420,147 @@ test('footer is durable before turn finalization and delivery cannot hold queue 
       await waitFor(() => state.discordOutbox?.length === 0)
     } finally {
       releaseSend()
+      clearInterval(run.typingTimer)
+      bot.client.destroy()
+    }
+  })
+})
+
+test('completed turn without visible output suppresses the run footer', async () => {
+  await withFixture(async ({ directory, state, session }) => {
+    const payloads: SendPayload[] = []
+    const channel = {
+      id: session.discordThreadId,
+      async send(payload: SendPayload) {
+        payloads.push(payload)
+        return { async edit() { return this } }
+      },
+    } as unknown as ThreadChannel
+    const bot = new CordexDiscordBot(
+      makeConfig(directory),
+      state,
+      new FakeCodex() as unknown as CodexAppServer,
+    )
+    const internal = bot as unknown as InternalBot & {
+      dismissPendingControlsForChannel(): Promise<void>
+    }
+    const run = makeRun(session, channel)
+    internal.runs.set(session.codexThreadId, run)
+    internal.dismissPendingControlsForChannel = async () => undefined
+    internal.scheduleQueueDrain = () => undefined
+
+    try {
+      await internal.onTurnCompleted(run, {
+        threadId: session.codexThreadId,
+        turnId: run.turnId,
+        turn: { id: run.turnId, status: 'completed', durationMs: 1_000 },
+      })
+
+      assert.deepEqual(state.discordOutbox, [])
+      assert.deepEqual(payloads, [])
+    } finally {
+      clearInterval(run.typingTimer)
+      bot.client.destroy()
+    }
+  })
+})
+
+test('terminal output notifies only when no prompt follows', async (t) => {
+  for (const fixture of [
+    { name: 'queue is empty', deliveryKind: undefined, suppressNotifications: false },
+    { name: 'queued prompt follows', deliveryKind: 'queued' as const, suppressNotifications: true },
+    { name: 'direct delivery ledger remains', deliveryKind: 'direct' as const, suppressNotifications: false },
+  ]) {
+    await t.test(fixture.name, async () => {
+      await withFixture(async ({ directory, state, session }) => {
+          if (fixture.deliveryKind) {
+            state.queues[session.discordThreadId] = [{
+              id: `${fixture.deliveryKind}-prompt`,
+              authorId: 'user-1',
+              authorName: 'User',
+              input: [{ type: 'text', text: 'Prompt.', text_elements: [] }],
+              displayText: 'Prompt.',
+              createdAt: new Date(0).toISOString(),
+              deliveryKind: fixture.deliveryKind,
+            }]
+          }
+        const payloads: Array<Exclude<SendPayload, string>> = []
+        const channel = {
+          id: session.discordThreadId,
+          async send(payload: SendPayload) {
+            assert.equal(typeof payload, 'object')
+            payloads.push(payload as Exclude<SendPayload, string>)
+            return { async edit() { return this } }
+          },
+        } as unknown as ThreadChannel
+        const bot = new CordexDiscordBot(
+          makeConfig(directory),
+          state,
+          new FakeCodex() as unknown as CodexAppServer,
+        )
+        const internal = bot as unknown as InternalBot
+        const run = makeRun(session, channel)
+
+        try {
+          await internal.onTurnError(run, {
+            threadId: session.codexThreadId,
+            turnId: run.turnId,
+            error: { message: 'Terminal failure.' },
+            willRetry: false,
+          })
+
+          assert.equal(payloads.length, 1)
+            assert.equal(
+              payloads[0]?.flags,
+              fixture.suppressNotifications ? MessageFlags.SuppressNotifications : undefined,
+            )
+        } finally {
+          clearInterval(run.typingTimer)
+          bot.client.destroy()
+        }
+      })
+    })
+  }
+})
+
+test('terminal finalization clears the local run and fails closed when state persistence fails', async () => {
+  await withFixture(async ({ home, directory, state, session }) => {
+    const channel = {
+      id: session.discordThreadId,
+      async send() {
+        return { async edit() { return this } }
+      },
+    } as unknown as ThreadChannel
+    const bot = new CordexDiscordBot(
+      makeConfig(directory),
+      state,
+      new FakeCodex() as unknown as CodexAppServer,
+    )
+    const internal = bot as unknown as InternalBot
+    const run = makeRun(session, channel)
+    internal.runs.set(session.codexThreadId, run)
+    let drainCalls = 0
+    internal.scheduleQueueDrain = () => {
+      drainCalls += 1
+    }
+    await rm(home, { recursive: true, force: true })
+    await writeFile(home, 'block state directory creation')
+
+    try {
+      await assert.rejects(
+        internal.onTurnCompleted(run, {
+          threadId: session.codexThreadId,
+          turnId: run.turnId,
+          turn: { id: run.turnId, status: 'interrupted', durationMs: 10 },
+        }),
+        /EEXIST|ENOTDIR|not a directory/i,
+      )
+
+      assert.equal(session.activeTurnId, undefined)
+      assert.equal(internal.runs.has(session.codexThreadId), false)
+      assert.equal(drainCalls, 0)
+      await assert.rejects(internal.waitForMutationIngressReady(), /finalization|unavailable/i)
+    } finally {
       clearInterval(run.typingTimer)
       bot.client.destroy()
     }
@@ -590,6 +764,7 @@ for (const completion of [
       )
       const internal = bot as unknown as InternalBot
       const run = makeRun(session, channel)
+      if (completion.status === 'completed') run.visibleOutput = true
       internal.runs.set(session.codexThreadId, run)
       internal.scheduleQueueDrain = () => {
         drainCalls += 1
