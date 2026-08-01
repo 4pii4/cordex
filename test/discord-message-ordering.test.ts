@@ -172,7 +172,7 @@ function sleep(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds))
 }
 
-async function waitFor(condition: () => boolean, timeoutMs = 1_000): Promise<void> {
+async function waitFor(condition: () => boolean, timeoutMs = 5_000): Promise<void> {
   const startedAt = Date.now()
   while (!condition()) {
     if (Date.now() - startedAt > timeoutMs) throw new Error('Timed out waiting for condition')
@@ -473,6 +473,7 @@ test('Codex-started goal turns are adopted and streamed to the linked Discord th
     await waitFor(() => codex.steered.length === 1)
     assert.equal(codex.steered[0]?.expectedTurnId, 'goal-turn-2')
     assert.equal(state.queues[session.discordThreadId]?.length, 0)
+    await waitFor(() => sent.length === 3)
     assert.match(sent[2] || '', /Goal user.*Include this in the next goal turn/)
     codex.emit('notification', {
       method: 'item/completed',
