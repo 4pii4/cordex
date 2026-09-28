@@ -391,6 +391,7 @@ test('Codex-started goal turns are adopted and streamed to the linked Discord th
   const state = makeState(session)
   const codex = new FakeCodex()
   const sent: string[] = []
+  const semanticSent = () => sent.filter((content) => !content.startsWith('Codex is still working'))
   let typingCalls = 0
   const channel = {
     id: session.discordThreadId,
@@ -512,10 +513,10 @@ test('Codex-started goal turns are adopted and streamed to the linked Discord th
       },
     })
 
-    await waitFor(() => sent.length === 2)
+    await waitFor(() => semanticSent().length === 2)
     assert.equal(typingCalls, 2)
-    assert.equal(sent[0], 'Goal work is now visible.')
-    assert.match(sent[1] || '', /gpt-test \(xhigh\)/)
+    assert.equal(semanticSent()[0], 'Goal work is now visible.')
+    assert.match(semanticSent()[1] || '', /gpt-test \(xhigh\)/)
     assert.equal(session.activeTurnId, undefined)
     assert.equal(internal.runs.size, 0)
     codex.emit('notification', {
@@ -532,8 +533,8 @@ test('Codex-started goal turns are adopted and streamed to the linked Discord th
     await waitFor(() => codex.steered.length === 1)
     assert.equal(codex.steered[0]?.expectedTurnId, 'goal-turn-2')
     assert.equal(state.queues[session.discordThreadId]?.length, 0)
-    await waitFor(() => sent.length === 3)
-    assert.match(sent[2] || '', /Goal user.*Include this in the next goal turn/)
+    await waitFor(() => semanticSent().length === 3)
+    assert.match(semanticSent()[2] || '', /Goal user.*Include this in the next goal turn/)
     codex.emit('notification', {
       method: 'item/completed',
       params: {
@@ -557,10 +558,10 @@ test('Codex-started goal turns are adopted and streamed to the linked Discord th
         },
       },
     })
-    await waitFor(() => sent.length === 5)
+    await waitFor(() => semanticSent().length === 5)
     assert.equal(typingCalls, 4)
-    assert.equal(sent[3], 'The second goal turn is visible too.')
-    assert.match(sent[4] || '', /gpt-test \(xhigh\)/)
+    assert.equal(semanticSent()[3], 'The second goal turn is visible too.')
+    assert.match(semanticSent()[4] || '', /gpt-test \(xhigh\)/)
     assert.equal(session.activeTurnId, undefined)
     assert.equal(internal.runs.size, 0)
     codex.emit('notification', {
@@ -600,8 +601,8 @@ test('Codex-started goal turns are adopted and streamed to the linked Discord th
         willRetry: true,
       },
     })
-    await waitFor(() => sent.length === 6)
-    assert.equal(sent[5], '⚠ Temporary goal error. Retrying.')
+    await waitFor(() => semanticSent().length === 6)
+    assert.equal(semanticSent()[5], '⚠ Temporary goal error. Retrying.')
     codex.emit('notification', {
       method: 'error',
       params: {
@@ -611,8 +612,8 @@ test('Codex-started goal turns are adopted and streamed to the linked Discord th
         willRetry: false,
       },
     })
-    await waitFor(() => sent.length === 7)
-    assert.equal(sent[6], '⨯ Goal turn failed.')
+    await waitFor(() => semanticSent().length === 7)
+    assert.equal(semanticSent()[6], '⨯ Goal turn failed.')
     codex.emit('notification', {
       method: 'turn/completed',
       params: {
@@ -628,7 +629,7 @@ test('Codex-started goal turns are adopted and streamed to the linked Discord th
     await waitFor(() => session.activeTurnId === undefined && internal.runs.size === 0)
     await sleep(30)
     assert.equal(typingCalls, 5)
-    assert.equal(sent.length, 7)
+    assert.equal(semanticSent().length, 7)
     assert.deepEqual(state.queues[session.discordThreadId]?.map((item) => item.id), ['queued-after-failure'])
     assert.equal(session.activeTurnId, undefined)
     assert.equal(internal.runs.size, 0)
@@ -639,8 +640,8 @@ test('Codex-started goal turns are adopted and streamed to the linked Discord th
         message: 'Goal warning is visible.',
       },
     })
-    await waitFor(() => sent.length === 8)
-    assert.equal(sent[7], '⚠ Goal warning is visible.')
+    await waitFor(() => semanticSent().length === 8)
+    assert.equal(semanticSent()[7], '⚠ Goal warning is visible.')
     codex.emit('notification', {
       method: 'guardianWarning',
       params: {
@@ -648,8 +649,8 @@ test('Codex-started goal turns are adopted and streamed to the linked Discord th
         message: 'Guardian warning is visible.',
       },
     })
-    await waitFor(() => sent.length === 9)
-    assert.equal(sent[8], '⚠ Guardian warning is visible.')
+    await waitFor(() => semanticSent().length === 9)
+    assert.equal(semanticSent()[8], '⚠ Guardian warning is visible.')
     const completedGoalNotification = {
       method: 'thread/goal/updated',
       params: {
@@ -666,9 +667,9 @@ test('Codex-started goal turns are adopted and streamed to the linked Discord th
     codex.goalStatus = 'complete'
     codex.emit('notification', completedGoalNotification)
     codex.emit('notification', completedGoalNotification)
-    await waitFor(() => sent.length === 11)
-    assert.equal(sent[9], '**Goal complete.** 1,234 tokens · 7s')
-    assert.match(sent[10] || '', /Keep queued after failure/)
+    await waitFor(() => semanticSent().length === 11)
+    assert.equal(semanticSent()[9], '**Goal complete.** 1,234 tokens · 7s')
+    assert.match(semanticSent()[10] || '', /Keep queued after failure/)
     assert.equal(state.queues[session.discordThreadId]?.length, 0)
     const queuedRun = (internal.runs as Map<string, { typingTimer: NodeJS.Timeout }>).get(
       session.codexThreadId,
@@ -689,7 +690,7 @@ test('Codex-started goal turns are adopted and streamed to the linked Discord th
       },
     })
     await sleep(30)
-    assert.equal(sent.length, 11)
+    assert.equal(semanticSent().length, 11)
     assert.equal(session.activeTurnId, undefined)
     assert.equal(internal.runs.size, 0)
   } finally {

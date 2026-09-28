@@ -1646,6 +1646,7 @@ test('ThreadDelete interrupts immediately and cleanup stays idempotent behind bl
       }])
       assert.deepEqual(codex.archived, [session.codexThreadId])
       assert.equal(state.queues[session.discordThreadId], undefined)
+      await waitFor(() => !internal.loadedThreads.has(session.codexThreadId))
       assert.equal(internal.loadedThreads.has(session.codexThreadId), false)
       await assert.rejects(
         internal.enqueuePrompt(session.discordThreadId, {
