@@ -5,6 +5,13 @@ All notable changes to Cordex are documented here. The project follows
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-09-28
+
+### Fixed
+
+- Shipped the compiled CLI and runtime files omitted from the `0.2.0` npm
+  tarball. Use `0.2.1` instead of `0.2.0`.
+
 ## [0.2.0] - 2026-09-28
 
 ### Added
