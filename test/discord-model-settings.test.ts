@@ -145,6 +145,10 @@ function makeState(directory: string): { state: CordexState; session: SessionSta
   }
 }
 
+function markSessionLoaded(bot: CordexDiscordBot, session: SessionState): void {
+  (bot as unknown as { loadedThreads: Set<string> }).loadedThreads.add(session.codexThreadId)
+}
+
 function interaction(options: {
   model?: string
   effort?: ReasoningEffort
@@ -197,6 +201,7 @@ test('/model resets an incompatible effort and updates the live Codex session', 
   const { state, session } = makeState(home)
   const codex = new FakeCodex(models)
   const bot = new CordexDiscordBot(config(home), state, codex as unknown as CodexAppServer)
+  markSessionLoaded(bot, session)
   const replies: string[] = []
   try {
     await (bot as unknown as InternalBot).handleModelCommand(interaction({
@@ -231,6 +236,7 @@ test('channel-scoped model changes also update the current thread session', asyn
   session.effort = 'max'
   const codex = new FakeCodex(models)
   const bot = new CordexDiscordBot(config(home), state, codex as unknown as CodexAppServer)
+  markSessionLoaded(bot, session)
   try {
     await (bot as unknown as InternalBot).handleModelCommand(interaction({
       model: 'gpt-5.6-luna',
@@ -319,6 +325,7 @@ test('/model RPC failure restores the prior durable model, effort, and context',
   const codex = new FakeCodex(models)
   codex.settingsError = new Error('settings RPC failed')
   const bot = new CordexDiscordBot(config(home), state, codex as unknown as CodexAppServer)
+  markSessionLoaded(bot, session)
   try {
     await assert.rejects(
       (bot as unknown as InternalBot).handleModelCommand(interaction({
@@ -353,6 +360,7 @@ test('/model-variant and /fast RPC failures restore their prior durable override
   const codex = new FakeCodex(models)
   codex.settingsError = new Error('settings RPC failed')
   const bot = new CordexDiscordBot(config(home), state, codex as unknown as CodexAppServer)
+  markSessionLoaded(bot, session)
   const internal = bot as unknown as InternalBot
   try {
     await assert.rejects(
@@ -383,6 +391,7 @@ test('/unset-model-override rolls back RPC failure then resets an incompatible e
   const codex = new FakeCodex(models)
   codex.settingsError = new Error('settings RPC failed')
   const bot = new CordexDiscordBot(config(home), state, codex as unknown as CodexAppServer)
+  markSessionLoaded(bot, session)
   const internal = bot as unknown as InternalBot
   try {
     await assert.rejects(
@@ -524,6 +533,7 @@ test('/fast uses the selected model catalog service tier id', async () => {
   session.effort = 'medium'
   const codex = new FakeCodex(models)
   const bot = new CordexDiscordBot(config(home), state, codex as unknown as CodexAppServer)
+  markSessionLoaded(bot, session)
   try {
     await (bot as unknown as InternalBot).handleFastCommand(fastInteraction('on'))
     assert.equal(session.fastMode, true)

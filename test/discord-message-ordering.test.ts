@@ -328,7 +328,11 @@ test('Codex notifications for a thread preserve Discord message order', async ()
       turnId: 'turn-1',
       startedAt: Date.now() - 225_000,
       agentText: new Map(),
+      activeItems: new Map(),
       typingTimer,
+      visibleOutput: false,
+      lastProgressAt: 0,
+      progressSequence: 0,
     })
 
     codex.emit('notification', {
@@ -697,7 +701,7 @@ test('Codex-started goal turns are adopted and streamed to the linked Discord th
   }
 })
 
-test('Discord ingress steers when an automatic goal turn wins the start race', async () => {
+test('Discord ingress does not replay an ambiguous prompt when a goal turn wins', async () => {
   const home = await mkdtemp(path.join(tmpdir(), 'cordex-goal-race-home-'))
   const directory = await mkdtemp(path.join(tmpdir(), 'cordex-goal-race-project-'))
   const oldHome = process.env.CORDEX_HOME
@@ -731,16 +735,17 @@ test('Discord ingress steers when an automatic goal turn wins the start race', a
     async () => channel
 
   try {
-    await internal.dispatchInputUnlocked(
-      channel,
-      session.parentChannelId,
-      [{ type: 'text', text: 'Steer this into the goal turn.', text_elements: [] }],
-      'discord-message-race',
+    await assert.rejects(
+      internal.dispatchInputUnlocked(
+        channel,
+        session.parentChannelId,
+        [{ type: 'text', text: 'Steer this into the goal turn.', text_elements: [] }],
+        'discord-message-race',
+      ),
+      /Thread already has an active turn/,
     )
     assert.equal(session.activeTurnId, 'automatic-goal-turn')
-    assert.equal(codex.steered.length, 1)
-    assert.equal(codex.steered[0]?.expectedTurnId, 'automatic-goal-turn')
-    assert.equal(codex.steered[0]?.clientUserMessageId, 'discord-message-race')
+    assert.equal(codex.steered.length, 0)
 
     codex.emit('notification', {
       method: 'turn/completed',

@@ -79,6 +79,7 @@ switching channels, and switch tasks by switching threads.
 - Project- or session-level model, reasoning, collaboration mode, and permission controls
 - Queued and scheduled prompts with restart recovery
 - Native Codex skill invocation plus MCP, authentication, account, rate-limit, and context diagnostics
+- Codex plugin discovery and management, plus read-only hook trust and app state
 - Reply-aware text and image input, code review, diffs, rollback, and controlled shell execution
 
 ## Setup
@@ -213,6 +214,26 @@ with a per-start mode-`0600` token. Accepted prompts enter the durable direct-
 delivery ledger before the CLI reports success. Safe channel or session creation
 is not yet exposed by this boundary; use `--thread` with an existing Cordex thread.
 
+To post files back to Discord without starting another Codex turn:
+
+```bash
+cordex upload-to-discord --session CODEX_SESSION_ID ./screenshot-1.png ./screenshot-2.png
+cordex upload-to-discord --thread DISCORD_THREAD_ID ./report.csv
+```
+
+Uploads keep up to ten files in one Discord message (an image grid for multiple
+images), with an 8 MiB aggregate safety limit. Paths must resolve inside that
+session's current directory by default, including after symlinks are resolved.
+Use `--allow-outside-project` only for an explicit path you intend to disclose;
+`--request-id ID` makes a retry idempotent. The daemon copies accepted bytes
+into a private cache and retries Discord delivery across network failures and
+bot restarts. Permanent Discord file rejection produces a visible text notice
+instead of retrying the invalid upload forever. New Codex sessions also expose
+`cordex_upload_files`, which lets
+the agent deliver verified project files without connecting to the daemon
+socket from its sandbox. Older sessions can use the CLI with a one-time Codex
+command approval until they are recreated with the new tool.
+
 Inside an existing Cordex thread, a message beginning with a mention of another
 Discord user is stored as passive model context without starting or steering a
 Codex turn. The next real prompt can use that user-to-user discussion.
@@ -235,15 +256,22 @@ Slash commands are registered in the configured Discord server.
 | `/add-project` | Map an existing local repository to a Discord channel |
 | `/new-session` | Start another session, inheriting the current checkout when used in a thread |
 | `/resume` | Reopen a previous active or archived Codex session |
-| `/abort` | Stop the current Codex turn |
+| `/abort` | Interrupt the current Codex turn and warn if a command remains running |
+| `/ps` / `/stop` | Inspect or terminate background commands left in the session |
+| `/delete` | Permanently delete the current Codex transcript after exact-ID confirmation |
+| `/plugins` / `/hooks` / `/apps` | Inspect extension availability and trust state |
+| `/plugin` | Inspect, install, enable, disable, or uninstall a Codex plugin |
+| `/subagents` / `/fork-subagent` | Inspect child agents or continue one in a new thread |
 | `/model` | Change the model and reasoning settings for a channel or session |
 | `/permissions` | List or select a Codex permission profile for the current session |
 | `/queue` | Run a prompt after the current turn finishes |
+| `/pending-prompts` / `/resolve-pending` | Privately review a prompt with uncertain Codex delivery, then retry or discard its exact ID |
 | `/btw` | Fork the current context into a side session |
 | `/new-worktree` | Fork the current session into an isolated Git worktree |
 | `/merge-worktree` | Merge a completed worktree back into its target branch |
 | `/diff` | Show or attach the complete current Git patch |
-| `/status` | Show the active project, session, model, permissions, and queue state |
+| `/status` | Show the working directory, current/next model, requested policy, context usage, and queue |
+| `/debug-config` | Privately inspect Codex config layers, safe effective defaults, and managed policy presence |
 
 <details>
 <summary>Full command inventory and behavior</summary>
@@ -253,26 +281,52 @@ Slash commands are registered in the configured Discord server.
 | Area | Commands |
 | --- | --- |
 | Projects | `/add-project`, `/create-new-project`, `/remove-project`, `/project` |
-| Sessions | `/new-session`, `/resume`, `/rename`, `/fork`, `/fork-subagent`, `/btw`, `/abort`, `/archive`, `/compact`, `/last-sessions`, `/session-id`, `/status` |
+| Sessions | `/new-session`, `/resume`, `/rename`, `/fork`, `/subagents`, `/fork-subagent`, `/btw`, `/abort`, `/ps`, `/stop`, `/archive`, `/delete`, `/compact`, `/last-sessions`, `/session-id`, `/status`, `/debug-config` |
 | Models and runtime | `/model`, `/model-variant`, `/unset-model-override`, `/mode`, `/fast`, `/permissions`, `/add-dir`, `/verbosity`, `/context-usage` |
 | Goals | `/goal`, `/clear-goal` |
 | Git and worktrees | `/diff`, `/review`, `/rollback`, `/new-worktree`, `/merge-worktree`, `/delete-worktree`, `/toggle-worktrees`, `/worktrees` |
-| Automation | `/queue`, `/clear-queue`, `/schedule`, `/tasks`, `/cancel-task` |
-| Codex services | `/skill`, `/skills`, `/skill-toggle`, `/skill-roots`, `/mcp`, `/mcp-status`, `/mcp-login`, `/auth-status`, `/rate-limits`, `/account-usage`, `/login` |
+| Automation | `/queue`, `/clear-queue`, `/pending-prompts`, `/resolve-pending`, `/schedule`, `/tasks`, `/cancel-task` |
+| Codex services | `/skill`, `/skills`, `/skill-toggle`, `/skill-roots`, `/plugins`, `/plugin`, `/hooks`, `/apps`, `/mcp`, `/mcp-status`, `/mcp-login`, `/auth-status`, `/rate-limits`, `/account-usage`, `/login` |
 | Host control | `/run-shell-command`, `!command`, `/yolo` |
 
 `/diff` renders small patches inline and attaches the complete binary-capable
 patch when it exceeds Discord message limits.
 
+During quiet turns, Cordex posts a status after about six seconds and then at
+most once a minute without visible output. It reports the current activity
+without exposing command details in `text_only` mode. Undelivered status
+notices are superseded by newer progress or the final answer when Discord
+reconnects. Cordex warns when a completed turn leaves a background command
+running. `/abort` interrupts the Codex turn; a command that outlives it can be
+inspected with `/ps` and ended with `/stop`.
+
 Messages ending in `. queue` are queued behind the active turn. Removing that
 suffix in an edit dequeues the message. In an existing session, punctuation
 followed by a final `btw` suffix, such as `check the API too. btw`, forks the
 message into a side session like `/btw`. `/mcp` enable and disable actions update
-the global Codex configuration, not only the current Discord project.
+the global Codex configuration, not only the current Discord project. `/mcp`
+reload rereads configuration without changing it and queues loaded-session
+tool refreshes for subsequent turns.
 `/archive` keeps the Discord-to-Codex mapping and session settings so `/resume`
 can reopen the same thread; active goals, turns, queued prompts, and scheduled
 tasks, plus any prompt delivery still awaiting recovery, must be resolved first.
 `/rename` keeps the Discord and Codex titles in sync.
+`/last-sessions` accepts a case-sensitive title fragment and can include archived
+sessions. `/delete` requires the exact ID shown by `/session-id`; it permanently
+removes the Codex transcript and spawned descendants, but keeps project files
+and Discord history, then archives the Discord thread. Finish active work and
+clear queued or scheduled work and background terminals before deleting.
+`/plugins` browses the stable Codex CLI catalog; `/plugin` uses an exact plugin
+ID to inspect, install, enable, disable, or uninstall a plugin in global Codex
+configuration. Every change requires repeating that ID in
+`confirm-plugin-id`. Managed or unavailable plugin policies cannot be
+overridden. Installing or enabling a plugin does not automatically trust its
+hooks, and a new Codex session may be needed to use its tools or skills.
+`/hooks` and `/apps` inspect app-server state for the current project or
+session; hook trust changes and app invocation are not yet available through
+Discord.
+`/subagents` lists known child threads and their current recorded status;
+`/fork-subagent` lets you continue a selected child in a new Discord thread.
 `/skill` invokes an enabled skill from the current session directory and accepts an
 optional prompt; Cordex resolves the skill path from Codex metadata at submission time.
 `/skill-toggle` updates a skill's enabled state through Codex configuration, while
@@ -295,10 +349,25 @@ timed-out attachments are reported in the session instead of being silently
 ignored. The final rendered text input also has an independent aggregate character
 limit so multiple attachments and forwarded context cannot create an unbounded prompt.
 
+Generated PNG, JPEG, and WebP images are validated from Codex's app-server
+output and sent back as Discord attachments, including at text-only verbosity.
+Cordex keeps pending uploads in a private, content-addressed cache and retries
+them through the durable Discord outbox. If an image is unavailable or exceeds
+the 8 MiB upload safety limit, the thread receives an explicit notice; project
+assets saved by Codex are not removed with the upload cache.
+
 Model choices use Codex's model catalog when available. Reasoning effort is validated
 per model, including `max`, and `/fast` selects the model's advertised priority tier
 instead of assuming one fixed service-tier name. Model, effort, Fast, permission, and
 YOLO changes are persisted before they are applied to a live Codex thread.
+`/status` distinguishes the active turn's model and effort from next-turn settings,
+reports the requested sandbox and approval policy (or named profile), and shows
+working directory, writable roots, and context usage when available.
+`/debug-config` requests the effective config for that project or worktree,
+shows Codex's resolved layers from lowest to highest precedence, and reports
+managed requirements separately. It sends only setting names and selected
+non-secret defaults in a private Discord reply; it never dumps raw config
+values such as MCP environment variables.
 
 `/goal` with an objective creates or updates Codex's persistent thread goal.
 Active goal turns, including continuations started directly by Codex, stream to
@@ -311,13 +380,56 @@ exponential backoff, clears controls belonging to the failed process, reloads
 persistent goal sessions, and resumes eligible queued work. Initialization and
 RPC watchdogs also recycle a child that remains alive but stops responding.
 After an ambiguous turn start or steer failure, Cordex checks Codex's persisted
-client message IDs before retrying so an accepted prompt is not delivered twice.
-Existing-session messages, `/skill`, queued prompts, scheduled occurrences, and
-post-conflict recovery instructions are persisted before Codex delivery and stay
-recorded until that acceptance is confirmed. Scheduled tasks found in `running`
-state after restart retry the same occurrence ID instead of creating a duplicate.
+client message IDs. That ID is a correlation field, not a guaranteed
+idempotency key in the current Codex app-server. An unconfirmed turn RPC does
+not cause an automatic client-ID replay: direct and queued prompts with
+uncertain delivery require explicit review, including after a restart.
+Once Codex returns a new thread ID, Cordex persists that session mapping and
+its first prompt together before starting a turn. Existing-session messages,
+`/skill`, queued prompts, scheduled occurrences, and post-conflict recovery
+instructions are likewise persisted before Codex delivery and stay recorded
+until that acceptance is confirmed. A scheduled task found in `running`
+state after restart reuses its occurrence ID. If no queue entry survives,
+Cordex holds that occurrence for review unless persisted Codex history proves
+acceptance; the ID alone does not guarantee Codex-side idempotency.
+Before Codex returns a new thread ID, Cordex also saves the intended first
+prompt and session settings as a pending start. If creation is interrupted,
+Discord shows a durable warning; later messages are saved behind that prompt.
+Use private `/pending-prompts` and exact-ID `/resolve-pending` to Retry into a
+new saved Codex thread or Discard the selected prompt. An unanswered
+`thread/start` may have created an empty orphan thread; Cordex does not guess
+its ID or claim that the prompt ran.
+When `/new-session` fails after this save, its command reply links the
+preserved Discord thread rather than deleting that thread or its automatic
+worktree. A project with unresolved pending starts cannot be removed until
+the saved work is reviewed.
+If a newly mapped Codex thread has no persisted rollout after a restart,
+Cordex still posts the pending-prompt warning. `/resolve-pending` Retry first
+saves a replacement Codex thread, then submits only the exact selected prompt;
+Discard leaves later queued work held for its own review. A lost `thread/start`
+response before Cordex learns the thread ID remains a separate orphan-thread
+case.
+If Codex cannot supply full stored history, Cordex holds saved work for
+review instead of treating a status-only response as proof that delivery is
+safe to repeat.
+If Cordex restarts during a turn with saved prompts, it announces reconciliation
+in the Discord thread before attempting automatic delivery. A prompt already
+accepted by Codex is not sent again. If a prompt's acceptance is still
+uncertain, Cordex holds it and later queued work, posts a durable warning,
+and requires `/pending-prompts` followed by `/resolve-pending` with its exact
+source ID. Retrying may duplicate side effects if Codex accepted the prompt
+without persisting it yet; inspect the thread and files before choosing.
 Completed Discord output and run footers use a separate durable outbox, so a partial
 send or bot restart resumes only missing chunks and does not block the next queued turn.
+Active turns also surface account-verification requirements, visible safety
+buffering, model reroutes, slow lifecycle hooks, and retry warnings without
+exposing internal classifier labels or hook source paths. A staged message
+counts as visible activity only after Discord accepts it; offline progress is
+superseded by newer real output before reconnect delivery.
+Before a turn exists, slow session creation and existing-session recovery send
+non-notifying startup progress after a short grace period. The bot retries a
+failed startup notice with the same nonce and stops that timer when the real
+turn starts, fails, or the Discord thread is removed.
 Archive and resume operations persist lifecycle intents before mutating Codex and
 reconcile those intents against complete active and archived thread listings on
 startup. A crash after either side accepts the operation therefore converges instead
@@ -478,6 +590,12 @@ channels, sessions, worktrees, files, or account flows:
 npm run test:live-all
 ```
 
+For a long run that survives an interrupted terminal observation and writes a
+private log plus a verifiable JSON result, use `npm run test:live-evidence`.
+It prints a run directory; query that exact directory with
+`node scripts/live-e2e-runner.mjs status <run-directory>`. Do not start another
+run merely because a status poll times out.
+
 Run live tests only with an authenticated test account, a dedicated Discord
 server, and projects where those side effects are acceptable. Individual
 `test:live-*` scripts are available for narrower integration checks. Some
@@ -491,7 +609,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution expectations and
 - Codex app-server is experimental and its protocol can change between CLI versions.
 - Task output is normally public within its channel. Authentication, account,
   session-ID, and other sensitive diagnostic commands use ephemeral replies.
-- `/rollback` changes Codex conversation history but intentionally does not restore files.
+- `/rollback` continues the Discord session from an earlier Codex turn in a new
+  Codex session. The previous session remains available, and local files are unchanged.
 - Worktree automation requires mapped projects to be git repositories.
 - MCP enable/disable actions affect the global Codex configuration.
 - Cordex does not currently provide hosted session sharing, voice transcription,

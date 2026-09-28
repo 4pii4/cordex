@@ -89,6 +89,7 @@ test('Discord command registry includes core and ported controls', () => {
   assert.ok(action && 'choices' in action && Array.isArray(action.choices))
   assert.deepEqual(action.choices.map((choice) => choice.value), [
     'status',
+    'reload',
     'login',
     'enable-global',
     'disable-global',

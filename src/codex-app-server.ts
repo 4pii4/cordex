@@ -136,6 +136,7 @@ export type StartThreadOptions = {
 export type StartTurnOptions = {
   threadId: string
   input: UserInput[]
+  cwd?: string
   model?: string
   effort?: ReasoningEffort
   serviceTier?: string | null
@@ -202,6 +203,31 @@ export type CodexThreadRuntimeState = {
   userMessageClientIds?: string[]
 }
 
+export type CodexBackgroundTerminal = {
+  itemId: string
+  processId: string
+  command: string
+  cwd: string
+  osPid?: number
+  cpuPercent?: number
+  rssKb?: number
+}
+
+export type CodexAppListEntry = {
+  id: string
+  name: string
+  description?: string
+  isAccessible: boolean
+  isEnabled: boolean
+}
+
+export type CodexInstalledApp = {
+  id: string
+  runtimeName: string | null
+  enabled: boolean
+  callable: boolean
+}
+
 export type CodexAppServerRestartOptions = {
   maxAttempts?: number
   initialDelayMs?: number
@@ -212,6 +238,8 @@ export type CodexAppServerRestartOptions = {
 export type CodexAppServerOptions = {
   command?: string
   args?: string[]
+  /** Per-instance child-process environment overrides, useful for isolated runtimes. */
+  env?: NodeJS.ProcessEnv
   verbose?: boolean
   /** Startup handshake deadline. Defaults to 60 seconds. */
   initializeTimeoutMs?: number
@@ -1339,6 +1367,7 @@ export class CodexAppServer extends EventEmitter {
   private readonly logger: StructuredLogger
   private readonly command: string
   private readonly args: string[]
+  private readonly childEnv: NodeJS.ProcessEnv | undefined
   private readonly initializeTimeoutMs: number
   private readonly requestTimeoutMs: number
   private readonly maxRestartAttempts: number
@@ -1352,6 +1381,7 @@ export class CodexAppServer extends EventEmitter {
   private closeEmitted = false
   private processGeneration = 0
   private lifecycleGeneration = 0
+  private readonly freshEmptyThreadIds = new Set<string>()
 
   constructor(options: CodexAppServerOptions = {}) {
     super()
@@ -1359,6 +1389,7 @@ export class CodexAppServer extends EventEmitter {
     this.logger = createLogger('codex-app-server', { verbose: this.verbose })
     this.command = options.command || process.env.CORDEX_CODEX_BIN || 'codex'
     this.args = [...(options.args || ['app-server', '--stdio'])]
+    this.childEnv = options.env ? { ...options.env } : undefined
     this.initializeTimeoutMs = this.timeoutOption(
       'initializeTimeoutMs',
       options.initializeTimeoutMs,
@@ -1440,12 +1471,15 @@ export class CodexAppServer extends EventEmitter {
 
   private spawnChild(): void {
     if (this.state === 'closing' || this.state === 'closed' || this.state === 'failed') return
+    this.freshEmptyThreadIds.clear()
     const generation = ++this.processGeneration
     let child: ChildProcessWithoutNullStreams
     try {
       child = spawn(this.command, this.args, {
         env: Object.fromEntries(
-          Object.entries(process.env).filter(([name]) => name !== 'CORDEX_DISCORD_TOKEN'),
+          Object.entries({ ...process.env, ...this.childEnv }).filter(
+            ([name, value]) => name !== 'CORDEX_DISCORD_TOKEN' && typeof value === 'string',
+          ),
         ),
         stdio: ['pipe', 'pipe', 'pipe'],
       })
@@ -1549,10 +1583,9 @@ export class CodexAppServer extends EventEmitter {
       this.rejectPending(error, child)
       this.childProcess = null
     }
+    if (this.state === 'closing' || this.state === 'closed') return
     const lifecycleGeneration = ++this.lifecycleGeneration
     this.emit('childFailure', error)
-
-    if (this.state === 'closing' || this.state === 'closed') return
     const termination = child ? this.terminateFailedChild(child) : Promise.resolve(true)
     if (this.state === 'ready') this.readiness = deferred<void>()
     if (this.restartAttempt >= this.maxRestartAttempts) {
@@ -1808,6 +1841,9 @@ export class CodexAppServer extends EventEmitter {
   }
 
   async request(method: string, params: unknown): Promise<unknown> {
+    if (method === 'turn/start' && isRecord(params) && typeof params.threadId === 'string') {
+      this.freshEmptyThreadIds.delete(params.threadId)
+    }
     await this.waitUntilReady()
     const child = this.childProcess
     if (!child) throw this.unavailableError()
@@ -1831,8 +1867,9 @@ export class CodexAppServer extends EventEmitter {
     this.serverRequestOwners.delete(request)
   }
 
-  async startThread(options: StartThreadOptions): Promise<{ threadId: string; model: string }> {
+  async startThread(options: StartThreadOptions): Promise<{ threadId: string; model: string; effort?: ReasoningEffort }> {
     await this.ready
+    const generation = this.processGeneration
     const response = asRecord(
       await this.request('thread/start', {
         cwd: options.cwd,
@@ -1850,7 +1887,13 @@ export class CodexAppServer extends EventEmitter {
     if (typeof thread.id !== 'string' || typeof response.model !== 'string') {
       throw new Error('Codex thread/start omitted thread id or model')
     }
-    return { threadId: thread.id, model: response.model }
+    if (generation === this.processGeneration) this.freshEmptyThreadIds.add(thread.id)
+    const effort = parseReasoningEffort(response.reasoningEffort)
+    return {
+      threadId: thread.id,
+      model: response.model,
+      ...(effort ? { effort } : {}),
+    }
   }
 
   async resumeThread(options: StartThreadOptions & {
@@ -1903,7 +1946,7 @@ export class CodexAppServer extends EventEmitter {
     }
   }
 
-  async forkThread(options: ForkThreadOptions): Promise<{ threadId: string; model: string }> {
+  async forkThread(options: ForkThreadOptions): Promise<{ threadId: string; model: string; effort?: ReasoningEffort }> {
     await this.ready
     const response = asRecord(
       await this.request('thread/fork', {
@@ -1923,7 +1966,12 @@ export class CodexAppServer extends EventEmitter {
     if (typeof thread.id !== 'string' || typeof response.model !== 'string') {
       throw new Error('Codex thread/fork omitted thread id or model')
     }
-    return { threadId: thread.id, model: response.model }
+    const effort = parseReasoningEffort(response.reasoningEffort)
+    return {
+      threadId: thread.id,
+      model: response.model,
+      ...(effort ? { effort } : {}),
+    }
   }
 
   async compactThread(threadId: string): Promise<void> {
@@ -1978,10 +2026,142 @@ export class CodexAppServer extends EventEmitter {
     return { turnId: turn.id, reviewThreadId: response.reviewThreadId }
   }
 
-  async rollbackThread(threadId: string, numTurns: number): Promise<void> {
+  async rollbackThread(
+    threadId: string,
+    numTurns: number,
+  ): Promise<{ threadId: string; model: string; effort?: ReasoningEffort }> {
     await this.ready
-    if (!Number.isInteger(numTurns) || numTurns < 1) throw new Error('Rollback turns must be >= 1')
-    await this.request('thread/rollback', { threadId, numTurns })
+    if (!Number.isSafeInteger(numTurns) || numTurns < 1) throw new Error('Rollback turns must be >= 1')
+    let remaining = numTurns
+    let cursor: string | null = null
+    let lastTurnId: string | undefined
+    let oldestTurnId: string | undefined
+    let turnCount = 0
+    let sawNonCompletedTurn = false
+    const seenCursors = new Set<string>()
+    while (!lastTurnId) {
+      const page = asRecord(
+        await this.request('thread/turns/list', {
+          threadId,
+          cursor,
+          limit: 100,
+          sortDirection: 'desc',
+          itemsView: 'notLoaded',
+        }),
+        'thread/turns/list',
+      )
+      if (!Array.isArray(page.data)) throw new Error('Codex thread/turns/list omitted data')
+      for (const item of page.data) {
+        if (!isRecord(item) || typeof item.id !== 'string' || typeof item.status !== 'string') {
+          throw new Error('Codex thread/turns/list omitted a turn id or status')
+        }
+        oldestTurnId = item.id
+        turnCount++
+        if (item.status !== 'completed') sawNonCompletedTurn = true
+        if (remaining > 0) {
+          remaining--
+          continue
+        }
+        // Legacy review history may contain an interrupted nested turn between
+        // completed turns. Codex rejects that turn as a fork boundary.
+        if (item.status === 'completed') {
+          lastTurnId = item.id
+          break
+        }
+      }
+      if (lastTurnId) break
+      cursor = typeof page.nextCursor === 'string' ? page.nextCursor : null
+      if (!cursor) break
+      if (seenCursors.has(cursor)) throw new Error('Codex thread/turns/list repeated its pagination cursor')
+      seenCursors.add(cursor)
+    }
+    let boundary: { lastTurnId: string } | { beforeTurnId: string }
+    if (sawNonCompletedTurn) {
+      boundary = await this.rollbackBoundaryFromTimeline(threadId, numTurns)
+    } else if (!lastTurnId) {
+      if (turnCount < numTurns) {
+        throw new Error(`Cannot remove ${numTurns} turns; thread has only ${turnCount}`)
+      }
+      if (!oldestTurnId) throw new Error('Codex thread/turns/list omitted a rollback boundary')
+      boundary = { beforeTurnId: oldestTurnId }
+    } else boundary = { lastTurnId }
+    const response = asRecord(
+      await this.request('thread/fork', {
+        threadId,
+        ...boundary,
+        deferGoalContinuation: true,
+      }),
+      'thread/fork',
+    )
+    const thread = asRecord(response.thread, 'thread/fork thread')
+    if (typeof thread.id !== 'string' || typeof response.model !== 'string') {
+      throw new Error('Codex thread/fork omitted thread id or model')
+    }
+    const effort = parseReasoningEffort(response.reasoningEffort)
+    return {
+      threadId: thread.id,
+      model: response.model,
+      ...(effort ? { effort } : {}),
+    }
+  }
+
+  private async rollbackBoundaryFromTimeline(
+    threadId: string,
+    numTurns: number,
+  ): Promise<{ lastTurnId: string } | { beforeTurnId: string }> {
+    let cursor: string | null = null
+    let firstTurnId: string | undefined
+    let completedCount = 0
+    let trailingStart = false
+    const recentCompleted: Array<{ id: string; status: string }> = []
+    const seenCursors = new Set<string>()
+    do {
+      const page = asRecord(
+        await this.request('thread/timeline/list', { threadId, cursor, limit: 100 }),
+        'thread/timeline/list',
+      )
+      if (!Array.isArray(page.data)) throw new Error('Codex thread/timeline/list omitted data')
+      for (const entry of page.data) {
+        if (!isRecord(entry)) throw new Error('Codex thread/timeline/list returned an invalid entry')
+        if (entry.type === 'turnStarted') {
+          if (typeof entry.turnId !== 'string') {
+            throw new Error('Codex thread/timeline/list omitted a started turn id')
+          }
+          firstTurnId ??= entry.turnId
+          trailingStart = true
+        } else if (entry.type === 'turnCompleted') {
+          if (typeof entry.turnId !== 'string' || typeof entry.status !== 'string') {
+            throw new Error('Codex thread/timeline/list omitted a completed turn id or status')
+          }
+          completedCount++
+          recentCompleted.push({ id: entry.turnId, status: entry.status })
+          if (recentCompleted.length > numTurns + 1) recentCompleted.shift()
+          trailingStart = false
+        }
+      }
+      cursor = typeof page.nextCursor === 'string' ? page.nextCursor : null
+      if (cursor) {
+        if (seenCursors.has(cursor)) throw new Error('Codex thread/timeline/list repeated its pagination cursor')
+        seenCursors.add(cursor)
+      }
+    } while (cursor)
+    const logicalTurnCount = completedCount + (trailingStart ? 1 : 0)
+    if (logicalTurnCount < numTurns) {
+      throw new Error(`Cannot remove ${numTurns} turns; thread has only ${logicalTurnCount}`)
+    }
+    if (logicalTurnCount === numTurns) {
+      if (!firstTurnId) throw new Error('Codex thread/timeline/list omitted the first turn boundary')
+      return { beforeTurnId: firstTurnId }
+    }
+    const completedToRemove = numTurns - (trailingStart ? 1 : 0)
+    const retained = recentCompleted[recentCompleted.length - completedToRemove - 1]
+    if (!retained) throw new Error('Codex thread/timeline/list omitted the retained turn boundary')
+    if (retained.status !== 'completed') {
+      throw new Error(
+        `Cannot retain a ${retained.status} turn as the rollback boundary; remove more turns`,
+      )
+    }
+    return { lastTurnId: retained.id }
   }
 
   async setThreadName(threadId: string, name: string): Promise<void> {
@@ -2046,7 +2226,7 @@ export class CodexAppServer extends EventEmitter {
   }
 
   private async listThreadsPage(options: {
-    cwd?: string
+    cwd?: string | string[]
     searchTerm?: string
     limit?: number
     archived?: boolean
@@ -2059,6 +2239,7 @@ export class CodexAppServer extends EventEmitter {
         limit: options.limit ?? 25,
         sortKey: 'updated_at',
         sortDirection: 'desc',
+        sourceKinds: ['cli', 'vscode', 'appServer'],
         cwd: options.cwd ?? null,
         searchTerm: options.searchTerm ?? null,
         archived: options.archived ?? false,
@@ -2083,7 +2264,7 @@ export class CodexAppServer extends EventEmitter {
   }
 
   async listThreads(options: {
-    cwd?: string
+    cwd?: string | string[]
     searchTerm?: string
     limit?: number
     archived?: boolean
@@ -2092,7 +2273,7 @@ export class CodexAppServer extends EventEmitter {
   }
 
   async listAllThreads(options: {
-    cwd?: string
+    cwd?: string | string[]
     searchTerm?: string
     archived?: boolean
   } = {}): Promise<CodexThreadSummary[]> {
@@ -2116,10 +2297,23 @@ export class CodexAppServer extends EventEmitter {
 
   async getThreadRuntimeState(threadId: string): Promise<CodexThreadRuntimeState> {
     await this.ready
-    const response = asRecord(
-      await this.request('thread/read', { threadId, includeTurns: true }),
-      'thread/read',
-    )
+    let result: unknown
+    try {
+      result = await this.request('thread/read', { threadId, includeTurns: true })
+    } catch (error) {
+      if (!this.freshEmptyThreadIds.has(threadId) || !(error instanceof Error) ||
+        !error.message.startsWith('Codex RPC -32601: list_turns is not supported yet')) throw error
+      // A just-started legacy thread can have no rollout turns yet. Its
+      // summary still gives runtime status, but no client-ID evidence.
+      const summary = asRecord(
+        await this.request('thread/read', { threadId, includeTurns: false }),
+        'thread/read',
+      )
+      const runtime = parseThreadRuntimeState(summary.thread)
+      if (runtime.status !== 'idle') throw error
+      return runtime
+    }
+    const response = asRecord(result, 'thread/read')
     return parseThreadRuntimeState(response.thread)
   }
 
@@ -2156,11 +2350,32 @@ export class CodexAppServer extends EventEmitter {
         if (!isRecord(itemValue)) continue
         if (
           itemValue.type === 'subAgentActivity' &&
-          typeof itemValue.agentThreadId === 'string'
+          typeof itemValue.agentThreadId === 'string' &&
+          itemValue.agentThreadId !== threadId
         ) {
           upsert(itemValue.agentThreadId, {
             ...(typeof itemValue.agentPath === 'string' ? { agentPath: itemValue.agentPath } : {}),
             ...(typeof itemValue.kind === 'string' ? { activity: itemValue.kind } : {}),
+          })
+          continue
+        }
+        if (itemValue.type === 'collabToolCall') {
+          const spawnedId = typeof itemValue.newThreadId === 'string'
+            ? itemValue.newThreadId
+            : undefined
+          const receiverId = typeof itemValue.receiverThreadId === 'string'
+            ? itemValue.receiverThreadId
+            : undefined
+          const childThreadId = spawnedId || receiverId
+          if (!childThreadId || childThreadId === threadId) continue
+          if (!spawnedId && itemValue.tool !== 'spawnAgent' && !subagents.has(childThreadId)) {
+            continue
+          }
+          upsert(childThreadId, {
+            ...(typeof itemValue.prompt === 'string' ? { prompt: itemValue.prompt } : {}),
+            ...(typeof itemValue.agentStatus === 'string'
+              ? { status: itemValue.agentStatus }
+              : {}),
           })
           continue
         }
@@ -2169,7 +2384,7 @@ export class CodexAppServer extends EventEmitter {
         }
         const agentStates = isRecord(itemValue.agentsStates) ? itemValue.agentsStates : undefined
         for (const receiverThreadId of itemValue.receiverThreadIds) {
-          if (typeof receiverThreadId !== 'string') continue
+          if (typeof receiverThreadId !== 'string' || receiverThreadId === threadId) continue
           if (itemValue.tool !== 'spawnAgent' && !subagents.has(receiverThreadId)) continue
           const agentState = agentStates && isRecord(agentStates[receiverThreadId])
             ? agentStates[receiverThreadId]
@@ -2210,6 +2425,7 @@ export class CodexAppServer extends EventEmitter {
       await this.request('turn/start', {
         threadId: options.threadId,
         input: options.input,
+        ...(options.cwd ? { cwd: options.cwd } : {}),
         model: options.model ?? null,
         effort: options.effort ?? null,
         ...('serviceTier' in options ? { serviceTier: options.serviceTier ?? null } : {}),
@@ -2249,6 +2465,65 @@ export class CodexAppServer extends EventEmitter {
   async interruptTurn(threadId: string, turnId: string): Promise<void> {
     await this.ready
     await this.request('turn/interrupt', { threadId, turnId })
+  }
+
+  async listBackgroundTerminals(threadId: string): Promise<CodexBackgroundTerminal[]> {
+    await this.ready
+    const terminals: CodexBackgroundTerminal[] = []
+    const seenCursors = new Set<string>()
+    let cursor: string | null = null
+    do {
+      const response = asRecord(
+        await this.request('thread/backgroundTerminals/list', { threadId, cursor, limit: 100 }),
+        'thread/backgroundTerminals/list',
+      )
+      if (!Array.isArray(response.data)) {
+        throw new Error('Codex thread/backgroundTerminals/list omitted data')
+      }
+      for (const value of response.data) {
+        if (
+          !isRecord(value) ||
+          typeof value.itemId !== 'string' ||
+          typeof value.processId !== 'string' ||
+          typeof value.command !== 'string' ||
+          typeof value.cwd !== 'string'
+        ) throw new Error('Codex returned an invalid background terminal')
+        terminals.push({
+          itemId: value.itemId,
+          processId: value.processId,
+          command: value.command,
+          cwd: value.cwd,
+          ...(typeof value.osPid === 'number' ? { osPid: value.osPid } : {}),
+          ...(typeof value.cpuPercent === 'number' ? { cpuPercent: value.cpuPercent } : {}),
+          ...(typeof value.rssKb === 'number' ? { rssKb: value.rssKb } : {}),
+        })
+      }
+      cursor = typeof response.nextCursor === 'string' ? response.nextCursor : null
+      if (cursor) {
+        if (seenCursors.has(cursor)) {
+          throw new Error('Codex thread/backgroundTerminals/list repeated its pagination cursor')
+        }
+        seenCursors.add(cursor)
+      }
+    } while (cursor)
+    return terminals
+  }
+
+  async terminateBackgroundTerminal(threadId: string, processId: string): Promise<boolean> {
+    await this.ready
+    const response = asRecord(
+      await this.request('thread/backgroundTerminals/terminate', { threadId, processId }),
+      'thread/backgroundTerminals/terminate',
+    )
+    if (typeof response.terminated !== 'boolean') {
+      throw new Error('Codex thread/backgroundTerminals/terminate omitted terminated')
+    }
+    return response.terminated
+  }
+
+  async cleanBackgroundTerminals(threadId: string): Promise<void> {
+    await this.ready
+    await this.request('thread/backgroundTerminals/clean', { threadId })
   }
 
   async listModels(): Promise<CodexModel[]> {
@@ -2350,6 +2625,86 @@ export class CodexAppServer extends EventEmitter {
   async listHooks(params: CodexHooksListParams = {}): Promise<CodexHooksListEntry[]> {
     await this.ready
     return parseHooksListResponse(await this.request('hooks/list', params))
+  }
+
+  async listApps(options: {
+    threadId?: string
+    forceRefetch?: boolean
+  } = {}): Promise<CodexAppListEntry[]> {
+    await this.ready
+    const apps: CodexAppListEntry[] = []
+    const seenCursors = new Set<string>()
+    let cursor: string | null = null
+    do {
+      const response = asRecord(await this.request('app/list', {
+        cursor,
+        limit: 100,
+        threadId: options.threadId ?? null,
+        forceRefetch: options.forceRefetch === true,
+      }), 'app/list')
+      if (!Array.isArray(response.data)) throw new Error('Codex app/list omitted data')
+      for (const value of response.data) {
+        const app = asRecord(value, 'app/list app')
+        if (typeof app.isAccessible !== 'boolean' || typeof app.isEnabled !== 'boolean') {
+          throw new Error('Codex app/list returned invalid app flags')
+        }
+        apps.push({
+          id: requiredString(app, 'id', 'app/list app'),
+          name: requiredString(app, 'name', 'app/list app'),
+          ...(typeof app.description === 'string' ? { description: app.description } : {}),
+          isAccessible: app.isAccessible,
+          isEnabled: app.isEnabled,
+        })
+      }
+      if (response.nextCursor !== null && response.nextCursor !== undefined &&
+        typeof response.nextCursor !== 'string') {
+        throw new Error('Codex app/list returned an invalid pagination cursor')
+      }
+      cursor = typeof response.nextCursor === 'string' ? response.nextCursor : null
+      if (cursor) {
+        if (seenCursors.has(cursor)) throw new Error('Codex app/list repeated its pagination cursor')
+        seenCursors.add(cursor)
+      }
+    } while (cursor)
+    return apps
+  }
+
+  async listInstalledApps(options: {
+    threadId?: string
+    forceRefresh?: boolean
+  } = {}): Promise<CodexInstalledApp[]> {
+    await this.ready
+    const response = asRecord(await this.request('app/installed', {
+      ...(options.threadId ? { threadId: options.threadId } : {}),
+      forceRefresh: options.forceRefresh === true,
+    }), 'app/installed')
+    if (!Array.isArray(response.apps)) throw new Error('Codex app/installed omitted apps')
+    return response.apps.map((value) => {
+      const app = asRecord(value, 'app/installed app')
+      if (typeof app.enabled !== 'boolean' || typeof app.callable !== 'boolean' ||
+        (app.runtimeName !== null && app.runtimeName !== undefined &&
+          typeof app.runtimeName !== 'string')) {
+        throw new Error('Codex app/installed returned invalid app state')
+      }
+      return {
+        id: requiredString(app, 'id', 'app/installed app'),
+        runtimeName: typeof app.runtimeName === 'string' ? app.runtimeName : null,
+        enabled: app.enabled,
+        callable: app.callable,
+      }
+    })
+  }
+
+  async writePluginEnabled(pluginId: string, enabled: boolean): Promise<void> {
+    await this.ready
+    if (!/^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*@[A-Za-z0-9_-]+$/.test(pluginId)) {
+      throw new Error('Plugin ID cannot be represented as a Codex config key')
+    }
+    await this.request('config/value/write', {
+      keyPath: `plugins."${pluginId}".enabled`,
+      value: enabled,
+      mergeStrategy: 'upsert',
+    })
   }
 
   async listPlugins(options: CodexPluginListOptions = {}): Promise<CodexPluginListResult> {
@@ -2454,6 +2809,11 @@ export class CodexAppServer extends EventEmitter {
     return servers
   }
 
+  async reloadMcpServers(): Promise<void> {
+    await this.ready
+    await this.request('config/mcpServer/reload', undefined)
+  }
+
   async listConfiguredMcpServers(cwd?: string): Promise<CodexMcpServerConfig[]> {
     await this.ready
     const response = asRecord(
@@ -2532,7 +2892,7 @@ export class CodexAppServer extends EventEmitter {
     ) {
       throw new Error('Codex config/value/write returned an invalid MCP toggle result')
     }
-    await this.request('config/mcpServer/reload', undefined)
+    await this.reloadMcpServers()
     const effective = (await this.listConfiguredMcpServers(cwd)).find(
       (server) => server.name === normalized,
     )

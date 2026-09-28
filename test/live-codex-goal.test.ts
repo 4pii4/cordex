@@ -24,7 +24,7 @@ function waitFor(condition: () => boolean, timeoutMs = 90_000): Promise<void> {
   })
 }
 
-test('active Codex goals automatically resume after restart and stream through Cordex', {
+test('active Codex goals continue after an explicit session resume and stream through Cordex', {
   skip: !process.env.CORDEX_LIVE_TEST,
   timeout: 120_000,
 }, async () => {
@@ -85,10 +85,16 @@ test('active Codex goals automatically resume after restart and stream through C
       tasks: {},
     }
     const sent: string[] = []
+    let channelArchived = false
     const channel = {
       id: session.discordThreadId,
+      get archived() { return channelArchived },
       isThread: () => true,
       async sendTyping() {},
+      async setArchived(archived: boolean) {
+        channelArchived = archived
+        return channel
+      },
       async send(payload: string | { content?: string }) {
         const content = typeof payload === 'string' ? payload : payload.content || ''
         sent.push(content)
@@ -106,11 +112,11 @@ test('active Codex goals automatically resume after restart and stream through C
       async (id: string) => {
         assert.equal(id, session.discordThreadId)
         return channel
-      }
+    }
 
     await codex.setThreadGoal(threadId, { status: 'active' })
-    await (bot as unknown as { resumeActiveGoalSessions(): Promise<void> })
-      .resumeActiveGoalSessions()
+    await (bot as unknown as { ensureSessionLoaded(session: SessionState): Promise<void> })
+      .ensureSessionLoaded(session)
     await waitFor(() =>
       sent.some((content) => /cordex-goal-stream-ok/i.test(content)) &&
       sent.some((content) => content.includes(started.model)),
@@ -130,7 +136,7 @@ test('active Codex goals automatically resume after restart and stream through C
       await codex.clearThreadGoal(threadId).catch(() => undefined)
       await codex.archiveThread(threadId).catch(() => undefined)
     }
-    bot?.client.destroy()
+    await bot?.stop()
     await codex?.close()
     await setupCodex?.close()
     if (oldHome === undefined) delete process.env.CORDEX_HOME

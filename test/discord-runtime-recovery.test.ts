@@ -702,7 +702,7 @@ async function withTemporaryHome(
   }
 }
 
-test('stale steer rejection against an idle runtime starts the same input as a new turn', async () => {
+test('ambiguous stale steer clears an idle run without replaying the input', async () => {
   await withTemporaryHome(async (directory) => {
     const session = makeSession(directory)
     const state = makeState([session])
@@ -716,15 +716,16 @@ test('stale steer rejection against an idle runtime starts the same input as a n
     const input: UserInput[] = [{ type: 'text', text: 'Do not lose this prompt.', text_elements: [] }]
 
     try {
-      await internal.dispatchInputUnlocked(channel, session.parentChannelId, input, 'message-idle')
+      await assert.rejects(
+        internal.dispatchInputUnlocked(channel, session.parentChannelId, input, 'message-idle'),
+        /Fixture stale turn rejection/,
+      )
 
       assert.deepEqual(codex.steered.map((attempt) => attempt.expectedTurnId), ['stale-turn'])
-      assert.equal(codex.started.length, 1)
-      assert.strictEqual(codex.started[0]?.input, input)
-      assert.equal(codex.started[0]?.clientUserMessageId, 'message-idle')
-      assert.equal(session.activeTurnId, 'replacement-turn')
-      assert.notStrictEqual(internal.runs.get(session.codexThreadId), staleRun)
-      assert.equal(internal.runs.get(session.codexThreadId)?.turnId, 'replacement-turn')
+      assert.equal(codex.started.length, 0)
+      assert.equal(session.activeTurnId, undefined)
+      assert.equal(internal.runs.has(session.codexThreadId), false)
+      assert.equal(staleRun.turnId, 'stale-turn')
     } finally {
       clearRunTimers(internal)
       bot.client.destroy()
@@ -732,7 +733,7 @@ test('stale steer rejection against an idle runtime starts the same input as a n
   })
 })
 
-test('failed turn start reconciles the authoritative active turn after the notification wait', async () => {
+test('ambiguous turn start adopts the active turn without replaying input', async () => {
   await withTemporaryHome(async (directory) => {
     const session = makeSession(directory)
     delete session.activeTurnId
@@ -745,16 +746,15 @@ test('failed turn start reconciles the authoritative active turn after the notif
     const input: UserInput[] = [{ type: 'text', text: 'Recover this accepted input.', text_elements: [] }]
 
     try {
-      await internal.dispatchInputUnlocked(channel, session.parentChannelId, input, 'message-start-failed')
+      await assert.rejects(
+        internal.dispatchInputUnlocked(channel, session.parentChannelId, input, 'message-start-failed'),
+        /Fixture turn\/start failed/,
+      )
 
       assert.equal(codex.started.length, 1)
       assert.strictEqual(codex.started[0]?.input, input)
       assert.ok(codex.runtimeReadAt - codex.startFailedAt >= 950)
-      assert.deepEqual(codex.steered.map((attempt) => attempt.expectedTurnId), [
-        'authoritative-start-turn',
-      ])
-      assert.strictEqual(codex.steered[0]?.input, input)
-      assert.equal(codex.steered[0]?.clientUserMessageId, 'message-start-failed')
+      assert.equal(codex.steered.length, 0)
       assert.equal(session.activeTurnId, 'authoritative-start-turn')
       assert.equal(internal.runs.get(session.codexThreadId)?.turnId, 'authoritative-start-turn')
     } finally {
@@ -819,7 +819,7 @@ test('accepted turn steer with a lost response is not delivered again', async ()
   })
 })
 
-test('reconciliation loss retries exact input as a new turn within the delivery bound', async () => {
+test('ambiguous start keeps the first attempt and authoritative turn for review', async () => {
   await withTemporaryHome(async (directory) => {
     const session = makeSession(directory)
     delete session.activeTurnId
@@ -832,20 +832,20 @@ test('reconciliation loss retries exact input as a new turn within the delivery 
     const input: UserInput[] = [{ type: 'text', text: 'Deliver exactly once after the race.', text_elements: [] }]
 
     try {
-      await internal.dispatchInputUnlocked(channel, session.parentChannelId, input, 'message-reconcile-loss')
+      await assert.rejects(
+        internal.dispatchInputUnlocked(channel, session.parentChannelId, input, 'message-reconcile-loss'),
+        /Fixture accepted turn but lost start response/,
+      )
 
-      assert.equal(codex.runtimeReads, 3)
-      assert.equal(codex.started.length, 2)
-      assert.equal(codex.steered.length, 1)
-      assert.equal(codex.steered[0]?.expectedTurnId, 'authoritative-turn-a')
-      for (const attempt of [...codex.started, ...codex.steered]) {
-        assert.strictEqual(attempt.input, input)
-        assert.equal(attempt.clientUserMessageId, 'message-reconcile-loss')
-      }
-      assert.equal(session.activeTurnId, 'replacement-after-reconciliation')
+      assert.equal(codex.runtimeReads, 1)
+      assert.equal(codex.started.length, 1)
+      assert.equal(codex.steered.length, 0)
+      assert.strictEqual(codex.started[0]?.input, input)
+      assert.equal(codex.started[0]?.clientUserMessageId, 'message-reconcile-loss')
+      assert.equal(session.activeTurnId, 'authoritative-turn-a')
       assert.equal(
         internal.runs.get(session.codexThreadId)?.turnId,
-        'replacement-after-reconciliation',
+        'authoritative-turn-a',
       )
     } finally {
       clearRunTimers(internal)
@@ -1364,7 +1364,7 @@ test('ThreadDelete after an interrupted steer cannot start a replacement turn', 
       await waitFor(() => codex.interrupted.length === 1)
 
       codex.releaseSteer()
-      await assert.rejects(dispatch, /Discord thread was deleted/)
+      await assert.rejects(dispatch, /Fixture steer interrupted by deletion/)
       await waitFor(() => state.sessions[session.discordThreadId] === undefined)
 
       assert.equal(codex.started.length, 0)
@@ -1729,7 +1729,7 @@ test('abort latches while turn start is pending and interrupts the materialized 
       await waitFor(() => replies.length === 1)
 
       assert.deepEqual(acknowledgments, [{}])
-      assert.deepEqual(replies, ['Abort requested.'])
+      assert.deepEqual(replies, ['Abort requested.\nBackground terminal status could not be verified; use /ps to inspect it.'])
       assert.deepEqual(codex.interrupted, [])
 
       codex.succeed('materialized-after-abort')
@@ -1885,7 +1885,7 @@ test('prompt slash command waits behind MessageCreate while abort bypasses ingre
         threadId: session.codexThreadId,
         turnId: 'stale-turn',
       }])
-      assert.deepEqual(abortReplies, ['Abort requested.'])
+      assert.deepEqual(abortReplies, ['Abort requested.\nBackground terminal status could not be verified; use /ps to inspect it.'])
       assert.deepEqual(abortResponseMethods, ['editReply'])
       assert.deepEqual(abortAcknowledgments, [{}])
       assert.deepEqual(queueAcknowledgments, [{}])
@@ -1976,7 +1976,7 @@ test('queued slash command denies access ephemerally without deferring or dispat
   })
 })
 
-test('stale steer rejection retries with the authoritative active turn id', async () => {
+test('ambiguous stale steer adopts the authoritative turn without retrying input', async () => {
   await withTemporaryHome(async (directory) => {
     const session = makeSession(directory)
     const state = makeState([session])
@@ -1989,14 +1989,17 @@ test('stale steer rejection retries with the authoritative active turn id', asyn
     const input: UserInput[] = [{ type: 'text', text: 'Steer this exact prompt.', text_elements: [] }]
 
     try {
-      await internal.dispatchInputUnlocked(channel, session.parentChannelId, input, 'message-active')
+      await assert.rejects(
+        internal.dispatchInputUnlocked(channel, session.parentChannelId, input, 'message-active'),
+        /Fixture stale turn rejection/,
+      )
 
       assert.deepEqual(
         codex.steered.map((attempt) => attempt.expectedTurnId),
-        ['stale-turn', 'authoritative-turn'],
+        ['stale-turn'],
       )
-      assert.strictEqual(codex.steered[1]?.input, input)
-      assert.equal(codex.steered[1]?.clientUserMessageId, 'message-active')
+      assert.strictEqual(codex.steered[0]?.input, input)
+      assert.equal(codex.steered[0]?.clientUserMessageId, 'message-active')
       assert.equal(codex.started.length, 0)
       assert.equal(session.activeTurnId, 'authoritative-turn')
       assert.strictEqual(internal.runs.get(session.codexThreadId), staleRun)
@@ -2085,7 +2088,7 @@ test('startup prunes a persisted session whose Discord thread was deleted offlin
     const bot = new CordexDiscordBot(makeConfig(directory), state, codex as unknown as CodexAppServer)
     const internal = bot as unknown as InternalBot
     internal.loadedThreads.add(session.codexThreadId)
-    ;(bot.client.channels as unknown as { fetch(id: string): Promise<never> }).fetch = async () => {
+    ;(bot.client.rest as unknown as { get(route: string): Promise<never> }).get = async () => {
       throw { code: 10_003 }
     }
 
@@ -2353,7 +2356,7 @@ test('failed app-server recovery keeps mutation ingress fail-closed', async () =
   })
 })
 
-test('turn adoption clears output visibility for every replacement turn path', async () => {
+test('runtime turn adoption resets output while nested starts preserve the root run', async () => {
   await withTemporaryHome(async (directory) => {
     const session = makeSession(directory)
     const state = makeState([session])
@@ -2377,7 +2380,8 @@ test('turn adoption clears output visibility for every replacement turn path', a
         threadId: session.codexThreadId,
         turnId: 'replacement-by-notification',
       })
-      assert.equal(run.visibleOutput, false)
+      assert.equal(run.visibleOutput, true)
+      assert.equal(run.turnId, 'replacement-by-runtime')
     } finally {
       clearRunTimers(internal)
       bot.client.destroy()

@@ -273,8 +273,10 @@ export async function createWorktree(options: {
     projectDirectory,
     branch,
   })
+  if (await pathExists(directory)) {
+    throw new Error(`Refusing to overwrite existing managed worktree path: ${directory}`)
+  }
   await mkdir(path.dirname(directory), { recursive: true })
-  await rm(directory, { recursive: true, force: true })
   await git(projectDirectory, ['worktree', 'add', '-b', branch, directory, baseRef])
   try {
     await initializeSubmodules(projectDirectory, directory)

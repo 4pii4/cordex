@@ -306,7 +306,6 @@ test('Codex app-server client covers thread, turn, stream, model, steer, interru
       target: { type: 'custom', instructions: 'Check fixture' },
     })
     assert.deepEqual(review, { turnId: 'review-turn', reviewThreadId: thread.threadId })
-    await codex.rollbackThread(thread.threadId, 1)
     assert.equal((await codex.listThreads({ cwd: process.cwd() }))[0]?.id, 'thread-1')
     assert.deepEqual(await codex.getThreadSummary(thread.threadId), {
       id: thread.threadId,
@@ -574,6 +573,7 @@ test('Codex app-server supports reversible archive lifecycle and archived thread
       limit: 25,
       sortKey: 'updated_at',
       sortDirection: 'desc',
+      sourceKinds: ['cli', 'vscode', 'appServer'],
       cwd: null,
       searchTerm: null,
       archived: false,
@@ -589,6 +589,7 @@ test('Codex app-server supports reversible archive lifecycle and archived thread
       limit: 10,
       sortKey: 'updated_at',
       sortDirection: 'desc',
+      sourceKinds: ['cli', 'vscode', 'appServer'],
       cwd: process.cwd(),
       searchTerm: 'fixture',
       archived: true,
@@ -604,6 +605,7 @@ test('Codex app-server supports reversible archive lifecycle and archived thread
       limit: 100,
       sortKey: 'updated_at',
       sortDirection: 'desc',
+      sourceKinds: ['cli', 'vscode', 'appServer'],
       cwd: null,
       searchTerm: 'paginated lifecycle',
       archived: false,

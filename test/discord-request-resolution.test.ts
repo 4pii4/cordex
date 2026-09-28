@@ -434,7 +434,7 @@ test('abort retires approvals, user input, and action buttons without duplicate 
 
     assert.deepEqual(codex.interrupts, [{ threadId: session.codexThreadId, turnId: 'turn-1' }])
     assert.deepEqual(codex.responses, [])
-    assert.deepEqual(replies, ['Abort requested.'])
+    assert.deepEqual(replies, ['Abort requested.\nBackground terminal status could not be verified; use /ps to inspect it.'])
     assert.equal(internal.approvals.size, 0)
     assert.equal(internal.pendingUserInputs.size, 0)
     assert.equal(internal.pendingActionButtons.size, 0)

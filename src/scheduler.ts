@@ -39,7 +39,7 @@ export class TaskScheduler {
 
   constructor(
     private readonly tasks: Record<string, ScheduledTask>,
-    private readonly onRun: (task: ScheduledTask) => Promise<void>,
+    private readonly onRun: (task: ScheduledTask, recoverRunning: boolean) => Promise<void>,
     private readonly onChange: () => Promise<void>,
   ) {}
 
@@ -346,7 +346,7 @@ export class TaskScheduler {
     let runFailed = false
     let runError: unknown
     try {
-      await this.onRun(task)
+      await this.onRun(task, recoverRunning)
     } catch (error) {
       runFailed = true
       runError = error

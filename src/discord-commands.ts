@@ -187,6 +187,10 @@ export function buildSlashCommands() {
       .setDescription(discordDescription('Fork a Codex subagent task into a new Discord thread'))
       .setDMPermission(false),
     new SlashCommandBuilder()
+      .setName('subagents')
+      .setDescription(discordDescription('List Codex subagent threads in this session'))
+      .setDMPermission(false),
+    new SlashCommandBuilder()
       .setName('btw')
       .setDescription(discordDescription('Fork current context and ask a side question'))
       .addStringOption((option) =>
@@ -227,6 +231,16 @@ export function buildSlashCommands() {
       .setDescription(discordDescription('Archive current Discord and Codex session'))
       .setDMPermission(false),
     new SlashCommandBuilder()
+      .setName('delete')
+      .setDescription(discordDescription('Permanently delete this Codex transcript; keep Discord history'))
+      .addStringOption((option) =>
+        option
+          .setName('confirm-session-id')
+          .setDescription(discordDescription('Paste the exact ID from /session-id to confirm'))
+          .setRequired(true),
+      )
+      .setDMPermission(false),
+    new SlashCommandBuilder()
       .setName('review')
       .setDescription(discordDescription('Run a Codex code review in current session'))
       .addStringOption((option) =>
@@ -257,7 +271,7 @@ export function buildSlashCommands() {
       .setName('tasks')
       .setDescription(discordDescription('List scheduled prompts'))
       .addBooleanOption((option) =>
-        option.setName('all').setDescription(discordDescription('Include completed, cancelled, and failed tasks')),
+        option.setName('all').setDescription(discordDescription('Include cancelled and failed tasks')),
       )
       .setDMPermission(false),
     new SlashCommandBuilder()
@@ -311,6 +325,53 @@ export function buildSlashCommands() {
       )
       .setDMPermission(false),
     new SlashCommandBuilder()
+      .setName('plugins')
+      .setDescription(discordDescription('Browse Codex plugins from configured marketplaces'))
+      .addStringOption((option) =>
+        option.setName('query').setDescription(discordDescription('Plugin name or ID')).setMaxLength(100),
+      )
+      .addBooleanOption((option) =>
+        option.setName('include-available').setDescription(discordDescription('Search uninstalled plugins too')),
+      )
+      .setDMPermission(false),
+    new SlashCommandBuilder()
+      .setName('plugin')
+      .setDescription(discordDescription('Inspect or manage a Codex plugin globally'))
+      .addStringOption((option) =>
+        option
+          .setName('action')
+          .setDescription(discordDescription('Plugin action'))
+          .addChoices(
+            { name: 'Inspect', value: 'inspect' },
+            { name: 'Install', value: 'install' },
+            { name: 'Enable', value: 'enable' },
+            { name: 'Disable', value: 'disable' },
+            { name: 'Uninstall', value: 'uninstall' },
+          )
+          .setRequired(true),
+      )
+      .addStringOption((option) =>
+        option.setName('plugin-id').setDescription(discordDescription('Exact ID from /plugins')).setMaxLength(200).setRequired(true),
+      )
+      .addStringOption((option) =>
+        option.setName('confirm-plugin-id').setDescription(discordDescription('Repeat exact ID to confirm a change')).setMaxLength(200),
+      )
+      .setDMPermission(false),
+    new SlashCommandBuilder()
+      .setName('hooks')
+      .setDescription(discordDescription('Inspect Codex hook events and trust state'))
+      .addStringOption((option) =>
+        option.setName('event').setDescription(discordDescription('Filter by hook event name')).setMaxLength(80),
+      )
+      .setDMPermission(false),
+    new SlashCommandBuilder()
+      .setName('apps')
+      .setDescription(discordDescription('Inspect Codex app availability and callable state'))
+      .addStringOption((option) =>
+        option.setName('query').setDescription(discordDescription('App name or ID')).setMaxLength(100),
+      )
+      .setDMPermission(false),
+    new SlashCommandBuilder()
       .setName('mcp-status')
       .setDescription(discordDescription('List Codex MCP server status'))
       .setDMPermission(false),
@@ -323,6 +384,7 @@ export function buildSlashCommands() {
           .setDescription(discordDescription('MCP action; toggles persist in global Codex config'))
           .addChoices(
             { name: 'Show status', value: 'status' },
+            { name: 'Reload configuration', value: 'reload' },
             { name: 'Authenticate', value: 'login' },
             { name: 'Enable globally', value: 'enable-global' },
             { name: 'Disable globally', value: 'disable-global' },
@@ -421,6 +483,25 @@ export function buildSlashCommands() {
       )
       .setDMPermission(false),
     new SlashCommandBuilder()
+      .setName('pending-prompts')
+      .setDescription(discordDescription('Privately review prompts whose delivery is uncertain'))
+      .setDMPermission(false),
+    new SlashCommandBuilder()
+      .setName('resolve-pending')
+      .setDescription(discordDescription('Explicitly retry or discard one uncertain prompt'))
+      .addStringOption((option) =>
+        option.setName('action').setDescription(discordDescription('What to do with the saved prompt'))
+          .setRequired(true).addChoices(
+            { name: 'Retry', value: 'retry' },
+            { name: 'Discard', value: 'discard' },
+          ),
+      )
+      .addStringOption((option) =>
+        option.setName('source-id').setDescription(discordDescription('Exact ID shown by /pending-prompts'))
+          .setRequired(true),
+      )
+      .setDMPermission(false),
+    new SlashCommandBuilder()
       .setName('run-shell-command')
       .setDescription(discordDescription('Run a shell command in project directory'))
       .addStringOption((option) =>
@@ -429,7 +510,16 @@ export function buildSlashCommands() {
       .setDMPermission(false),
     new SlashCommandBuilder()
       .setName('last-sessions')
-      .setDescription(discordDescription('List recent Codex sessions across all mapped projects'))
+      .setDescription(discordDescription('Find recent Codex sessions across mapped projects'))
+      .addStringOption((option) =>
+        option
+          .setName('query')
+          .setDescription(discordDescription('Case-sensitive title fragment'))
+          .setMaxLength(100),
+      )
+      .addBooleanOption((option) =>
+        option.setName('include-archived').setDescription(discordDescription('Include archived sessions')),
+      )
       .setDMPermission(false),
     new SlashCommandBuilder()
       .setName('context-usage')
@@ -458,8 +548,23 @@ export function buildSlashCommands() {
       .setDescription(discordDescription('Stop active Codex turn'))
       .setDMPermission(false),
     new SlashCommandBuilder()
+      .setName('ps')
+      .setDescription(discordDescription('List background terminals for this Codex session'))
+      .setDMPermission(false),
+    new SlashCommandBuilder()
+      .setName('stop')
+      .setDescription(discordDescription('Stop background terminals in this Codex session'))
+      .addStringOption((option) =>
+        option.setName('process-id').setDescription(discordDescription('One Codex process ID; omit to stop all')),
+      )
+      .setDMPermission(false),
+    new SlashCommandBuilder()
       .setName('status')
       .setDescription(discordDescription('Show Cordex session status'))
+      .setDMPermission(false),
+    new SlashCommandBuilder()
+      .setName('debug-config')
+      .setDescription(discordDescription('Privately show Codex config layers and managed policy'))
       .setDMPermission(false),
   ].map((command) => command.toJSON())
 }

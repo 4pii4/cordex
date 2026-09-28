@@ -132,7 +132,7 @@ class ReconciliationCodex extends EventEmitter {
 class NotificationCodex extends EventEmitter {}
 
 class AutocompleteCodex extends EventEmitter {
-  readonly calls: Array<{ archived?: boolean; searchTerm?: string; limit?: number }> = []
+  readonly calls: Array<{ archived?: boolean; searchTerm?: string; cwd?: string[] }> = []
 
   constructor(
     private readonly active: CodexThreadSummary[],
@@ -141,7 +141,7 @@ class AutocompleteCodex extends EventEmitter {
     super()
   }
 
-  async listThreads(options: { archived?: boolean; searchTerm?: string; limit?: number }) {
+  async listAllThreads(options: { archived?: boolean; searchTerm?: string; cwd?: string[] }) {
     this.calls.push({ ...options })
     return options.archived ? this.archived : this.active
   }
@@ -1091,7 +1091,7 @@ test('thread/deleted notification destructively removes linkage exactly once', a
       assert.equal(state.tasks['task-before-delete'], undefined)
       assert.equal(internal.loadedThreads.has(session.codexThreadId), false)
       assert.equal(channel.sent.length, 1)
-      assert.match(channel.sent[0] || '', /deleted outside Cordex/i)
+      assert.match(channel.sent[0] || '', /session was deleted.*no longer linked/i)
     } finally {
       bot.client.destroy()
     }
@@ -1156,10 +1156,11 @@ test('resume autocomplete merges active, archived, and locally retained archived
     try {
       await internal.handleAutocomplete(interaction)
 
-      assert.deepEqual(codex.calls, [
-        { limit: 100 },
-        { limit: 100, archived: true },
-      ])
+      assert.equal(codex.calls.length, 2)
+      assert.equal(codex.calls[0]?.archived, undefined)
+      assert.equal(codex.calls[1]?.archived, true)
+      assert.deepEqual(codex.calls[0]?.cwd, [project])
+      assert.deepEqual(codex.calls[1]?.cwd, [project])
       assert.deepEqual(responses[0]?.map((choice) => choice.value), [
         'remote-linked',
         'local-only',

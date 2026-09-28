@@ -49,8 +49,11 @@ type TestRun = {
   turnId: string
   startedAt: number
   agentText: Map<string, string>
+  activeItems: Map<string, string>
   typingTimer: NodeJS.Timeout
   visibleOutput: boolean
+  lastProgressAt: number
+  progressSequence: number
   lastError?: string
 }
 
@@ -123,8 +126,11 @@ function makeRun(session: SessionState, channel: ThreadChannel): TestRun {
     turnId: session.activeTurnId || 'turn',
     startedAt: Date.now() - 1_000,
     agentText: new Map(),
+    activeItems: new Map(),
     typingTimer,
     visibleOutput: false,
+    lastProgressAt: 0,
+    progressSequence: 0,
   }
 }
 
@@ -284,8 +290,8 @@ test('a crash after a partial chunk send recovers only unsent chunks with stable
         assert.equal(typeof payload, 'object')
         const resolved = payload as Exclude<SendPayload, string>
         assert.ok((await loadState()).discordOutbox?.some((entry) => entry.nonce === resolved.nonce))
-        if (attempts === 2) {
-          failedNonce = resolved.nonce
+        if (attempts >= 2) {
+          failedNonce ??= resolved.nonce
           throw new Error('Discord temporarily unavailable')
         }
         firstPayloads.push(resolved)
@@ -300,14 +306,12 @@ test('a crash after a partial chunk send recovers only unsent chunks with stable
     const firstRun = makeRun(session, firstChannel)
 
     try {
-      await assert.rejects(
-        (firstBot as unknown as InternalBot).onItemCompleted(firstRun, {
-          threadId: session.codexThreadId,
-          turnId: firstRun.turnId,
-          item: { type: 'agentMessage', id: 'message-chunked', text: answer },
-        }),
-        /temporarily unavailable/,
-      )
+      await (firstBot as unknown as InternalBot).onItemCompleted(firstRun, {
+        threadId: session.codexThreadId,
+        turnId: firstRun.turnId,
+        item: { type: 'agentMessage', id: 'message-chunked', text: answer },
+      })
+      await waitFor(() => attempts >= 2)
       assert.deepEqual(firstPayloads.map((payload) => payload.content), expectedChunks.slice(0, 1))
       assert.deepEqual(
         state.discordOutbox?.map((entry) => entry.chunkIndex),
@@ -426,7 +430,7 @@ test('footer is durable before turn finalization and delivery cannot hold queue 
   })
 })
 
-test('completed turn without visible output suppresses the run footer', async () => {
+test('completed turn without visible output reports a terminal status', async () => {
   await withFixture(async ({ directory, state, session }) => {
     const payloads: SendPayload[] = []
     const channel = {
@@ -456,8 +460,9 @@ test('completed turn without visible output suppresses the run footer', async ()
         turn: { id: run.turnId, status: 'completed', durationMs: 1_000 },
       })
 
-      assert.deepEqual(state.discordOutbox, [])
-      assert.deepEqual(payloads, [])
+      await waitFor(() => payloads.length === 1 && state.discordOutbox?.length === 0)
+      assert.equal(typeof payloads[0], 'object')
+      assert.equal((payloads[0] as { content: string }).content, 'Codex finished without a visible response.')
     } finally {
       clearInterval(run.typingTimer)
       bot.client.destroy()

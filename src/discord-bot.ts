@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import path from 'node:path'
+import { monitorEventLoopDelay } from 'node:perf_hooks'
 import {
   ActionRowBuilder,
   ButtonBuilder,
@@ -21,6 +22,7 @@ import {
   type ButtonInteraction,
   type ChatInputCommandInteraction,
   type Message as DiscordMessage,
+  type MessageCreateOptions,
   type ModalSubmitInteraction,
   type PartialMessage,
   type StringSelectMenuInteraction,
@@ -29,6 +31,7 @@ import {
 } from 'discord.js'
 import {
   assertDirectory,
+  bindStatePath,
   getCordexHome,
   getProjectsDirectory,
   loadConfig,
@@ -60,7 +63,14 @@ import {
   type ActionButtonOption,
 } from './action-buttons.js'
 import { parseBtwMessage } from './btw.js'
+import { fileUploadToolName, parseFileUploadPaths } from './file-upload-tool.js'
 import { buildSlashCommands } from './discord-commands.js'
+import {
+  installCodexCliPlugin,
+  listCodexCliPlugins,
+  removeCodexCliPlugin,
+  type CodexCliPlugin,
+} from './codex-plugin-cli.js'
 import {
   formatCompletedToolItem,
   formatAssistantText,
@@ -73,10 +83,26 @@ import {
 import { isUnknownDiscordChannelError, isUnknownDiscordMessageError } from './discord-errors.js'
 import {
   createDiscordOutboxEntries,
+  discordOutboxNonce,
   discordOutboxOutputKey,
   ensureDiscordOutboxState,
   rememberDiscordOutboxDeliveredKey,
 } from './discord-outbox.js'
+import {
+  cacheGeneratedImage,
+  decodeGeneratedImage,
+  generatedImageFileName,
+  pruneGeneratedImageCache,
+  readCachedGeneratedImage,
+  type GeneratedImageAttachment,
+} from './discord-generated-media.js'
+import {
+  cacheOutgoingFile,
+  pruneOutgoingFileCache,
+  readCachedOutgoingFile,
+  readOutgoingFiles,
+  type OutgoingFileAttachment,
+} from './discord-outgoing-files.js'
 import {
   buildDiscordInput,
   pruneDiscordAttachmentCache,
@@ -147,6 +173,7 @@ import type {
   CordexState,
   JsonObject,
   JsonValue,
+  PendingInitialSession,
   QueuedPrompt,
   ReasoningEffort,
   ServerNotification,
@@ -194,6 +221,16 @@ function truncate(value: string, limit: number): string {
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function discordUploadRejection(error: unknown): 'too-large' | 'invalid' | undefined {
+  if (!isRecord(error)) return undefined
+  if (error.status === 413 || error.code === 40005 || error.code === 50045) return 'too-large'
+  if (
+    error.status === 400 || error.status === 415 ||
+    [30015, 50035, 50046, 50110, 50123].includes(Number(error.code))
+  ) return 'invalid'
+  return undefined
 }
 
 function errorObject(error: unknown): Error {
@@ -252,10 +289,25 @@ type ActiveRun = {
   turnId?: string
   startedAt: number
   agentText: Map<string, string>
+  activeItems: Map<string, string>
   typingTimer: NodeJS.Timeout
   visibleOutput: boolean
+  lastVisibleOutputAt?: number
+  lastProgressAt: number
+  progressSequence: number
+  progressPromise?: Promise<void>
   contextPercent?: number
   lastError?: string
+}
+
+type PendingStartupProgress = {
+  channel: ThreadChannel
+  startedAt: number
+  lastSentAt?: number
+  sequence: number
+  references: number
+  timer: NodeJS.Timeout
+  sending?: Promise<void>
 }
 
 type InitialSessionLocation = {
@@ -266,15 +318,26 @@ type InitialSessionLocation = {
 
 const ephemeralChatCommands = new Set([
   'account-usage',
+  'apps',
   'auth-status',
+  'debug-config',
+  'delete',
+  'hooks',
   'last-sessions',
   'login',
   'mcp',
   'mcp-login',
   'mcp-status',
+  'pending-prompts',
+  'ps',
+  'plugin',
+  'plugins',
   'rate-limits',
+  'resolve-pending',
   'session-id',
   'status',
+  'stop',
+  'subagents',
 ])
 
 type PendingApproval = {
@@ -356,7 +419,9 @@ class CordexStoppingError extends Error {
 export class CordexDiscordBot {
   readonly client: Client
   private readonly logger: StructuredLogger
+  private readonly eventLoopDelay = monitorEventLoopDelay({ resolution: 20 })
   private readonly runs = new Map<string, ActiveRun>()
+  private readonly pendingStartupProgress = new Map<string, PendingStartupProgress>()
   private readonly contextUsageVersions = new Map<string, number>()
   private readonly contextReplayBlocked = new Set<string>()
   private readonly pendingContextUsage = new Map<string, {
@@ -376,8 +441,16 @@ export class CordexDiscordBot {
   private readonly discordIngressQueue = new KeyedSerialQueue()
   private readonly promptQueue = new KeyedSerialQueue()
   private readonly attachmentCacheQueue = new KeyedSerialQueue()
+  private readonly outgoingMediaQueue = new KeyedSerialQueue()
+  private readonly outgoingMediaDirectory: string
+  private readonly outgoingFileDirectory: string
   private readonly discordOutboxStateQueue = new KeyedSerialQueue()
   private readonly discordOutboxDeliveryQueue = new KeyedSerialQueue()
+  private readonly pluginMutationQueue = new KeyedSerialQueue()
+  private readonly reportedBackgroundTerminals = new Map<string, Set<string>>()
+  private discordOutboxRetryTimer?: NodeJS.Timeout
+  private discordOutboxRetryInFlight = false
+  private discordOutboxRetryDelayMs = 5_000
   private readonly resumeQueue = new KeyedSerialQueue()
   private readonly titleQueue = new KeyedSerialQueue()
   private readonly expectedDiscordTitles = new Map<string, string>()
@@ -445,13 +518,24 @@ export class CordexDiscordBot {
     private readonly config: CordexConfig,
     private readonly state: CordexState,
     private readonly codex: CodexAppServer,
-    private readonly options: { verbose?: boolean } = {},
+    private readonly options: {
+      verbose?: boolean
+      pluginCliEnv?: NodeJS.ProcessEnv
+      interruptedOnStartup?: Array<{
+        discordThreadId: string
+        codexThreadId: string
+        turnId: string
+      }>
+    } = {},
   ) {
+    bindStatePath(this.state)
     ensureDiscordOutboxState(this.state)
+    this.outgoingMediaDirectory = path.join(getCordexHome(), 'outgoing-media')
+    this.outgoingFileDirectory = path.join(getCordexHome(), 'outgoing-files')
     this.logger = createLogger('discord-bot', { verbose: this.options.verbose === true })
     this.scheduler = new TaskScheduler(
       this.state.tasks,
-      (task) => this.runScheduledTask(task),
+      (task, recoverRunning) => this.runScheduledTask(task, recoverRunning),
       () => saveState(this.state),
     )
     this.client = new Client({
@@ -493,9 +577,11 @@ export class CordexDiscordBot {
         shardId,
         unavailableGuildCount: unavailableGuilds?.size || 0,
       })
+      this.scheduleDiscordOutboxRetry(true)
     })
     this.client.on(Events.ShardResume, (shardId, replayedEvents) => {
       this.logger.info('shard_resumed', { shardId, replayedEvents })
+      this.scheduleDiscordOutboxRetry(true)
     })
     this.client.on(Events.Invalidated, () => {
       this.logger.error('discord_invalidated', new Error('Discord session was invalidated'))
@@ -543,10 +629,12 @@ export class CordexDiscordBot {
         ))
     })
     this.client.on(Events.ChannelDelete, (channel) => {
+      this.stopPendingStartupProgress(channel.id)
       this.acceptDiscordIngress('Discord channel deletion', () =>
         this.discordIngressQueue.run(channel.id, () => this.handleChannelDelete(channel.id)))
     })
     this.client.on(Events.ThreadDelete, (thread) => {
+      this.stopPendingStartupProgress(thread.id)
       this.acceptDiscordIngress('Discord thread deletion', async () => {
         this.clearQueuedSourceBlock(thread.id)
         this.unlinkedCodexSessionChannels.delete(thread.id)
@@ -810,6 +898,7 @@ export class CordexDiscordBot {
       this.discordIngressQueue.drain(),
       this.promptQueue.drain(),
       this.attachmentCacheQueue.drain(),
+      this.outgoingMediaQueue.drain(),
       this.discordOutboxStateQueue.drain(),
       this.discordOutboxDeliveryQueue.drain(),
       this.resumeQueue.drain(),
@@ -942,6 +1031,18 @@ export class CordexDiscordBot {
     })
   }
 
+  private async pruneOutgoingMediaCache(): Promise<void> {
+    await this.outgoingMediaQueue.run('cache', async () => {
+      const referenced = (this.state.discordOutbox || []).flatMap((entry) =>
+        entry.attachment ? [entry.attachment] : [])
+      const fileReferences = (this.state.discordOutbox || []).flatMap((entry) =>
+        entry.fileAttachments || [])
+      const removed = await pruneGeneratedImageCache(this.outgoingMediaDirectory, referenced) +
+        await pruneOutgoingFileCache(this.outgoingFileDirectory, fileReferences)
+      if (removed > 0) this.logVerbose('pruned delivered generated-image cache', { removed })
+    })
+  }
+
   private preserveDiscordTitleEchoesAcrossRestart(): void {
     for (const [discordThreadId, title] of this.expectedDiscordTitles) {
       this.rememberTitleEcho(this.recentDiscordTitleEchoes, discordThreadId, title)
@@ -997,9 +1098,20 @@ export class CordexDiscordBot {
     })))
     await saveState(this.state)
     if (announceRestart && generation === this.codexLifecycleGeneration()) {
-      await Promise.all(interruptedRuns.map((run) => run.channel.send(
-        `⚠ Codex runtime stopped unexpectedly and is restarting (attempt ${event.attempt}). The interrupted turn was ended.`,
-      ).catch(() => undefined)))
+      await Promise.all([...this.restartAffectedChannels].map(async (channelId) => {
+        const run = interruptedRuns.find((candidate) => candidate.channel.id === channelId)
+        const codexThreadId = run?.session.codexThreadId ||
+          this.state.sessions[channelId]?.codexThreadId || 'runtime'
+        await this.queueRuntimeNotice({
+          discordThreadId: channelId,
+          codexThreadId,
+          turnId: `runtime-restart:${generation}`,
+          itemKey: `attempt:${event.attempt}`,
+          value: `⚠ Codex runtime stopped unexpectedly and is restarting (attempt ${event.attempt}). The interrupted turn was ended.`,
+        }).catch((error: unknown) => {
+          this.logger.error('runtime_notice_failed', error, { channelId, phase: 'restarting' })
+        })
+      }))
     }
   }
 
@@ -1013,6 +1125,7 @@ export class CordexDiscordBot {
     await this.reconcileWorktreeRemovalIntents()
     if (generation !== this.codexLifecycleGeneration()) return
     await this.recoverDiscordOutbox()
+    this.scheduleDiscordOutboxRetry()
     if (generation !== this.codexLifecycleGeneration()) return
     await this.reconcileSessionTitles(generation)
     if (generation !== this.codexLifecycleGeneration()) return
@@ -1035,8 +1148,15 @@ export class CordexDiscordBot {
     const affectedChannels = [...this.restartAffectedChannels]
     this.restartAffectedChannels.clear()
     await Promise.all(affectedChannels.map(async (channelId) => {
-      const channel = await this.client.channels.fetch(channelId).catch(() => undefined)
-      if (channel?.isThread()) await channel.send('✓ Codex runtime recovered.').catch(() => undefined)
+      await this.queueRuntimeNotice({
+        discordThreadId: channelId,
+        codexThreadId: this.state.sessions[channelId]?.codexThreadId || 'runtime',
+        turnId: `runtime-recovery:${generation}`,
+        itemKey: 'recovered',
+        value: '✓ Codex runtime recovered.',
+      }).catch((error: unknown) => {
+        this.logger.error('runtime_notice_failed', error, { channelId, phase: 'recovered' })
+      })
     }))
   }
 
@@ -1044,11 +1164,15 @@ export class CordexDiscordBot {
     const affectedChannels = [...this.restartAffectedChannels]
     this.restartAffectedChannels.clear()
     await Promise.all(affectedChannels.map(async (channelId) => {
-      const channel = await this.client.channels.fetch(channelId).catch(() => undefined)
-      if (channel?.isThread()) {
-        await channel.send(`⨯ Codex runtime recovery failed: ${truncate(error.message, 1_750)}`)
-          .catch(() => undefined)
-      }
+      await this.queueRuntimeNotice({
+        discordThreadId: channelId,
+        codexThreadId: this.state.sessions[channelId]?.codexThreadId || 'runtime',
+        turnId: `runtime-recovery:${this.codexLifecycleGeneration()}`,
+        itemKey: 'failed',
+        value: `⨯ Codex runtime recovery failed: ${truncate(error.message, 1_750)}`,
+      }).catch((noticeError: unknown) => {
+        this.logger.error('runtime_notice_failed', noticeError, { channelId, phase: 'failed' })
+      })
     }))
   }
 
@@ -1787,6 +1911,7 @@ export class CordexDiscordBot {
   async start(): Promise<void> {
     this.assertNotStopping()
     if (this.stopPromise) throw new CordexStoppingError()
+    this.eventLoopDelay.enable()
     this.logger.info('startup_start', {
       guildId: this.config.guildId,
       projectCount: Object.keys(this.config.projects).length,
@@ -1801,6 +1926,9 @@ export class CordexDiscordBot {
     try {
       await this.pruneAttachmentCache().catch((error: unknown) => {
         console.error(`Failed to prune Discord attachment cache: ${errorText(error)}`)
+      })
+      await this.pruneOutgoingMediaCache().catch((error: unknown) => {
+        this.logVerbose('generated-image cache startup prune failed', { error: errorText(error) })
       })
       this.assertNotStopping()
       await this.registerCommands()
@@ -1835,22 +1963,20 @@ export class CordexDiscordBot {
             ...(this.client.user?.username ? { botName: this.client.user.username } : {}),
           })
           this.assertNotStopping()
-          if (root) {
-            try {
-              await saveManagedConfig(this.config)
-              this.assertNotStopping()
-            } catch (error) {
-              if (root.created) {
-                delete this.config.projects[root.textChannel.id]
-                await root.textChannel.delete('Cordex root mapping could not be saved').catch(() => undefined)
-              }
-              throw error
+          try {
+            await saveManagedConfig(this.config)
+            this.assertNotStopping()
+          } catch (error) {
+            if (root?.created) {
+              delete this.config.projects[root.textChannel.id]
+              await root.textChannel.delete('Cordex root mapping could not be saved').catch(() => undefined)
             }
-            if (root.created) {
-              await this.sendRootWelcome(root.textChannel).catch((error: unknown) => {
-                console.error(`Failed to send Cordex root welcome: ${errorText(error)}`)
-              })
-            }
+            throw error
+          }
+          if (root?.created) {
+            await this.sendRootWelcome(root.textChannel).catch((error: unknown) => {
+              console.error(`Failed to send Cordex root welcome: ${errorText(error)}`)
+            })
           }
         })
       } catch (error) {
@@ -1859,10 +1985,14 @@ export class CordexDiscordBot {
       }
       this.assertNotStopping()
       await this.recoverDiscordOutbox()
+      this.scheduleDiscordOutboxRetry()
+      await this.announceInterruptedStartupSessions()
       this.assertNotStopping()
       await this.reconcilePersistedQueuedSources()
       this.assertNotStopping()
       await this.reconcileSessionTitles()
+      this.assertNotStopping()
+      await this.recoverPendingInitialSessions()
       this.assertNotStopping()
       await this.recoverPersistedPromptQueues()
       this.assertNotStopping()
@@ -1877,6 +2007,7 @@ export class CordexDiscordBot {
       throw error
     } finally {
       if (!started) {
+        this.eventLoopDelay.disable()
         this.stopping = true
         this.clearAllQueuedSourceRetries()
       }
@@ -1897,6 +2028,17 @@ export class CordexDiscordBot {
           error: errorText(error),
         })
       })
+    }
+  }
+
+  private async recoverPendingInitialSessions(): Promise<void> {
+    for (const [threadId, pending] of Object.entries(this.state.pendingInitialSessions || {})) {
+      if (this.state.sessions[threadId]) continue
+      if (!this.queueFor(threadId).length) continue
+      const channel = await this.client.channels.fetch(threadId).catch(() => undefined)
+      if (!channel?.isThread() || channel.guildId !== this.config.guildId ||
+        channel.parentId !== pending.parentChannelId) continue
+      await this.holdPendingInitialPrompt(channel, pending)
     }
   }
 
@@ -1928,11 +2070,14 @@ export class CordexDiscordBot {
     if (!firstEntry || !outputKey) return
     await this.updateDiscordOutbox((outbox, deliveredKeys) => {
       const session = this.state.sessions[firstEntry.discordThreadId]
-      if (
+      const pendingInitial = this.state.pendingInitialSessions?.[firstEntry.discordThreadId]
+      const pendingNotice = pendingInitial &&
+        firstEntry.codexThreadId === `pending-session:${firstEntry.discordThreadId}`
+      if (!pendingNotice && (
         !session ||
         session.codexThreadId !== firstEntry.codexThreadId ||
         session.lifecycleIntent?.kind === 'delete-thread'
-      ) return false
+      )) return false
       const pending = new Set(outbox.map((entry) => entry.key))
       const delivered = new Set(deliveredKeys)
       if (
@@ -1940,6 +2085,20 @@ export class CordexDiscordBot {
         outbox.some((entry) => discordOutboxOutputKey(entry) === outputKey)
       ) return false
       let changed = false
+      // On reconnect, only the latest pending progress is useful. Real output
+      // supersedes every undelivered progress notice for this turn.
+      for (let index = outbox.length - 1; index >= 0; index--) {
+        const entry = outbox[index]
+        if (
+          entry?.discordThreadId === firstEntry.discordThreadId &&
+          entry.codexThreadId === firstEntry.codexThreadId &&
+          entry.turnId === firstEntry.turnId &&
+          entry.itemKey.startsWith('progress:')
+        ) {
+          outbox.splice(index, 1)
+          changed = true
+        }
+      }
       for (const entry of entries) {
         if (pending.has(entry.key) || delivered.has(entry.key)) continue
         outbox.push(entry)
@@ -1967,34 +2126,128 @@ export class CordexDiscordBot {
   }
 
   private async drainDiscordOutbox(channel: ThreadChannel): Promise<void> {
-    await this.discordOutboxDeliveryQueue.run(channel.id, async () => {
-      while (true) {
-        const entry = this.state.discordOutbox?.find(
-          (candidate) => candidate.discordThreadId === channel.id,
-        )
-        if (!entry) return
-        await channel.send({
-          content: entry.content,
-          allowedMentions: { parse: [] },
-          ...(entry.suppressNotifications
-            ? { flags: MessageFlags.SuppressNotifications }
-            : {}),
-          nonce: entry.nonce,
-          enforceNonce: true,
-        })
-        await this.acknowledgeDiscordOutput(entry.key)
-      }
-    })
+    try {
+      await this.discordOutboxDeliveryQueue.run(channel.id, async () => {
+        while (true) {
+          const entry = this.state.discordOutbox?.find(
+            (candidate) => candidate.discordThreadId === channel.id,
+          )
+          if (!entry) return
+          let files: Array<{ attachment: Buffer; name: string }> | undefined
+          let attachmentUnavailable = false
+          if (entry.attachment) {
+            try {
+              files = [{
+                attachment: await readCachedGeneratedImage(this.outgoingMediaDirectory, entry.attachment),
+                name: generatedImageFileName(entry.attachment),
+              }]
+            } catch (error) {
+              attachmentUnavailable = true
+              this.logVerbose('generated-image cache unavailable for Discord delivery', {
+                threadId: entry.codexThreadId,
+                error: errorText(error),
+              })
+            }
+          } else if (entry.fileAttachments) {
+            try {
+              files = await Promise.all(entry.fileAttachments.map(async (attachment) => ({
+                attachment: await readCachedOutgoingFile(this.outgoingFileDirectory, attachment),
+                name: attachment.name,
+              })))
+            } catch (error) {
+              attachmentUnavailable = true
+              this.logVerbose('outgoing-file cache unavailable for Discord delivery', {
+                threadId: entry.codexThreadId,
+                error: errorText(error),
+              })
+            }
+          }
+          const unavailableNotice = entry.fileAttachments
+            ? '\n⚠ Files could not be attached; rerun the explicit upload command.'
+            : '\n⚠ Generated image could not be attached; ask Codex for its saved project path.'
+          const sendOptions: MessageCreateOptions = {
+            content: attachmentUnavailable ? `${entry.content}${unavailableNotice}` : entry.content,
+            allowedMentions: { parse: [] },
+            ...(entry.suppressNotifications
+              ? { flags: MessageFlags.SuppressNotifications }
+              : {}),
+            nonce: entry.nonce,
+            enforceNonce: true,
+            ...(files && !attachmentUnavailable ? { files } : {}),
+          }
+          try {
+            await channel.send(sendOptions)
+          } catch (error) {
+            const rejection = files?.length ? discordUploadRejection(error) : undefined
+            if (!rejection) throw error
+            const notice = rejection === 'too-large'
+              ? entry.fileAttachments
+                ? 'Files exceed this Discord channel\'s upload limit; rerun with smaller files.'
+                : 'Generated image exceeds this Discord channel\'s upload limit; ask Codex for its saved project path.'
+              : entry.fileAttachments
+                ? 'Discord rejected one or more file attachments; check file types and names, then rerun the upload.'
+                : 'Discord rejected the generated image attachment; ask Codex for its saved project path.'
+            await channel.send({
+              ...sendOptions,
+              content: `${entry.content}\n⚠ ${notice}`,
+              files: [],
+            })
+          }
+          await this.acknowledgeDiscordOutput(entry.key)
+          await this.pruneOutgoingMediaCache().catch((error: unknown) => {
+            this.logVerbose('generated-image cache cleanup deferred', { error: errorText(error) })
+          })
+        }
+      })
+    } catch (error) {
+      this.scheduleDiscordOutboxRetry()
+      throw error
+    }
+    if (!this.state.discordOutbox?.length) {
+      this.discordOutboxRetryDelayMs = 5_000
+      if (this.discordOutboxRetryTimer) clearTimeout(this.discordOutboxRetryTimer)
+      delete this.discordOutboxRetryTimer
+    }
+  }
+
+  private scheduleDiscordOutboxRetry(immediate = false): void {
+    if (this.stopping || !this.state.discordOutbox?.length) return
+    if (immediate && this.discordOutboxRetryTimer) {
+      clearTimeout(this.discordOutboxRetryTimer)
+      delete this.discordOutboxRetryTimer
+    }
+    if (this.discordOutboxRetryTimer) return
+    this.discordOutboxRetryTimer = setTimeout(() => {
+      delete this.discordOutboxRetryTimer
+      this.trackBackgroundWork(this.retryDiscordOutbox(), 'Discord outbox retry')
+    }, immediate ? 0 : this.discordOutboxRetryDelayMs)
+    this.discordOutboxRetryTimer.unref()
+  }
+
+  private async retryDiscordOutbox(): Promise<void> {
+    if (this.stopping || this.discordOutboxRetryInFlight) return
+    this.discordOutboxRetryInFlight = true
+    try {
+      await this.recoverDiscordOutbox()
+    } finally {
+      this.discordOutboxRetryInFlight = false
+      if (this.state.discordOutbox?.length) {
+        this.discordOutboxRetryDelayMs = Math.min(this.discordOutboxRetryDelayMs * 2, 120_000)
+        this.scheduleDiscordOutboxRetry()
+      } else this.discordOutboxRetryDelayMs = 5_000
+    }
   }
 
   private async stageDurableDiscordOutput(options: {
-    channel: ThreadChannel
+    channel: { id: string }
     codexThreadId: string
     turnId: string
     itemKey: string
     value: string
     suppressNotifications: boolean
     format?: boolean
+    attachment?: GeneratedImageAttachment
+    fileAttachments?: OutgoingFileAttachment[]
   }): Promise<void> {
     const rendered = options.format === false ? options.value : formatAssistantText(options.value)
     const chunks = splitMarkdownForDiscord(rendered, 1_900)
@@ -2005,7 +2258,28 @@ export class CordexDiscordBot {
       itemKey: options.itemKey,
       chunks,
       suppressNotifications: options.suppressNotifications,
+      ...(options.attachment ? { attachment: options.attachment } : {}),
+      ...(options.fileAttachments ? { fileAttachments: options.fileAttachments } : {}),
     }))
+  }
+
+  private async queueRuntimeNotice(options: {
+    discordThreadId: string
+    codexThreadId: string
+    turnId: string
+    itemKey: string
+    value: string
+  }): Promise<void> {
+    await this.stageDurableDiscordOutput({
+      channel: { id: options.discordThreadId },
+      codexThreadId: options.codexThreadId,
+      turnId: options.turnId,
+      itemKey: options.itemKey,
+      value: options.value,
+      suppressNotifications: false,
+      format: false,
+    })
+    this.scheduleDiscordOutboxRetry(true)
   }
 
   private async sendDurableDiscordOutput(options: {
@@ -2032,6 +2306,37 @@ export class CordexDiscordBot {
         this.logVerbose('Discord outbox recovery failed', {
           discordThreadId,
           error: errorText(error),
+        })
+      })
+    }
+  }
+
+  private async announceInterruptedStartupSessions(): Promise<void> {
+    for (const interrupted of this.options.interruptedOnStartup || []) {
+      const session = this.state.sessions[interrupted.discordThreadId]
+      if (
+        !session ||
+        session.codexThreadId !== interrupted.codexThreadId ||
+        session.archived
+      ) continue
+      const savedPromptCount = this.state.queues[interrupted.discordThreadId]?.length || 0
+      const uncertainPrompt = this.state.queues[interrupted.discordThreadId]?.some(
+        (prompt) => prompt.reviewRequired,
+      ) || false
+      await this.queueRuntimeNotice({
+        discordThreadId: interrupted.discordThreadId,
+        codexThreadId: interrupted.codexThreadId,
+        turnId: interrupted.turnId,
+        itemKey: 'startup-interrupted',
+        value: uncertainPrompt
+          ? '⚠ Cordex restarted while this Codex turn was recorded as active. A saved prompt needs delivery review; Cordex will not retry it automatically. Use /pending-prompts to inspect it.'
+          : savedPromptCount > 0
+          ? `⚠ Cordex restarted while this Codex turn was recorded as active. ${savedPromptCount} saved prompt${savedPromptCount === 1 ? '' : 's'} ${savedPromptCount === 1 ? 'is' : 'are'} being reconciled; any not already accepted may run automatically. Watch this thread and check /status before sending more work.`
+          : '⚠ Cordex restarted while this Codex turn was recorded as active. Check the latest output, then send a new message to continue.',
+      }).catch((error: unknown) => {
+        this.logger.error('runtime_notice_failed', error, {
+          channelId: interrupted.discordThreadId,
+          phase: 'startup',
         })
       })
     }
@@ -2569,6 +2874,9 @@ export class CordexDiscordBot {
   }
 
   private clearShutdownTimers(): void {
+    this.eventLoopDelay.disable()
+    if (this.discordOutboxRetryTimer) clearTimeout(this.discordOutboxRetryTimer)
+    delete this.discordOutboxRetryTimer
     for (const timer of this.titleVerificationRetryTimers.values()) clearTimeout(timer)
     this.titleVerificationRetryTimers.clear()
     this.titleVerificationRetryAttempts.clear()
@@ -2578,6 +2886,8 @@ export class CordexDiscordBot {
     this.clearAllQueuedSourceRetries()
     this.invalidateSkillCache()
     for (const run of this.runs.values()) clearInterval(run.typingTimer)
+    for (const progress of this.pendingStartupProgress.values()) clearInterval(progress.timer)
+    this.pendingStartupProgress.clear()
   }
 
   private async dismissPendingControlsForShutdown(): Promise<void> {
@@ -2692,12 +3002,9 @@ export class CordexDiscordBot {
   private async pruneDeletedProjectMappings(): Promise<void> {
     for (const { channelId } of projectMappings(this.config)) {
       try {
-        const channel = await this.client.channels.fetch(channelId)
-        if (
-          !channel ||
-          !('guildId' in channel) ||
-          channel.guildId !== this.config.guildId
-        ) {
+        const channel = await this.channelMetadataForPrune(channelId)
+        if (!channel) continue
+        if (channel.guild_id !== this.config.guildId) {
           await this.cleanupProjectMapping(channelId, true)
         }
       } catch (error) {
@@ -2708,6 +3015,20 @@ export class CordexDiscordBot {
         }
       }
     }
+  }
+
+  private async channelMetadataForPrune(channelId: string): Promise<JsonObject | undefined> {
+    const channel = await this.client.rest.get(Routes.channel(channelId))
+    if (
+      !isRecord(channel) ||
+      channel.id !== channelId ||
+      typeof channel.guild_id !== 'string' ||
+      typeof channel.type !== 'number'
+    ) {
+      console.error(`Could not verify channel ${channelId}: incomplete Discord channel metadata`)
+      return undefined
+    }
+    return channel
   }
 
   private async pruneOrphanedState(): Promise<void> {
@@ -2732,11 +3053,19 @@ export class CordexDiscordBot {
       let validThread = mappedChannels.has(session.parentChannelId)
       if (validThread) {
         try {
-          const channel = await this.client.channels.fetch(threadId)
-          validThread = Boolean(
-            channel?.isThread() &&
-            channel.guildId === this.config.guildId &&
-            channel.parentId === session.parentChannelId,
+          const channel = await this.channelMetadataForPrune(threadId)
+          if (!channel || typeof channel.parent_id !== 'string') {
+            if (channel) {
+              console.error(`Could not verify session thread ${threadId}: missing Discord parent ID`)
+            }
+            continue
+          }
+          validThread = (
+            channel.guild_id === this.config.guildId &&
+            channel.parent_id === session.parentChannelId &&
+            (channel.type === ChannelType.AnnouncementThread ||
+              channel.type === ChannelType.PublicThread ||
+              channel.type === ChannelType.PrivateThread)
           )
         } catch (error) {
           if (isUnknownDiscordChannelError(error)) validThread = false
@@ -3123,11 +3452,11 @@ export class CordexDiscordBot {
     ])
     const listOptions = {
       ...(searchTerm ? { searchTerm } : {}),
-      limit: 100,
+      cwd: [...directories],
     }
     const [activeThreads, archivedThreads] = await Promise.all([
-      this.codex.listThreads(listOptions),
-      this.codex.listThreads({ ...listOptions, archived: true }),
+      this.codex.listAllThreads(listOptions),
+      this.codex.listAllThreads({ ...listOptions, archived: true }),
     ])
     const linked = new Map(
       Object.values(this.state.sessions).map((session) => [session.codexThreadId, session]),
@@ -3166,14 +3495,32 @@ export class CordexDiscordBot {
       .slice(0, limit)
   }
 
-  private async listAllProjectThreads(limit = 20) {
+  private async listAllProjectThreads(
+    limit = 20,
+    options: { searchTerm?: string; includeArchived?: boolean } = {},
+  ) {
     const directories = new Set([
       ...Object.values(this.config.projects).map((project) => path.resolve(project.directory)),
       ...Object.values(this.state.sessions).map((session) => path.resolve(session.directory)),
     ])
     if (directories.size === 0) return []
-    const threads = await this.codex.listThreads({ limit: 100 })
-    return threads.filter((thread) => directories.has(path.resolve(thread.cwd))).slice(0, limit)
+    const listOptions = {
+      cwd: [...directories],
+      ...(options.searchTerm ? { searchTerm: options.searchTerm } : {}),
+    }
+    const [active, archived] = await Promise.all([
+      this.codex.listAllThreads(listOptions),
+      options.includeArchived
+        ? this.codex.listAllThreads({ ...listOptions, archived: true })
+        : Promise.resolve([]),
+    ])
+    return [
+      ...active.map((thread) => ({ ...thread, archived: false })),
+      ...archived.map((thread) => ({ ...thread, archived: true })),
+    ]
+      .filter((thread) => directories.has(path.resolve(thread.cwd)))
+      .sort((left, right) => right.updatedAt - left.updatedAt)
+      .slice(0, limit)
   }
 
   private deferredCommandInteraction(
@@ -3205,15 +3552,66 @@ export class CordexDiscordBot {
   private async handleQueuedCommand(
     interaction: ChatInputCommandInteraction,
   ): Promise<void> {
-    const acknowledgment = this.requireAccess(interaction).then(async (allowed) => {
-      if (!allowed) return false
-      if (ephemeralChatCommands.has(interaction.commandName)) {
-        await interaction.deferReply({ ephemeral: true })
-      } else {
+    const privateReply = ephemeralChatCommands.has(interaction.commandName)
+    const ackStartedAt = Date.now()
+    const ageAtIngressMs = Math.max(0, ackStartedAt - interaction.createdTimestamp)
+    let callbackCompletedAt: number | undefined
+    const initialAcknowledgment = privateReply
+      ? (async () => {
+        // Private commands can acknowledge before a slow guild/member lookup.
+        // Access checks still gate dispatch, and denials edit this private reply.
+        await interaction.deferReply({ flags: MessageFlags.Ephemeral })
+        callbackCompletedAt = Date.now()
+        return this.requireAccess(this.deferredCommandInteraction(interaction))
+      })()
+      : this.requireAccess(interaction).then(async (allowed) => {
+        if (!allowed) {
+          callbackCompletedAt = Date.now()
+          return false
+        }
         await interaction.deferReply()
-      }
-      return true
-    })
+        callbackCompletedAt = Date.now()
+        return true
+      })
+    const acknowledgment = initialAcknowledgment.then(
+      (allowed) => {
+        const eventLoopDelayMaxMs = Math.round(this.eventLoopDelay.max / 1_000_000)
+        this.eventLoopDelay.reset()
+        const callbackLatencyMs = (callbackCompletedAt ?? Date.now()) - ackStartedAt
+        const metadata = {
+          privateReply,
+          allowed,
+          ageAtIngressMs,
+          callbackLatencyMs,
+          afterAckMs: callbackCompletedAt ? Date.now() - callbackCompletedAt : 0,
+          totalAgeMs: Math.max(0, Date.now() - interaction.createdTimestamp),
+          gatewayPingMs: this.client.ws.ping,
+          eventLoopDelayMaxMs,
+        }
+        if (ageAtIngressMs >= 1_500 || callbackLatencyMs >= 1_500 || eventLoopDelayMaxMs >= 500) {
+          this.logger.warn('discord_interaction_ack_slow', metadata)
+        } else this.logger.info('discord_interaction_ack', metadata)
+        return allowed
+      },
+      (error: unknown) => {
+        const eventLoopDelayMaxMs = Math.round(this.eventLoopDelay.max / 1_000_000)
+        this.eventLoopDelay.reset()
+        this.logger.warn('discord_interaction_ack_failed', {
+          privateReply,
+          ageAtIngressMs,
+          callbackLatencyMs: (callbackCompletedAt ?? Date.now()) - ackStartedAt,
+          acknowledged: callbackCompletedAt !== undefined,
+          totalAgeMs: Math.max(0, Date.now() - interaction.createdTimestamp),
+          gatewayPingMs: this.client.ws.ping,
+          eventLoopDelayMaxMs,
+          errorCode: isRecord(error) &&
+            (typeof error.code === 'number' || typeof error.code === 'string')
+            ? String(error.code)
+            : 'unknown',
+        })
+        throw error
+      },
+    )
     await this.discordIngressQueue.run(interaction.channelId, async () => {
       if (!(await acknowledgment)) return
       await this.waitForMutationIngressReady()
@@ -3266,11 +3664,13 @@ export class CordexDiscordBot {
       else if (interaction.commandName === 'rename') await this.handleRenameCommand(interaction)
       else if (interaction.commandName === 'fork') await this.handleForkCommand(interaction)
       else if (interaction.commandName === 'fork-subagent') await this.handleForkSubagentCommand(interaction)
+      else if (interaction.commandName === 'subagents') await this.handleSubagentsCommand(interaction)
       else if (interaction.commandName === 'btw') await this.handleBtwCommand(interaction)
       else if (interaction.commandName === 'compact') await this.handleCompactCommand(interaction)
       else if (interaction.commandName === 'goal') await this.handleGoalCommand(interaction)
       else if (interaction.commandName === 'clear-goal') await this.handleClearGoalCommand(interaction)
       else if (interaction.commandName === 'archive') await this.handleArchiveCommand(interaction)
+      else if (interaction.commandName === 'delete') await this.handleDeleteSessionCommand(interaction)
       else if (interaction.commandName === 'review') await this.handleReviewCommand(interaction)
       else if (interaction.commandName === 'diff') await this.handleDiffCommand(interaction)
       else if (interaction.commandName === 'schedule') await this.handleScheduleCommand(interaction)
@@ -3280,6 +3680,10 @@ export class CordexDiscordBot {
       else if (interaction.commandName === 'skills') await this.handleSkillsCommand(interaction)
       else if (interaction.commandName === 'skill-toggle') await this.handleSkillToggleCommand(interaction)
       else if (interaction.commandName === 'skill-roots') await this.handleSkillRootsCommand(interaction)
+      else if (interaction.commandName === 'plugins') await this.handlePluginsCommand(interaction)
+      else if (interaction.commandName === 'plugin') await this.handlePluginCommand(interaction)
+      else if (interaction.commandName === 'hooks') await this.handleHooksCommand(interaction)
+      else if (interaction.commandName === 'apps') await this.handleAppsCommand(interaction)
       else if (interaction.commandName === 'mcp-status') await this.handleMcpStatusCommand(interaction)
       else if (interaction.commandName === 'mcp') await this.handleMcpCommand(interaction)
       else if (interaction.commandName === 'mcp-login') await this.handleMcpLoginCommand(interaction)
@@ -3295,13 +3699,18 @@ export class CordexDiscordBot {
       else if (interaction.commandName === 'delete-worktree') await this.handleDeleteWorktreeCommand(interaction)
       else if (interaction.commandName === 'queue') await this.handleQueueCommand(interaction)
       else if (interaction.commandName === 'clear-queue') await this.handleClearQueueCommand(interaction)
+      else if (interaction.commandName === 'pending-prompts') await this.handlePendingPromptsCommand(interaction)
+      else if (interaction.commandName === 'resolve-pending') await this.handleResolvePendingCommand(interaction)
       else if (interaction.commandName === 'run-shell-command') await this.handleShellCommand(interaction)
       else if (interaction.commandName === 'last-sessions') await this.handleLastSessionsCommand(interaction)
       else if (interaction.commandName === 'context-usage') await this.handleContextUsageCommand(interaction)
       else if (interaction.commandName === 'verbosity') await this.handleVerbosityCommand(interaction)
       else if (interaction.commandName === 'session-id') await this.handleSessionIdCommand(interaction)
       else if (interaction.commandName === 'abort') await this.handleAbortCommand(interaction)
+      else if (interaction.commandName === 'ps') await this.handlePsCommand(interaction)
+      else if (interaction.commandName === 'stop') await this.handleStopCommand(interaction)
       else if (interaction.commandName === 'status') await this.handleStatusCommand(interaction)
+      else if (interaction.commandName === 'debug-config') await this.handleDebugConfigCommand(interaction)
     } catch (error) {
       const payload = { content: `⨯ ${truncate(errorText(error), 1_850)}` }
       if (interaction.deferred && !interaction.replied) await interaction.editReply(payload.content)
@@ -3317,7 +3726,10 @@ export class CordexDiscordBot {
   ): Promise<void> {
     const chunks = splitMarkdownForDiscord(content || '…', 1_900)
     const first = chunks.shift() || '…'
-    if (interaction.deferred && !interaction.replied) await interaction.editReply(first)
+    if (interaction.deferred && !interaction.replied) await interaction.editReply({
+      content: first,
+      allowedMentions: { parse: [] },
+    })
     else if (!interaction.replied) await interaction.reply({
       content: first,
       allowedMentions: { parse: [] },
@@ -3581,6 +3993,11 @@ export class CordexDiscordBot {
           const sessions = Object.entries(this.state.sessions).filter(
             ([, session]) => session.parentChannelId === channelId,
           )
+          const pendingStarts = Object.values(this.state.pendingInitialSessions || {})
+            .filter((pending) => pending.parentChannelId === channelId)
+          if (pendingStarts.length > 0) {
+            throw new Error('Project has saved session creation work awaiting /pending-prompts review')
+          }
           const blocker = projectRemovalBlocker(sessions, force)
           if (blocker) throw new Error(blocker)
           await this.archiveProjectSessions(channelId, true)
@@ -3646,18 +4063,26 @@ export class CordexDiscordBot {
       reason: 'New project session',
     })
     await thread.members.add(interaction.user.id).catch(() => undefined)
-    await this.dispatchInput(
-      thread,
-      projectChannel.textChannel.id,
-      [
-        {
-          type: 'text',
-          text: 'The project was just initialized. Say hello and ask what the user wants to build.',
-          text_elements: [],
-        },
-      ],
-      interaction.id,
-    )
+    try {
+      await this.dispatchInput(
+        thread,
+        projectChannel.textChannel.id,
+        [
+          {
+            type: 'text',
+            text: 'The project was just initialized. Say hello and ask what the user wants to build.',
+            text_elements: [],
+          },
+        ],
+        interaction.id,
+      )
+    } catch (error) {
+      if (!this.state.pendingInitialSessions?.[thread.id]) throw error
+      await interaction.editReply(
+        `Project **${created.name}** was created, but Codex session creation is pending review in ${thread}. Open that thread and use /pending-prompts.`,
+      )
+      return
+    }
     await interaction.editReply(
       `Created project **${created.name}** at \`${created.directory}\`.\nChannel: <#${projectChannel.textChannel.id}>\nSession: ${thread}`,
     )
@@ -3767,6 +4192,7 @@ export class CordexDiscordBot {
     }
     if (!session) throw new Error('Selecting a permission profile requires a Cordex thread')
     if (profile === 'default') {
+      await this.ensureSessionLoaded(session)
       const previous = session.permissions
       const previousUpdatedAt = session.updatedAt
       delete session.permissions
@@ -3801,6 +4227,7 @@ export class CordexDiscordBot {
       await interaction.editReply(`Permission profile is not allowed: \`${profile}\`.`)
       return
     }
+    await this.ensureSessionLoaded(session)
     const previous = session.permissions
     const previousUpdatedAt = session.updatedAt
     session.permissions = profile
@@ -3871,6 +4298,7 @@ export class CordexDiscordBot {
         )
       }
     }
+    if (session) await this.ensureSessionLoaded(session)
     const previousSession = session
       ? {
           model: session.model,
@@ -4057,6 +4485,7 @@ export class CordexDiscordBot {
       effort,
     })
     if (session) {
+      await this.ensureSessionLoaded(session)
       const previousEffort = session.effort
       const previousUpdatedAt = session.updatedAt
       session.effort = resolved.effort || effort
@@ -4105,6 +4534,7 @@ export class CordexDiscordBot {
       ? this.state.sessions[interaction.channel.id]
       : undefined
     if (session) {
+      await this.ensureSessionLoaded(session)
       const fallback = this.state.channelModels[parentId] || this.config.defaultModel
       const resolved = await this.resolveModelSettings({
         ...(fallback ? { model: fallback } : {}),
@@ -4236,6 +4666,7 @@ export class CordexDiscordBot {
     const model = session?.model || this.state.channelModels[parentId] || this.config.defaultModel
     const serviceTier = await this.serviceTierForFastMode(model, next, true)
     if (session) {
+      await this.ensureSessionLoaded(session)
       const previous = session.fastMode
       const previousUpdatedAt = session.updatedAt
       session.fastMode = next
@@ -4290,6 +4721,7 @@ export class CordexDiscordBot {
     }
     const next = action === 'on'
     if (session) {
+      await this.ensureSessionLoaded(session)
       const previous = session.yoloMode
       const previousUpdatedAt = session.updatedAt
       session.yoloMode = next
@@ -4516,11 +4948,18 @@ export class CordexDiscordBot {
         `Session started: ${thread}${worktree ? `\nWorktree: \`${worktree.branch}\`` : inherited?.worktree ? `\nDirectory: \`${directory}\`` : ''}${files.length ? `\nFiles: ${files.map((file) => `\`${file}\``).join(', ')}` : ''}`,
       )
     } catch (error) {
-      if (worktree && (!thread || !this.state.sessions[thread.id])) {
+      const pendingInitial = thread && this.state.pendingInitialSessions?.[thread.id]
+      if (worktree && (!thread || (!this.state.sessions[thread.id] && !pendingInitial))) {
         await removeWorktree(worktree).catch(() => undefined)
       }
-      if (thread && !this.state.sessions[thread.id]) {
+      if (thread && !this.state.sessions[thread.id] && !pendingInitial) {
         await thread.delete('Cordex session could not be started').catch(() => undefined)
+      }
+      if (thread && pendingInitial) {
+        await interaction.editReply(
+          `Codex session creation is pending review in ${thread}. Your initial prompt is saved; open that thread and use /pending-prompts.`,
+        )
+        return
       }
       throw error
     } finally {
@@ -4841,6 +5280,21 @@ export class CordexDiscordBot {
     return { channel: interaction.channel, session }
   }
 
+  private requirePendingPromptTarget(interaction: ChatInputCommandInteraction):
+    | { channel: ThreadChannel; session: SessionState; pendingInitial?: never }
+    | { channel: ThreadChannel; session?: never; pendingInitial: PendingInitialSession } {
+    if (!interaction.channel?.isThread() || interaction.channel.guildId !== this.config.guildId) {
+      throw new Error('Command requires a Cordex thread in the configured server')
+    }
+    if (this.state.sessions[interaction.channel.id]) return this.requireThreadSession(interaction)
+    const pendingInitial = this.state.pendingInitialSessions?.[interaction.channel.id]
+    if (!pendingInitial || interaction.channel.parentId !== pendingInitial.parentChannelId ||
+      !this.config.projects[pendingInitial.parentChannelId]) {
+      throw new Error('Thread has no Cordex session or pending session creation')
+    }
+    return { channel: interaction.channel, pendingInitial }
+  }
+
   private restoreSessionState(target: SessionState, snapshot: SessionState): void {
     const mutable = target as unknown as Record<string, unknown>
     for (const key of Object.keys(mutable)) delete mutable[key]
@@ -5136,6 +5590,9 @@ export class CordexDiscordBot {
     })
     const modelTransition = !isSubagentFork && options.source.model !== undefined &&
       options.source.model !== forked.model
+    const forkEffort = isSubagentFork
+      ? forked.effort
+      : options.source.effort || forked.effort
     const thread = await this.createSessionThread({
       parentChannelId: options.parentChannelId,
       name: options.name,
@@ -5147,7 +5604,7 @@ export class CordexDiscordBot {
       directory: options.source.directory,
       codexThreadId: forked.threadId,
       model: isSubagentFork ? forked.model : options.source.model || forked.model,
-      ...(!isSubagentFork && options.source.effort ? { effort: options.source.effort } : {}),
+      ...(forkEffort ? { effort: forkEffort } : {}),
       ...(!isSubagentFork && options.source.mode ? { mode: options.source.mode } : {}),
       ...(options.source.fastMode !== undefined ? { fastMode: options.source.fastMode } : {}),
       ...(options.source.yoloMode !== undefined ? { yoloMode: options.source.yoloMode } : {}),
@@ -5191,7 +5648,25 @@ export class CordexDiscordBot {
 
   private subagentLabel(subagent: CodexSubagentThread): string {
     const agent = subagent.agentPath?.split('/').filter(Boolean).at(-1)
-    return truncate(agent || subagent.prompt || `subagent ${subagent.threadId.slice(0, 8)}`, 100)
+    return truncate((agent || subagent.prompt || `subagent ${subagent.threadId.slice(0, 8)}`)
+      .replace(/\s+/g, ' ').trim(), 100)
+  }
+
+  private async handleSubagentsCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const { session } = this.requireThreadSession(interaction)
+    await interaction.deferReply({ ephemeral: true })
+    const subagents = await this.codex.listSubagentThreads(session.codexThreadId)
+    const shown = subagents.slice(0, 25)
+    const lines = shown.map((subagent, index) => {
+      const label = escapeInlineMarkdown(this.subagentLabel(subagent).replace(/\s+/g, ' '))
+      const status = subagent.status || subagent.activity || 'status unknown'
+      return `${index + 1}. **${label}** — ${discordInlineCode(status)}\n${discordInlineCode(subagent.threadId)}`
+    })
+    await this.replyWithChunks(
+      interaction,
+      `${subagents.length} Codex subagent${subagents.length === 1 ? '' : 's'} found${subagents.length > shown.length ? `; showing the newest ${shown.length}` : ''}.\n${lines.join('\n') || 'No subagent tasks found in this session.'}\nUse /fork-subagent to continue one in a new Discord thread.`,
+      { ephemeral: true },
+    )
   }
 
   private async handleForkSubagentCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -5308,6 +5783,7 @@ export class CordexDiscordBot {
     const { session } = this.requireThreadSession(interaction)
     if (session.activeTurnId) throw new Error('Wait for active turn or run /abort first')
     await interaction.deferReply()
+    await this.ensureSessionLoaded(session)
     const contextVersion = this.contextUsageVersion(session.codexThreadId)
     await this.codex.compactThread(session.codexThreadId)
     if (this.invalidateContextUsageUnlessUpdated(session, contextVersion)) await saveState(this.state)
@@ -5428,6 +5904,66 @@ export class CordexDiscordBot {
     }
   }
 
+  private async handleDeleteSessionCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const { channel, session } = this.requireThreadSession(interaction)
+    const confirmedId = interaction.options.getString('confirm-session-id', true).trim()
+    if (confirmedId !== session.codexThreadId) {
+      throw new Error('Confirmation must match this exact Codex session ID. Use /session-id to copy it.')
+    }
+    await interaction.deferReply({ ephemeral: true })
+    await this.promptQueue.run(channel.id, async () => {
+      if (this.state.sessions[channel.id] !== session) {
+        throw new Error('The Discord thread is no longer linked to this Codex session')
+      }
+      if (session.activeTurnId || this.runs.has(session.codexThreadId)) {
+        throw new Error('Wait for the active turn or run /abort before deleting')
+      }
+      if (this.pendingTurnStarts.has(session.codexThreadId)) {
+        throw new Error('Wait for the pending turn start or run /abort before deleting')
+      }
+      if (session.abortIntent) throw new Error('Turn abort is still pending')
+      const prompts = this.state.queues[channel.id] || []
+      if (prompts.some((prompt) => this.promptDeliveryKind(prompt) === 'queued')) {
+        throw new Error('Clear queued prompts before deleting')
+      }
+      if (prompts.some((prompt) => this.promptDeliveryKind(prompt) === 'direct')) {
+        throw new Error('Wait for pending prompt delivery or recovery before deleting')
+      }
+      const pendingTask = Object.values(this.state.tasks).find(
+        (task) => task.threadId === channel.id &&
+          (task.status === 'scheduled' || task.status === 'running'),
+      )
+      if (pendingTask) throw new Error(`Cancel scheduled task ${pendingTask.id} before deleting`)
+      if (!session.archived) await this.ensureSessionLoaded(session)
+      const runtime = await this.codex.getThreadRuntimeState(session.codexThreadId)
+      if (runtime.status === 'active') throw new Error('Codex still reports an active turn; run /abort first')
+      if (runtime.status === 'systemError') throw new Error('Codex thread status is unavailable; deletion was not started')
+      const terminals = await this.codex.listBackgroundTerminals(session.codexThreadId)
+      if (terminals.length > 0) throw new Error('Stop background terminals with /stop before deleting')
+      if (!session.archived) {
+        const goal = await this.codex.getThreadGoal(session.codexThreadId)
+        if (goal?.status === 'active') {
+          throw new Error('Pause, complete, or clear the active goal before deleting')
+        }
+      }
+      await this.persistDeletedThreadIntent(session, 'delete')
+    })
+    await this.reconcileDeletedThreadIntents(new Set([channel.id]))
+    if (this.state.sessions[channel.id]?.codexThreadId === session.codexThreadId) {
+      throw new Error('Session deletion is still pending; Cordex will retry during recovery')
+    }
+    const warnings: string[] = []
+    await channel.send({
+      content: 'This Codex session transcript was permanently deleted. Project files and Discord history remain; this thread is no longer linked.',
+      allowedMentions: { parse: [] },
+    }).catch((error: unknown) => warnings.push(`Discord notice failed: ${errorText(error)}`))
+    await channel.setArchived(true, 'Codex session deleted by Cordex user')
+      .catch((error: unknown) => warnings.push(`Discord archiving failed: ${errorText(error)}`))
+    await interaction.editReply(
+      `Deleted Codex session ${discordInlineCode(session.codexThreadId)} and its spawned descendants. Project files and Discord history were kept.${warnings.length ? ` ${warnings.join('; ')}` : ''}`,
+    )
+  }
+
   private async handleReviewCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     const { channel, session } = this.requireThreadSession(interaction)
     if (session.abortIntent) throw new Error('Turn abort is still pending')
@@ -5446,6 +5982,7 @@ export class CordexDiscordBot {
       target = { type: 'uncommittedChanges' }
     }
     await interaction.deferReply()
+    await this.ensureSessionLoaded(session)
     const review = await this.codex.startReview({
       threadId: session.codexThreadId,
       target,
@@ -5459,16 +5996,41 @@ export class CordexDiscordBot {
   }
 
   private async handleRollbackCommand(interaction: ChatInputCommandInteraction): Promise<void> {
-    const { session } = this.requireThreadSession(interaction)
+    const { channel, session } = this.requireThreadSession(interaction)
     if (session.activeTurnId) throw new Error('Wait for active turn or run /abort first')
+    if (session.abortIntent) throw new Error('Turn abort is still pending')
     const turns = interaction.options.getInteger('turns', true)
     await interaction.deferReply()
-    const contextVersion = this.contextUsageVersion(session.codexThreadId)
-    await this.codex.rollbackThread(session.codexThreadId, turns)
-    this.invalidateContextUsageUnlessUpdated(session, contextVersion)
+    const previous = structuredClone(session)
+    const forked = await this.codex.rollbackThread(session.codexThreadId, turns)
+    session.codexThreadId = forked.threadId
+    session.model = forked.model
+    if (!session.effort && forked.effort) session.effort = forked.effort
+    this.clearContextUsage(session)
+    this.hydratePendingContextUsage(session)
     session.updatedAt = new Date().toISOString()
-    await saveState(this.state)
-    await interaction.editReply(`Removed ${turns} turn${turns === 1 ? '' : 's'} from Codex history. Files unchanged.`)
+    try {
+      await saveState(this.state)
+    } catch (error) {
+      this.restoreSessionState(session, previous)
+      await this.codex.deleteThread(forked.threadId).catch((cleanupError: unknown) => {
+        this.logVerbose('rollback fork cleanup failed', {
+          threadId: forked.threadId,
+          error: errorText(cleanupError),
+        })
+      })
+      throw error
+    }
+    this.loadedThreads.add(forked.threadId)
+    await this.synchronizeCodexThreadTitle(forked.threadId, channel.name).catch((error: unknown) => {
+      this.logVerbose('rollback fork title synchronization failed', {
+        threadId: forked.threadId,
+        error: errorText(error),
+      })
+    })
+    await interaction.editReply(
+      `Current session continues before the last ${turns} turn${turns === 1 ? '' : 's'}. Files unchanged. Previous Codex session: \`${previous.codexThreadId}\`.`,
+    )
   }
 
   private async handleDiffCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -5488,25 +6050,26 @@ export class CordexDiscordBot {
       )
     }
     if (result.exitCode !== 0 || result.timedOut) {
-      await interaction.editReply(formatShellCommandResult({
-        command: 'git diff --binary HEAD',
-        output: result.stderr || 'Git diff failed',
-        exitCode: result.exitCode,
-        timedOut: result.timedOut,
-      }))
+      await interaction.editReply({
+        content: `Could not create a complete Git diff${result.timedOut ? ' (timed out)' : ''}: ${truncate(result.stderr || 'Git diff failed', 1_800)}`,
+        allowedMentions: { parse: [] },
+      })
       return
     }
     if (result.patch.length === 0) {
       await interaction.editReply('No uncommitted changes.')
       return
     }
-    if (result.patch.length <= 1_500) {
-      await interaction.editReply(formatShellCommandResult({
-        command: 'git diff --binary HEAD',
-        output: result.patch.toString('utf8'),
-        exitCode: 0,
-        language: 'diff',
-      }))
+    const inlinePatch = result.patch.toString('utf8')
+    if (
+      result.patch.length <= 1_500 &&
+      !inlinePatch.includes('```') &&
+      Buffer.from(inlinePatch, 'utf8').equals(result.patch)
+    ) {
+      await interaction.editReply({
+        content: `Complete Git diff:\n\`\`\`diff\n${inlinePatch}\n\`\`\``,
+        allowedMentions: { parse: [] },
+      })
       return
     }
     const files: Array<{ attachment: Buffer; name: string }> = []
@@ -5731,6 +6294,154 @@ export class CordexDiscordBot {
     )
   }
 
+  private async handlePluginsCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    this.requireProject(this.parentChannelId(interaction.channel))
+    await interaction.deferReply({ ephemeral: true })
+    const query = interaction.options.getString('query')?.trim().toLowerCase() || ''
+    const includeAvailable = interaction.options.getBoolean('include-available') === true
+    const catalog = await listCodexCliPlugins(includeAvailable,
+      this.options.pluginCliEnv ? { env: this.options.pluginCliEnv } : {})
+    const entries = [...catalog.installed, ...(includeAvailable ? catalog.available : [])]
+    const matched = entries.filter((plugin) =>
+      `${plugin.name} ${plugin.pluginId} ${plugin.marketplaceName}`.toLowerCase().includes(query))
+    const shown = matched.slice(0, 20)
+    const lines = shown.map((plugin) => {
+      const status = plugin.installed
+        ? plugin.enabled ? 'installed, enabled' : 'installed, disabled'
+        : plugin.installPolicy === 'NOT_AVAILABLE' ? 'unavailable' : 'available'
+      return `• **${escapeInlineMarkdown(truncate(plugin.name.replace(/\s+/g, ' '), 75))}** — ${discordInlineCode(plugin.pluginId)} — ${status}`
+    })
+    const summary = `${catalog.installed.length} installed; ${includeAvailable ? `${catalog.available.length} additional catalog entries` : 'available catalog not requested'}. ${matched.length} match${matched.length === 1 ? '' : 'es'}${matched.length > shown.length ? `; showing first ${shown.length}` : ''}.`
+    await this.replyWithChunks(
+      interaction,
+      `${summary}\n${lines.join('\n') || 'No matching plugins.'}\nUse /plugin with an exact ID to inspect or manage an entry.`,
+      { ephemeral: true },
+    )
+  }
+
+  private async handlePluginCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    this.requireProject(this.parentChannelId(interaction.channel))
+    await interaction.deferReply({ ephemeral: true })
+    const action = interaction.options.getString('action', true)
+    const pluginId = interaction.options.getString('plugin-id', true).trim()
+    if (!['inspect', 'install', 'enable', 'disable', 'uninstall'].includes(action)) {
+      throw new Error('Unknown Codex plugin action')
+    }
+    if (!pluginId) throw new Error('Plugin ID is required')
+    if (action !== 'inspect' && interaction.options.getString('confirm-plugin-id')?.trim() !== pluginId) {
+      throw new Error('Repeat the exact plugin ID in confirm-plugin-id before changing global Codex plugins')
+    }
+    const cliOptions = this.options.pluginCliEnv ? { env: this.options.pluginCliEnv } : {}
+    const reply = await this.pluginMutationQueue.run('global', async () => {
+      const catalog = await listCodexCliPlugins(true, cliOptions)
+      const plugin: CodexCliPlugin | undefined =
+        catalog.installed.find((entry) => entry.pluginId === pluginId) ||
+        catalog.available.find((entry) => entry.pluginId === pluginId)
+      if (!plugin) throw new Error(`Plugin ${pluginId} is not in the current Codex catalog`)
+      const label = `**${escapeInlineMarkdown(truncate(plugin.name.replace(/\s+/g, ' '), 75))}** (${discordInlineCode(pluginId)})`
+      if (action === 'inspect') {
+        return `${label}\nMarketplace: ${discordInlineCode(plugin.marketplaceName)} · version: ${discordInlineCode(plugin.version || 'unknown')}\nState: ${plugin.installed ? plugin.enabled ? 'installed, enabled' : 'installed, disabled' : 'not installed'} · install policy: ${discordInlineCode(plugin.installPolicy)} · auth policy: ${discordInlineCode(plugin.authPolicy)}`
+      }
+      if (action === 'install') {
+        if (plugin.installed) throw new Error('Plugin is already installed')
+        if (plugin.installPolicy !== 'AVAILABLE') {
+          throw new Error(`Plugin install policy is ${plugin.installPolicy}; Cordex cannot override it`)
+        }
+        await installCodexCliPlugin(pluginId, cliOptions)
+        const updated = await listCodexCliPlugins(false, cliOptions)
+        if (!updated.installed.some((entry) => entry.pluginId === pluginId)) {
+          throw new Error('Codex reported installation success, but the installed catalog does not contain the plugin')
+        }
+        return `Installed ${label}. Start a new Codex session to use bundled skills or tools. Plugin hooks are not trusted automatically.`
+      }
+      if (!plugin.installed) throw new Error('Plugin is not installed')
+      if (plugin.installPolicy !== 'AVAILABLE') {
+        throw new Error(`Plugin install policy is ${plugin.installPolicy}; Cordex cannot change a managed/default plugin`)
+      }
+      if (action === 'uninstall') {
+        await removeCodexCliPlugin(pluginId, cliOptions)
+        const updated = await listCodexCliPlugins(false, cliOptions)
+        if (updated.installed.some((entry) => entry.pluginId === pluginId)) {
+          throw new Error('Codex reported uninstallation success, but the plugin is still installed')
+        }
+        return `Uninstalled ${label}. Existing external service connections are not changed.`
+      }
+      const enabled = action === 'enable'
+      await this.codex.writePluginEnabled(pluginId, enabled)
+      const updated = await listCodexCliPlugins(false, cliOptions)
+      const effective = updated.installed.find((entry) => entry.pluginId === pluginId)
+      if (!effective) throw new Error('Plugin disappeared from the installed catalog after the config change')
+      return `${enabled ? 'Enabled' : 'Disabled'} ${label} in Codex config. Effective state: **${effective.enabled ? 'enabled' : 'disabled'}**${effective.enabled !== enabled ? ' (a higher-priority layer may override this setting)' : ''}. Start a new Codex session for the change to take effect; enabling does not trust plugin hooks automatically.`
+    })
+    await interaction.editReply(reply)
+  }
+
+  private async handleHooksCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const parentId = this.parentChannelId(interaction.channel)
+    const project = this.requireProject(parentId).project
+    const directory = interaction.channel?.isThread()
+      ? this.state.sessions[interaction.channel.id]?.directory || project.directory
+      : project.directory
+    await interaction.deferReply({ ephemeral: true })
+    const event = interaction.options.getString('event')?.trim().toLowerCase() || ''
+    const entries = await this.codex.listHooks({ cwds: [directory] })
+    const hooks = entries.flatMap((entry) => entry.hooks)
+      .filter((hook) => hook.eventName.toLowerCase().includes(event))
+    const shown = hooks.slice(0, 25)
+    const lines = shown.map((hook) =>
+      `• ${discordInlineCode(hook.eventName)} — ${hook.enabled ? 'enabled' : 'disabled'}, ${hook.trustStatus}${hook.isManaged ? ', managed' : ''} — ${hook.source}`)
+    const warningCount = entries.reduce((count, entry) => count + entry.warnings.length, 0)
+    const errorCount = entries.reduce((count, entry) => count + entry.errors.length, 0)
+    await this.replyWithChunks(
+      interaction,
+      `${hooks.length} matching hook${hooks.length === 1 ? '' : 's'}${hooks.length > shown.length ? `; showing first ${shown.length}` : ''}.${warningCount || errorCount ? ` ${warningCount} warning(s), ${errorCount} error(s) in discovery.` : ''}\n${lines.join('\n') || 'No matching hooks.'}\nTrust and enable/disable controls are not yet available through Discord.`,
+      { ephemeral: true },
+    )
+  }
+
+  private async handleAppsCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    this.requireProject(this.parentChannelId(interaction.channel))
+    const session = interaction.channel?.isThread()
+      ? this.state.sessions[interaction.channel.id]
+      : undefined
+    await interaction.deferReply({ ephemeral: true })
+    if (session) await this.ensureSessionLoaded(session)
+    const options = session ? { threadId: session.codexThreadId } : {}
+    const [available, installed] = await Promise.all([
+      this.codex.listApps(options),
+      this.codex.listInstalledApps(options),
+    ])
+    const byId = new Map(available.map((app) => [app.id, app]))
+    const runtime = new Map(installed.map((app) => [app.id, app]))
+    const ids = [...new Set([...byId.keys(), ...runtime.keys()])]
+    const query = interaction.options.getString('query')?.trim().toLowerCase() || ''
+    const matched = ids.filter((id) =>
+      `${id} ${byId.get(id)?.name || ''} ${runtime.get(id)?.runtimeName || ''}`.toLowerCase().includes(query))
+    const shown = matched.slice(0, 25)
+    const lines = shown.map((id) => {
+      const app = byId.get(id)
+      const active = runtime.get(id)
+      const name = app?.name || active?.runtimeName || id
+      const status = active?.callable
+        ? 'callable'
+        : active?.enabled
+          ? 'enabled, not callable'
+          : active
+            ? 'installed, disabled'
+            : app?.isAccessible && app.isEnabled
+              ? 'accessible, not installed'
+              : app?.isAccessible
+                ? 'accessible, disabled'
+                : 'not accessible'
+      return `• **${escapeInlineMarkdown(truncate(name.replace(/\s+/g, ' '), 75))}** — ${discordInlineCode(id)} — ${status}`
+    })
+    await this.replyWithChunks(
+      interaction,
+      `${available.length} discoverable; ${installed.length} installed; ${installed.filter((app) => app.callable).length} callable. ${matched.length} match${matched.length === 1 ? '' : 'es'}${matched.length > shown.length ? `; showing first ${shown.length}` : ''}.\n${lines.join('\n') || 'No matching apps.'}\nApp invocation is not yet available through Discord.`,
+      { ephemeral: true },
+    )
+  }
+
   private async handleMcpStatusCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     const { cwd, threadId } = this.mcpContext(interaction.channel)
     await interaction.deferReply({ ephemeral: true })
@@ -5770,6 +6481,17 @@ export class CordexDiscordBot {
     const action = interaction.options.getString('action') || (server ? 'login' : 'status')
     if (action === 'status') {
       await this.handleMcpStatusCommand(interaction)
+      return
+    }
+    if (action === 'reload') {
+      if (server) throw new Error('MCP reload does not take a server name')
+      await interaction.deferReply({ ephemeral: true })
+      await this.mcpConfigQueue.run('global-mcp-config', async () => {
+        await this.codex.reloadMcpServers()
+        await interaction.editReply(
+          'MCP configuration reload requested. Loaded sessions refresh for subsequent turns; use /mcp-status to inspect the current inventory.',
+        )
+      })
       return
     }
     if (!server) throw new Error(`MCP ${action} requires a server`)
@@ -5926,7 +6648,7 @@ export class CordexDiscordBot {
     )
   }
 
-  private async runScheduledTask(task: ScheduledTask): Promise<void> {
+  private async runScheduledTask(task: ScheduledTask, recoverRunning: boolean): Promise<void> {
     const session = this.state.sessions[task.threadId]
     if (!session) throw new Error('Session no longer exists')
     if (!this.config.projects[session.parentChannelId]) {
@@ -5943,6 +6665,11 @@ export class CordexDiscordBot {
     if (task.status !== 'running' || this.state.tasks[task.id] !== task) return
     const input: UserInput[] = [{ type: 'text', text: task.prompt, text_elements: [] }]
     const deliveryId = scheduledTaskDeliveryId(task)
+    // A recovered running occurrence with no queue may have crossed the
+    // Codex acceptance boundary before Cordex could save task completion.
+    const uncertainAfterRecovery = recoverRunning && !this.queueFor(channel.id).some(
+      (prompt) => this.queuedPromptDeliveryId(prompt) === deliveryId,
+    )
     await this.enqueuePrompt(channel.id, {
       id: deliveryId,
       authorId: task.createdBy,
@@ -5951,9 +6678,11 @@ export class CordexDiscordBot {
       displayText: task.prompt,
       createdAt: new Date().toISOString(),
       deliveryKind: 'queued',
+      ...(uncertainAfterRecovery ? { reviewRequired: true } : {}),
     }, session.archived === true)
     if (session.archived && session.lifecycleIntent?.kind !== 'archive') {
-      await channel.send(`» **scheduled task queued while archived:** ${truncate(task.prompt, 1_650)}`)
+      const reviewNote = uncertainAfterRecovery ? ' Delivery needs review after the session is resumed.' : ''
+      await channel.send(`» **scheduled task queued while archived:** ${truncate(task.prompt, 1_650)}${reviewNote}`)
         .catch(() => undefined)
     } else {
       await this.recoverPersistedPrompts(session, channel).catch((error: unknown) => {
@@ -5962,8 +6691,11 @@ export class CordexDiscordBot {
           error: errorText(error),
         })
       })
-      if (this.queueFor(channel.id).some((prompt) =>
-        this.queuedPromptDeliveryId(prompt) === deliveryId)) {
+      const pending = this.queueFor(channel.id).find((prompt) =>
+        this.queuedPromptDeliveryId(prompt) === deliveryId)
+      if (pending?.reviewRequired) {
+        await this.sendUncertainPromptNotice(session, channel, pending)
+      } else if (pending) {
         await channel.send(`» **scheduled task:** ${truncate(task.prompt, 1_700)}`)
           .catch((error: unknown) => {
             this.logVerbose('scheduled prompt announcement failed', {
@@ -6020,7 +6752,7 @@ export class CordexDiscordBot {
         directory: created.directory,
         codexThreadId: forked.threadId,
         model: session.model || forked.model,
-        ...(session.effort ? { effort: session.effort } : {}),
+        ...(session.effort || forked.effort ? { effort: session.effort || forked.effort } : {}),
         ...(session.mode ? { mode: session.mode } : {}),
         ...(session.fastMode !== undefined ? { fastMode: session.fastMode } : {}),
         ...(session.yoloMode !== undefined ? { yoloMode: session.yoloMode } : {}),
@@ -6407,6 +7139,33 @@ export class CordexDiscordBot {
     })
   }
 
+  private async enqueuePendingInitialPrompt(
+    threadId: string,
+    prompt: QueuedPrompt,
+  ): Promise<number> {
+    return this.promptQueue.run(threadId, async () => {
+      this.assertDiscordThreadAvailable(threadId)
+      const pending = this.state.pendingInitialSessions?.[threadId]
+      if (!pending || this.state.sessions[threadId] ||
+        !this.config.projects[pending.parentChannelId]) {
+        throw new Error('Pending Codex session is no longer available')
+      }
+      const queue = this.queueFor(threadId)
+      const existing = queue.findIndex((item) =>
+        this.queuedPromptDeliveryId(item) === this.queuedPromptDeliveryId(prompt))
+      if (existing >= 0) return existing + 1
+      queue.push(prompt)
+      try {
+        await saveState(this.state)
+      } catch (error) {
+        const index = queue.indexOf(prompt)
+        if (index >= 0) queue.splice(index, 1)
+        throw error
+      }
+      return queue.length
+    })
+  }
+
   private async announceQueuedPrompt(channel: ThreadChannel, prompt: QueuedPrompt): Promise<void> {
     await channel.send({
       content: `» **${escapeInlineMarkdown(prompt.authorName)}:** ${truncate(prompt.displayText, 1_700)}`,
@@ -6470,6 +7229,106 @@ export class CordexDiscordBot {
     for (const prompt of delivered) await this.announceDeliveredPrompt(channel, prompt)
   }
 
+  private async markPromptDeliveryStarted(prompt: QueuedPrompt): Promise<void> {
+    const previouslyStarted = prompt.deliveryStarted === true
+    prompt.deliveryStarted = true
+    try {
+      await saveState(this.state)
+    } catch (error) {
+      if (!previouslyStarted) delete prompt.deliveryStarted
+      throw error
+    }
+  }
+
+  private async sendUncertainPromptNotice(
+    session: SessionState,
+    channel: ThreadChannel,
+    prompt: QueuedPrompt,
+  ): Promise<void> {
+    await this.sendDurableDiscordOutput({
+      channel,
+      codexThreadId: session.codexThreadId,
+      turnId: `pending-direct:${this.queuedPromptDeliveryId(prompt)}`,
+      itemKey: 'review',
+      value: `⚠ This saved prompt's delivery to Codex is uncertain. Cordex will not retry it automatically. Source ID: ${discordInlineCode(this.queuedPromptDeliveryId(prompt))}. Review it with /pending-prompts before choosing whether to retry or discard it. Later queued work is held too.`,
+      suppressNotifications: false,
+      format: false,
+    }).catch((error: unknown) => {
+      this.logVerbose('uncertain prompt notice delivery deferred', {
+        threadId: session.codexThreadId,
+        error: errorText(error),
+      })
+    })
+  }
+
+  private async sendPendingInitialSessionNotice(
+    channel: ThreadChannel,
+    pending: PendingInitialSession,
+  ): Promise<void> {
+    if (this.state.pendingInitialSessions?.[channel.id] !== pending) return
+    const first = this.queueFor(channel.id)[0]
+    if (!first) return
+    await this.sendDurableDiscordOutput({
+      channel,
+      codexThreadId: `pending-session:${channel.id}`,
+      turnId: `pending-start:${this.queuedPromptDeliveryId(first)}`,
+      itemKey: 'review',
+      value: `⚠ Cordex could not confirm Codex session creation. The first prompt is saved and will not run automatically. Source ID: ${discordInlineCode(this.queuedPromptDeliveryId(first))}. Review it with /pending-prompts, then use /resolve-pending to retry or discard it. Later work is held too.`,
+      suppressNotifications: false,
+      format: false,
+    }).catch((error: unknown) => {
+      this.logVerbose('pending initial-session notice delivery deferred', {
+        discordThreadId: channel.id,
+        error: errorText(error),
+      })
+    })
+  }
+
+  private async holdPendingInitialPrompt(
+    channel: ThreadChannel,
+    pending: PendingInitialSession,
+  ): Promise<void> {
+    if (this.state.pendingInitialSessions?.[channel.id] !== pending) return
+    const first = this.queueFor(channel.id)[0]
+    if (!first) return
+    first.reviewRequired = true
+    await saveState(this.state).catch((error: unknown) => {
+      this.logVerbose('pending initial-session hold save deferred', {
+        discordThreadId: channel.id,
+        error: errorText(error),
+      })
+    })
+    await this.sendPendingInitialSessionNotice(channel, pending)
+  }
+
+  private async clearPendingInitialSessionNotice(threadId: string): Promise<void> {
+    await this.updateDiscordOutbox((outbox) => {
+      const originalLength = outbox.length
+      for (let index = outbox.length - 1; index >= 0; index--) {
+        const entry = outbox[index]
+        if (entry?.discordThreadId === threadId &&
+          entry.codexThreadId === `pending-session:${threadId}`) outbox.splice(index, 1)
+      }
+      return outbox.length !== originalLength
+    })
+  }
+
+  private async holdUncertainPrompt(
+    session: SessionState,
+    channel: ThreadChannel,
+    prompt: QueuedPrompt,
+  ): Promise<void> {
+    if (!this.queueFor(channel.id).includes(prompt)) return
+    prompt.reviewRequired = true
+    await saveState(this.state).catch((error: unknown) => {
+      this.logVerbose('uncertain prompt hold save deferred; delivery marker remains durable', {
+        threadId: session.codexThreadId,
+        error: errorText(error),
+      })
+    })
+    await this.sendUncertainPromptNotice(session, channel, prompt)
+  }
+
   private async deliverPersistedDirectPromptsUnlocked(
     session: SessionState,
     channel: ThreadChannel,
@@ -6486,6 +7345,7 @@ export class CordexDiscordBot {
         (prompt) => this.promptDeliveryKind(prompt) === 'direct',
       )
       if (!next) return
+      if (next.reviewRequired) return
 
       const runtime = await this.readThreadRuntimeState(current)
       await this.removeDeliveredQueuePrompts(current, channel, runtime)
@@ -6498,13 +7358,19 @@ export class CordexDiscordBot {
         throw new Error('Codex thread is unavailable for persisted prompt recovery')
       }
 
-      await this.dispatchInputUnlocked(
-        channel,
-        current.parentChannelId,
-        next.input,
-        this.queuedPromptDeliveryId(next),
-      )
-      await this.removeQueuedPrompt(channel.id, next)
+      await this.markPromptDeliveryStarted(next)
+      try {
+        await this.dispatchInputUnlocked(
+          channel,
+          current.parentChannelId,
+          next.input,
+          this.queuedPromptDeliveryId(next),
+        )
+        await this.removeQueuedPrompt(channel.id, next)
+      } catch (error) {
+        await this.holdUncertainPrompt(current, channel, next)
+        throw error
+      }
     }
   }
 
@@ -6521,13 +7387,30 @@ export class CordexDiscordBot {
       current.archived ||
       this.deletedDiscordThreads.has(channel.id)
     ) return
+    const uncertain = this.queueFor(channel.id).find((prompt) => prompt.reviewRequired)
+    if (uncertain) await this.sendUncertainPromptNotice(current, channel, uncertain)
     if (current.abortIntent) {
       const reconciliation = await this.reconcileAbortIntent(current)
       if (!reconciliation.cleared) return
     }
-    const runtime = await this.readThreadRuntimeState(current)
+    let runtime: CodexThreadRuntimeState
+    try {
+      runtime = await this.readThreadRuntimeState(current)
+    } catch (error) {
+      if (uncertain) return
+      if ((this.isUnloadedCodexThreadError(error, current.codexThreadId) ||
+        this.isMissingCodexRolloutError(error, current.codexThreadId) ||
+        this.isUnsupportedCodexHistoryError(error)) &&
+        this.queueFor(channel.id).length > 0) {
+        const next = this.queueFor(channel.id)[0]!
+        await this.holdUncertainPrompt(current, channel, next)
+        return
+      }
+      throw error
+    }
     this.assertCodexSessionLinked(current)
     await this.removeDeliveredQueuePrompts(current, channel, runtime)
+    if (uncertain && this.queueFor(channel.id).includes(uncertain)) return
     if (runtime.status === 'active' && runtime.activeTurnId) {
       await this.adoptActiveTurn(current, channel, runtime.activeTurnId)
     } else if (runtime.status === 'idle') {
@@ -6549,18 +7432,23 @@ export class CordexDiscordBot {
     channel: ThreadChannel,
     waitForRecovery = true,
   ): Promise<void> {
-    if (waitForRecovery) await this.waitForCodexRecovery()
-    await this.projectMutationQueue.run(`channel:${session.parentChannelId}`, async () => {
-      await this.refreshProjectsSafely()
-      if (
-        this.removingProjects.has(session.parentChannelId) ||
-        !this.config.projects[session.parentChannelId]
-      ) {
-        throw new Error('Project is no longer available')
-      }
-      await this.promptQueue.run(channel.id, () =>
-        this.recoverPersistedPromptsUnlocked(session, channel))
-    })
+    const finishStartup = this.beginPendingStartupProgress(channel)
+    try {
+      if (waitForRecovery) await this.waitForCodexRecovery()
+      await this.projectMutationQueue.run(`channel:${session.parentChannelId}`, async () => {
+        await this.refreshProjectsSafely()
+        if (
+          this.removingProjects.has(session.parentChannelId) ||
+          !this.config.projects[session.parentChannelId]
+        ) {
+          throw new Error('Project is no longer available')
+        }
+        await this.promptQueue.run(channel.id, () =>
+          this.recoverPersistedPromptsUnlocked(session, channel))
+      })
+    } finally {
+      finishStartup()
+    }
   }
 
   private async persistAndDeliverDirectPrompt(
@@ -6609,6 +7497,89 @@ export class CordexDiscordBot {
     return { threadId: channel.id, position }
   }
 
+  async uploadDaemonFiles(options: {
+    target: { kind: 'thread' | 'session'; id: string }
+    requestId: string
+    filePaths: string[]
+    allowOutsideProject: boolean
+    rejectHidden?: boolean
+  }): Promise<{ threadId: string; fileCount: number }> {
+    if (this.stopping) throw new CordexStoppingError()
+    await this.waitForMutationIngressReady()
+    const candidates = options.target.kind === 'session'
+      ? Object.values(this.state.sessions).filter((candidate) =>
+          candidate.codexThreadId === options.target.id &&
+          !this.unlinkedCodexSessionChannels.has(candidate.discordThreadId))
+      : [this.state.sessions[options.target.id]].filter((candidate): candidate is SessionState =>
+          candidate !== undefined)
+    if (candidates.length !== 1) {
+      throw new Error(candidates.length > 1
+        ? 'Codex session maps to multiple Discord threads; use --thread to choose one'
+        : 'No linked Cordex session matches the upload target')
+    }
+    const session = candidates[0]!
+    if (session.archived || session.lifecycleIntent ||
+      this.unlinkedCodexSessionChannels.has(session.discordThreadId)) {
+      throw new Error('Session is unavailable; resume it before uploading files')
+    }
+    if (!this.config.projects[session.parentChannelId]) {
+      throw new Error('Session parent project is no longer mapped')
+    }
+    const channel = await this.client.channels.fetch(session.discordThreadId)
+    if (!channel?.isThread() ||
+      channel.guildId !== this.config.guildId ||
+      channel.parentId !== session.parentChannelId) {
+      throw new Error('Discord session thread is unavailable or outside the configured project')
+    }
+    const identity = {
+      discordThreadId: channel.id,
+      codexThreadId: session.codexThreadId,
+      turnId: `upload:${options.requestId}`,
+      itemKey: 'files',
+    }
+    const outputKey = discordOutboxOutputKey(identity)
+    const fileCount = await this.outgoingMediaQueue.run('cache', async () => {
+      const existing = this.state.discordOutbox?.find((entry) =>
+        discordOutboxOutputKey(entry) === outputKey)
+      if (existing?.fileAttachments) return existing.fileAttachments.length
+      if (this.state.discordOutboxDeliveredKeys?.includes(outputKey)) return 0
+      const prepared = await readOutgoingFiles({
+        paths: options.filePaths,
+        sessionDirectory: session.directory,
+        allowOutsideProject: options.allowOutsideProject,
+        ...(options.rejectHidden ? { rejectHidden: true } : {}),
+      })
+      if (
+        this.stopping ||
+        this.state.sessions[channel.id] !== session ||
+        session.archived ||
+        session.lifecycleIntent ||
+        !this.config.projects[session.parentChannelId]
+      ) throw new Error('Session changed before the files could be queued')
+      try {
+        for (const file of prepared) {
+          await cacheOutgoingFile(this.outgoingFileDirectory, file.bytes, file.attachment)
+        }
+        const fileAttachments = prepared.map((file) => file.attachment)
+        const names = fileAttachments.map((attachment) => discordInlineCode(attachment.name)).join(', ')
+        await this.persistDiscordOutput(createDiscordOutboxEntries({
+          ...identity,
+          chunks: [`📎 Uploaded ${fileAttachments.length} file${fileAttachments.length === 1 ? '' : 's'}: ${names}`],
+          fileAttachments,
+          suppressNotifications: false,
+        }))
+      } catch (error) {
+        const referenced = (this.state.discordOutbox || []).flatMap((entry) =>
+          entry.fileAttachments || [])
+        await pruneOutgoingFileCache(this.outgoingFileDirectory, referenced).catch(() => undefined)
+        throw error
+      }
+      return prepared.length
+    })
+    this.scheduleDiscordOutboxRetry(true)
+    return { threadId: channel.id, fileCount }
+  }
+
   private async steerNextQueuedPrompt(run: ActiveRun): Promise<void> {
     await this.promptQueue.run(run.channel.id, () => this.steerNextQueuedPromptUnlocked(run))
   }
@@ -6618,6 +7589,7 @@ export class CordexDiscordBot {
       this.deletedDiscordThreads.has(run.channel.id) ||
       run.session.archived ||
       run.session.abortIntent ||
+      this.queueFor(run.channel.id).some((prompt) => prompt.reviewRequired) ||
       this.blockedQueuedSourceThreads.has(run.channel.id)
     ) return
     try {
@@ -6657,6 +7629,7 @@ export class CordexDiscordBot {
       this.deletedDiscordThreads.has(channel.id) ||
       session.archived ||
       session.abortIntent ||
+      this.queueFor(channel.id).some((prompt) => prompt.reviewRequired) ||
       this.blockedQueuedSourceThreads.has(channel.id)
     ) return
     const queue = this.queueFor(channel.id)
@@ -6685,6 +7658,12 @@ export class CordexDiscordBot {
     const next = queue[0]
     if (!next) return
     try {
+      await this.markPromptDeliveryStarted(next)
+    } catch (error) {
+      await channel.send(`⨯ Queued prompt deferred before delivery: ${truncate(errorText(error), 1_700)}`).catch(() => undefined)
+      return
+    }
+    try {
       await this.dispatchInputUnlocked(
         channel,
         session.parentChannelId,
@@ -6693,6 +7672,7 @@ export class CordexDiscordBot {
       )
       await this.removeQueuedPrompt(channel.id, next)
     } catch (error) {
+      await this.holdUncertainPrompt(session, channel, next)
       await channel.send(`⨯ Queued prompt deferred: ${truncate(errorText(error), 1_700)}`).catch(() => undefined)
       return
     }
@@ -6791,6 +7771,376 @@ export class CordexDiscordBot {
     })
   }
 
+  private async handlePendingPromptsCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const { channel } = this.requirePendingPromptTarget(interaction)
+    await interaction.deferReply({ ephemeral: true })
+    if (!interaction.ephemeral) {
+      await interaction.editReply('⨯ Private pending-prompt review is unavailable for this interaction.')
+      return
+    }
+    const pending = this.queueFor(channel.id).filter((prompt) => prompt.reviewRequired)
+    if (pending.length === 0) {
+      await interaction.editReply('No uncertain prompts are waiting for review.')
+      return
+    }
+    const later = this.queueFor(channel.id).length - pending.length
+    const lines = pending.map((prompt, index) =>
+      `${index + 1}. ${this.promptDeliveryKind(prompt)} source ID ${discordInlineCode(this.queuedPromptDeliveryId(prompt))}\n` +
+      `   ${escapeInlineMarkdown(truncate(prompt.displayText.replace(/\s+/g, ' '), 700))}`)
+    await this.replyWithChunks(interaction, [
+      `**Uncertain prompts:** ${pending.length}`,
+      ...lines,
+      `${later} later saved prompt${later === 1 ? '' : 's'} held behind them.`,
+      'Codex may already have accepted a prompt even if its history does not show it yet.',
+      'Use /resolve-pending with the exact source ID to retry or discard one prompt. Retrying can duplicate side effects; inspect the transcript and workspace first.',
+    ].join('\n'), { ephemeral: true })
+  }
+
+  private async handleResolvePendingInitialSession(
+    interaction: ChatInputCommandInteraction,
+    channel: ThreadChannel,
+    pendingInitial: PendingInitialSession,
+    action: 'retry' | 'discard',
+    sourceId: string,
+  ): Promise<void> {
+    type InitialResolution =
+      | { kind: 'missing' }
+      | { kind: 'discarded'; laterHeld: boolean }
+      | { kind: 'retry'; session: SessionState }
+    let result: InitialResolution
+    try {
+      result = await this.projectMutationQueue.run(`channel:${pendingInitial.parentChannelId}`, async () => {
+        await this.refreshProjectsSafely()
+        return this.promptQueue.run(channel.id, async (): Promise<InitialResolution> => {
+          if (this.state.pendingInitialSessions?.[channel.id] !== pendingInitial ||
+            this.state.sessions[channel.id] ||
+            channel.guildId !== this.config.guildId ||
+            channel.parentId !== pendingInitial.parentChannelId ||
+            !this.config.projects[pendingInitial.parentChannelId] ||
+            this.deletedDiscordThreads.has(channel.id)) {
+            throw new Error('Pending Codex session is no longer available')
+          }
+          const queue = this.queueFor(channel.id)
+          const selected = queue.find((prompt) =>
+            prompt.reviewRequired && this.queuedPromptDeliveryId(prompt) === sourceId)
+          if (!selected) return { kind: 'missing' }
+          await this.clearPendingInitialSessionNotice(channel.id)
+          if (action === 'discard') {
+            const previousQueue = [...queue]
+            const previousReviews = queue.map((prompt) => prompt.reviewRequired === true)
+            queue.splice(queue.indexOf(selected), 1)
+            if (queue.length > 0) queue[0]!.reviewRequired = true
+            else delete this.state.pendingInitialSessions![channel.id]
+            try {
+              await saveState(this.state)
+            } catch (error) {
+              queue.splice(0, queue.length, ...previousQueue)
+              previousQueue.forEach((prompt, index) => {
+                if (previousReviews[index]) prompt.reviewRequired = true
+                else delete prompt.reviewRequired
+              })
+              this.state.pendingInitialSessions![channel.id] = pendingInitial
+              throw error
+            }
+            return { kind: 'discarded', laterHeld: queue.length > 0 }
+          }
+
+          const runtimeRoots = pendingInitial.workspaceRoots?.length
+            ? [...new Set([path.resolve(pendingInitial.directory), ...pendingInitial.workspaceRoots])]
+            : undefined
+          const serviceTier = await this.serviceTierForFastMode(
+            pendingInitial.model || this.config.defaultModel,
+            pendingInitial.fastMode,
+          )
+          const started = await this.codex.startThread({
+            cwd: pendingInitial.directory,
+            ...(pendingInitial.model ? { model: pendingInitial.model } : {}),
+            ...(serviceTier !== undefined ? { serviceTier } : {}),
+            dynamicTools: cordexDynamicTools,
+            ...(runtimeRoots ? { runtimeWorkspaceRoots: runtimeRoots } : {}),
+            sandbox: pendingInitial.yoloMode ? 'danger-full-access' : this.config.sandbox,
+            approvalPolicy: pendingInitial.yoloMode ? 'never' : this.config.approvalPolicy,
+          })
+          if (this.state.pendingInitialSessions?.[channel.id] !== pendingInitial ||
+            this.state.sessions[channel.id] || this.deletedDiscordThreads.has(channel.id)) {
+            throw new Error('Pending Codex session changed during creation')
+          }
+          const session: SessionState = {
+            discordThreadId: channel.id,
+            parentChannelId: pendingInitial.parentChannelId,
+            directory: pendingInitial.directory,
+            codexThreadId: started.threadId,
+            model: pendingInitial.model || started.model,
+            ...(pendingInitial.effort || started.effort
+              ? { effort: pendingInitial.effort || started.effort }
+              : {}),
+            ...(pendingInitial.fastMode !== undefined ? { fastMode: pendingInitial.fastMode } : {}),
+            ...(pendingInitial.yoloMode !== undefined ? { yoloMode: pendingInitial.yoloMode } : {}),
+            ...(pendingInitial.workspaceRoots?.length
+              ? { workspaceRoots: [...pendingInitial.workspaceRoots] }
+              : {}),
+            ...(pendingInitial.worktree ? { worktree: { ...pendingInitial.worktree } } : {}),
+            updatedAt: new Date().toISOString(),
+          }
+          this.state.sessions[channel.id] = session
+          delete this.state.pendingInitialSessions![channel.id]
+          try {
+            await saveState(this.state)
+          } catch (error) {
+            delete this.state.sessions[channel.id]
+            this.state.pendingInitialSessions![channel.id] = pendingInitial
+            throw error
+          }
+          this.loadedThreads.add(started.threadId)
+          await this.synchronizeCodexThreadTitle(started.threadId, channel.name)
+            .catch((error: unknown) => {
+              this.logVerbose('pending-session title sync deferred', {
+                threadId: started.threadId,
+                error: errorText(error),
+              })
+            })
+          delete selected.reviewRequired
+          try {
+            await saveState(this.state)
+          } catch (error) {
+            selected.reviewRequired = true
+            throw error
+          }
+          return { kind: 'retry', session }
+        })
+      })
+    } catch (error) {
+      await this.holdPendingInitialPrompt(channel, pendingInitial)
+      throw error
+    }
+    if (result.kind === 'missing') {
+      await interaction.editReply('No uncertain prompt matches that source ID. Run /pending-prompts again.')
+      return
+    }
+    if (result.kind === 'discarded') {
+      if (result.laterHeld) await this.sendPendingInitialSessionNotice(channel, pendingInitial)
+      await interaction.editReply(result.laterHeld
+        ? 'Saved prompt discarded. Later work remains held until you review its exact source ID.'
+        : 'Saved prompt discarded. No pending Codex session creation remains.')
+      return
+    }
+    try {
+      await this.recoverPersistedPrompts(result.session, channel)
+    } catch (error) {
+      await this.promptQueue.run(channel.id, async () => {
+        const prompt = this.queueFor(channel.id).find((item) =>
+          this.queuedPromptDeliveryId(item) === sourceId)
+        if (!prompt) return
+        prompt.reviewRequired = true
+        await saveState(this.state)
+      })
+      throw error
+    }
+    await interaction.editReply(
+      'A Codex thread was saved before retrying this exact prompt. Watch this thread for output; an unanswered earlier thread/start may have left an empty orphan.',
+    )
+  }
+
+  private isUnloadedCodexThreadError(error: unknown, threadId: string): boolean {
+    return error instanceof Error &&
+      error.message === `Codex RPC -32600: thread not loaded: ${threadId}`
+  }
+
+  private isMissingCodexRolloutError(error: unknown, threadId: string): boolean {
+    return error instanceof Error &&
+      error.message === `Codex RPC -32600: no rollout found for thread id ${threadId}`
+  }
+
+  private isUnsupportedCodexHistoryError(error: unknown): boolean {
+    return error instanceof Error &&
+      error.message.startsWith('Codex RPC -32601: list_turns is not supported yet')
+  }
+
+  private async confirmMissingCodexRollout(session: SessionState): Promise<boolean> {
+    const threadId = session.codexThreadId
+    const runtimeRoots = this.runtimeWorkspaceRoots(session)
+    const serviceTier = await this.serviceTierForFastMode(
+      session.model || this.config.defaultModel,
+      session.fastMode,
+    )
+    let resumed: Awaited<ReturnType<CodexAppServer['resumeThread']>>
+    try {
+      resumed = await this.codex.resumeThread({
+        threadId,
+        cwd: session.directory,
+        ...(session.model ? { model: session.model } : {}),
+        ...(serviceTier !== undefined ? { serviceTier } : {}),
+        ...(runtimeRoots ? { runtimeWorkspaceRoots: runtimeRoots } : {}),
+        ...(!session.yoloMode && session.permissions
+          ? { permissions: session.permissions }
+          : { sandbox: session.yoloMode ? 'danger-full-access' as const : this.config.sandbox }),
+        approvalPolicy: session.yoloMode ? 'never' : this.config.approvalPolicy,
+      })
+    } catch (error) {
+      if (this.isMissingCodexRolloutError(error, threadId)) return true
+      throw error
+    }
+    this.assertCodexSessionLinked(session)
+    if (session.effort && resumed.effort !== session.effort) {
+      await this.codex.updateThreadSettings({ threadId, effort: session.effort })
+    }
+    this.loadedThreads.add(threadId)
+    return false
+  }
+
+  private async replaceMissingCodexThread(
+    session: SessionState,
+    channel: ThreadChannel,
+  ): Promise<void> {
+    this.assertCodexSessionLinked(session)
+    this.assertDiscordThreadAvailable(channel.id)
+    if (session.archived || session.abortIntent || session.activeTurnId ||
+      session.lifecycleIntent || this.runs.has(session.codexThreadId)) {
+      throw new Error('Cannot replace a Codex thread while this session is active or changing')
+    }
+    if (!this.config.projects[session.parentChannelId]) {
+      throw new Error('Project is no longer available')
+    }
+    const runtimeRoots = this.runtimeWorkspaceRoots(session)
+    const serviceTier = await this.serviceTierForFastMode(
+      session.model || this.config.defaultModel,
+      session.fastMode,
+    )
+    const started = await this.codex.startThread({
+      cwd: session.directory,
+      ...(session.model ? { model: session.model } : {}),
+      ...(serviceTier !== undefined ? { serviceTier } : {}),
+      dynamicTools: cordexDynamicTools,
+      ...(runtimeRoots ? { runtimeWorkspaceRoots: runtimeRoots } : {}),
+      ...(!session.yoloMode && session.permissions
+        ? { permissions: session.permissions }
+        : { sandbox: session.yoloMode ? 'danger-full-access' as const : this.config.sandbox }),
+      approvalPolicy: session.yoloMode ? 'never' : this.config.approvalPolicy,
+    })
+    this.assertCodexSessionLinked(session)
+    const oldThreadId = session.codexThreadId
+    const oldUpdatedAt = session.updatedAt
+    const oldContextTokens = session.contextTokens
+    const oldContextWindow = session.contextWindow
+    session.codexThreadId = started.threadId
+    session.updatedAt = new Date().toISOString()
+    delete session.contextTokens
+    delete session.contextWindow
+    try {
+      await saveState(this.state)
+    } catch (error) {
+      session.codexThreadId = oldThreadId
+      session.updatedAt = oldUpdatedAt
+      if (oldContextTokens !== undefined) session.contextTokens = oldContextTokens
+      if (oldContextWindow !== undefined) session.contextWindow = oldContextWindow
+      throw error
+    }
+    this.loadedThreads.delete(oldThreadId)
+    this.loadedThreads.add(started.threadId)
+    await this.synchronizeCodexThreadTitle(started.threadId, channel.name)
+      .catch((error: unknown) => {
+        this.logVerbose('replacement Codex thread title sync deferred', {
+          threadId: started.threadId,
+          error: errorText(error),
+        })
+      })
+  }
+
+  private async handleResolvePendingCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const target = this.requirePendingPromptTarget(interaction)
+    const { channel } = target
+    const action = interaction.options.getString('action', true)
+    const sourceId = interaction.options.getString('source-id', true).trim()
+    if (action !== 'retry' && action !== 'discard') throw new Error('Invalid pending-prompt action')
+    if (!sourceId) throw new Error('Source ID is required')
+    await interaction.deferReply({ ephemeral: true })
+    if (!interaction.ephemeral) {
+      await interaction.editReply('⨯ Private pending-prompt resolution is unavailable for this interaction.')
+      return
+    }
+    if (target.pendingInitial) {
+      await this.handleResolvePendingInitialSession(
+        interaction, channel, target.pendingInitial, action, sourceId,
+      )
+      return
+    }
+    const session = target.session
+    if (!session) throw new Error('Thread has no Cordex session')
+    const result = await this.promptQueue.run(channel.id, async () => {
+      const queue = this.queueFor(channel.id)
+      const pending = queue.find((prompt) =>
+        prompt.reviewRequired && this.queuedPromptDeliveryId(prompt) === sourceId)
+      if (!pending) return 'missing' as const
+      let runtime: CodexThreadRuntimeState | undefined
+      let missingRollout = false
+      try {
+        runtime = await this.readThreadRuntimeState(session)
+      } catch (error) {
+        if (!this.isUnloadedCodexThreadError(error, session.codexThreadId) &&
+          !this.isMissingCodexRolloutError(error, session.codexThreadId)) throw error
+        missingRollout = await this.confirmMissingCodexRollout(session)
+        if (!missingRollout) runtime = await this.readThreadRuntimeState(session)
+      }
+      if (runtime?.status === 'systemError') {
+        throw new Error('Codex thread is unavailable for pending-prompt review')
+      }
+      if (runtime) await this.removeDeliveredQueuePrompts(session, channel, runtime)
+      if (!queue.includes(pending)) return 'accepted' as const
+      if (action === 'discard') {
+        await this.removeQueuedPrompt(channel.id, pending)
+        return missingRollout ? 'discarded-missing' as const : 'discarded' as const
+      }
+      if (missingRollout) await this.replaceMissingCodexThread(session, channel)
+      delete pending.reviewRequired
+      try {
+        await saveState(this.state)
+      } catch (error) {
+        pending.reviewRequired = true
+        throw error
+      }
+      return missingRollout ? 'retry-recreated' as const : 'retry' as const
+    })
+    if (result === 'missing') {
+      await interaction.editReply('No uncertain prompt matches that source ID. Run /pending-prompts again.')
+      return
+    }
+    if (result === 'accepted') {
+      await this.recoverPersistedPrompts(session, channel)
+      await interaction.editReply('Codex had already accepted that prompt. It was removed from the pending queue without retry.')
+      return
+    }
+    if (result === 'discarded') {
+      await this.recoverPersistedPrompts(session, channel)
+      await interaction.editReply('Uncertain prompt discarded. Later queued work may now run automatically.')
+      return
+    }
+    if (result === 'discarded-missing') {
+      await this.recoverPersistedPrompts(session, channel).catch((error: unknown) => {
+        if (!this.isUnloadedCodexThreadError(error, session.codexThreadId) &&
+          !this.isMissingCodexRolloutError(error, session.codexThreadId)) throw error
+      })
+      await interaction.editReply(
+        'Uncertain prompt discarded. Its Codex thread was not persisted; later work remains held for review.',
+      )
+      return
+    }
+    try {
+      await this.recoverPersistedPrompts(session, channel)
+    } catch (error) {
+      await this.promptQueue.run(channel.id, async () => {
+        const prompt = this.queueFor(channel.id).find((item) =>
+          this.queuedPromptDeliveryId(item) === sourceId)
+        if (!prompt) return
+        prompt.reviewRequired = true
+        await saveState(this.state)
+      })
+      throw error
+    }
+    await interaction.editReply(result === 'retry-recreated'
+      ? 'The old Codex thread had no persisted rollout. A replacement thread was saved before retrying this exact prompt. Watch this thread for output; a prior acceptance not visible in history could still cause duplicate work.'
+      : 'Retry requested for the exact saved prompt. Watch this thread for Codex output; a prior acceptance not visible in history could still cause duplicate work.')
+  }
+
   private async sendShellResult(interaction: ChatInputCommandInteraction, command: string, directory: string): Promise<void> {
     if (!this.config.allowShellCommands) {
       throw new Error('Direct shell commands are disabled; set allowShellCommands to true to enable them')
@@ -6820,13 +8170,21 @@ export class CordexDiscordBot {
 
   private async handleLastSessionsCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     await interaction.deferReply({ ephemeral: true })
-    const threads = await this.listAllProjectThreads(20)
-    const lines = threads.map(
-      (thread, index) => `${index + 1}. **${truncate(thread.name || thread.preview || 'Untitled', 80)}**\n\`${thread.id}\` · \`${thread.cwd}\``,
-    )
+    const searchTerm = interaction.options.getString('query')?.trim() || undefined
+    const includeArchived = interaction.options.getBoolean('include-archived') === true
+    const threads = await this.listAllProjectThreads(20, {
+      ...(searchTerm ? { searchTerm } : {}),
+      includeArchived,
+    })
+    const lines = threads.map((thread, index) => {
+      const title = (thread.name || thread.preview || 'Untitled').replace(/\s+/g, ' ').trim()
+      return `${index + 1}. **${escapeInlineMarkdown(truncate(title, 80))}**${thread.archived ? ' · archived' : ''}\n${discordInlineCode(thread.id)} · ${discordInlineCode(thread.cwd)}`
+    })
     await this.replyWithChunks(
       interaction,
-      lines.join('\n') || 'No Codex sessions found.',
+      lines.join('\n') || (searchTerm
+        ? `No Codex session titles match ${discordInlineCode(searchTerm)} in mapped projects${includeArchived ? ' (including archived)' : ''}.`
+        : 'No Codex sessions found.'),
       { ephemeral: true },
     )
   }
@@ -6881,7 +8239,7 @@ export class CordexDiscordBot {
       ? 'All output including tool executions and status messages'
       : level === 'text_and_essential_tools'
         ? 'Text + essential tools (edits, custom MCP). Hides read/search.'
-        : 'Only text responses. Hides all tools and status messages.'
+        : 'Agent text plus essential progress and turn-end status. Hides tool details and routine footers.'
     await interaction.reply({
       content: `Verbosity set to \`${level}\` for this channel.\n${description}\nApplies immediately, including active sessions.`,
     })
@@ -6915,6 +8273,21 @@ export class CordexDiscordBot {
       })
       return
     }
+    let backgroundWarning = ''
+    if (activeTurnId || hadPendingStart || hadIntent) {
+      try {
+        const terminals = await this.codex.listBackgroundTerminals(session.codexThreadId)
+        if (terminals.length > 0) {
+          backgroundWarning = `\n${terminals.length} background terminal${terminals.length === 1 ? '' : 's'} still running. Use /ps to inspect or /stop to terminate.`
+        }
+      } catch (error) {
+        backgroundWarning = '\nBackground terminal status could not be verified; use /ps to inspect it.'
+        this.logVerbose('post-abort background terminal query failed', {
+          threadId: session.codexThreadId,
+          error: errorText(error),
+        })
+      }
+    }
     if (
       result.cleared &&
       !activeTurnId &&
@@ -6923,10 +8296,62 @@ export class CordexDiscordBot {
       !result.goalPaused &&
       !result.interrupted
     ) {
-      await interaction.reply({ content: 'No active turn.' })
+      await interaction.reply({ content: `No active turn.${backgroundWarning}` })
       return
     }
-    await interaction.reply('Abort requested.')
+    await interaction.reply(`Abort requested.${backgroundWarning}`)
+  }
+
+  private async handlePsCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const { session } = this.requireThreadSession(interaction)
+    await this.ensureSessionLoaded(session)
+    const terminals = await this.codex.listBackgroundTerminals(session.codexThreadId)
+    const lines = terminals.map((terminal) =>
+      `• ${discordInlineCode(terminal.processId)} — ${escapeInlineMarkdown(truncate(terminal.command.replace(/\s+/g, ' ').trim(), 150))} — ${discordInlineCode(terminal.cwd)}`,
+    )
+    await this.replyWithChunks(
+      interaction,
+      lines.join('\n') || 'No background terminals in this Codex session.',
+      { ephemeral: true },
+    )
+  }
+
+  private async handleStopCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const { session } = this.requireThreadSession(interaction)
+    await this.ensureSessionLoaded(session)
+    const selected = interaction.options.getString('process-id')?.trim()
+    const before = await this.codex.listBackgroundTerminals(session.codexThreadId)
+    if (selected) {
+      if (!before.some((terminal) => terminal.processId === selected)) {
+        await interaction.reply(`No running background terminal with Codex process ID ${discordInlineCode(selected)}.`)
+        return
+      }
+      const terminated = await this.codex.terminateBackgroundTerminal(session.codexThreadId, selected)
+      if (!terminated) {
+        await interaction.reply(`Codex process ${discordInlineCode(selected)} was no longer running.`)
+        return
+      }
+    } else {
+      if (before.length === 0) {
+        await interaction.reply('No background terminals to stop.')
+        return
+      }
+      await this.codex.cleanBackgroundTerminals(session.codexThreadId)
+    }
+    let remaining = await this.codex.listBackgroundTerminals(session.codexThreadId)
+    for (let attempt = 0; remaining.length > 0 && attempt < 10; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 250))
+      remaining = await this.codex.listBackgroundTerminals(session.codexThreadId)
+    }
+    this.reportedBackgroundTerminals.set(
+      session.codexThreadId,
+      new Set(remaining.map((terminal) => terminal.processId)),
+    )
+    await interaction.reply(
+      remaining.length === 0
+        ? `Stopped ${selected ? 'the selected' : String(before.length)} background terminal${selected || before.length === 1 ? '' : 's'}.`
+        : `Stop requested; ${remaining.length} background terminal${remaining.length === 1 ? '' : 's'} still reported. Run /ps to inspect.`,
+    )
   }
 
   private async handleStatusCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -6934,24 +8359,174 @@ export class CordexDiscordBot {
     if (!parentId) throw new Error('Status requires a project channel')
     const project = this.config.projects[parentId]
     const session = interaction.channel?.isThread() ? this.state.sessions[interaction.channel.id] : undefined
+    const run = session ? this.runs.get(session.codexThreadId) : undefined
+    const active = Boolean(session?.activeTurnId || run)
+    const directory = session?.directory || project?.directory
+    const model = session?.model || this.state.channelModels[parentId] || this.config.defaultModel || 'Codex default'
+    const effort = session?.effort || this.state.channelEfforts[parentId] || this.config.defaultEffort || 'default'
+    const yolo = session?.yoloMode ?? this.state.channelYoloMode[parentId] ?? false
+    const fast = session?.fastMode ?? this.state.channelFastMode[parentId] ?? false
     const queued = interaction.channel?.isThread()
       ? this.queuedPromptsFor(interaction.channel.id).length
       : 0
+    const context = session?.contextTokens === undefined
+      ? 'unavailable'
+      : formatContextUsage({
+          contextTokens: session.contextTokens,
+          ...(session.contextWindow !== undefined ? { contextWindow: session.contextWindow } : {}),
+        }) || 'unavailable'
+    const policy = yolo
+      ? { sandbox: 'danger-full-access', approval: 'never' }
+      : session?.permissions
+        ? { sandbox: 'controlled by permission profile', approval: 'controlled by permission profile' }
+        : { sandbox: this.config.sandbox, approval: this.config.approvalPolicy }
+    const writableRoots = yolo || (!session?.permissions && this.config.sandbox === 'danger-full-access')
+      ? 'unrestricted'
+      : session?.permissions
+        ? 'controlled by permission profile'
+        : this.config.sandbox === 'read-only'
+          ? 'none (read-only sandbox)'
+          : directory
+            ? [directory, ...(session?.workspaceRoots || [])]
+                .filter((root, index, roots) => roots.indexOf(root) === index)
+                .map(discordInlineCode)
+                .join(', ')
+            : 'unavailable'
     const lines = [
-      `Project: ${project ? `\`${project.directory}\`` : 'not configured'}`,
-      `Session: ${session ? `\`${session.codexThreadId}\`` : 'none'}`,
-      `Turn: ${session?.activeTurnId ? `active (\`${session.activeTurnId}\`)` : 'idle'}`,
-      `Mode: ${session?.mode || 'default'}`,
-      `Model: ${formatModelLabel(session?.model || this.state.channelModels[parentId] || this.config.defaultModel || 'Codex default', session?.effort || this.state.channelEfforts[parentId] || this.config.defaultEffort || 'default')}`,
-      `Fast mode: ${(session?.fastMode ?? this.state.channelFastMode[parentId] ?? false) ? 'on' : 'off'}`,
-      `YOLO mode: ${(session?.yoloMode ?? this.state.channelYoloMode[parentId] ?? false) ? 'on' : 'off'}`,
+      `Project: ${project ? discordInlineCode(project.directory) : 'not configured'}`,
+      `Working directory: ${directory ? discordInlineCode(directory) : 'unavailable'}`,
+      `Session: ${session ? discordInlineCode(session.codexThreadId) : 'none'}`,
+      `Turn: ${session?.activeTurnId ? `active (${discordInlineCode(session.activeTurnId)})` : active ? 'starting or recovering' : 'idle'}`,
+      ...(active ? [
+        `Current turn model: ${run ? formatModelLabel(run.model, run.effort) : 'unavailable while starting or recovering'}`,
+        `Next turn model: ${formatModelLabel(model, effort)}`,
+      ] : [`Model: ${formatModelLabel(model, effort)}`]),
+      `Mode${active ? ' (next turn)' : ''}: ${session?.mode || 'default'}`,
+      `Fast mode${active ? ' (next turn)' : ''}: ${fast ? 'on' : 'off'}`,
+      `YOLO mode${active ? ' (next turn)' : ''}: ${yolo ? 'on' : 'off'}`,
+      `Sandbox${active ? ' (next turn)' : ''}: ${policy.sandbox}`,
+      `Approval policy${active ? ' (next turn)' : ''}: ${policy.approval}`,
+      ...(session?.permissions ? [`Permission profile: ${discordInlineCode(session.permissions)}${yolo ? ' (bypassed by YOLO)' : ''}`] : []),
+      `Writable roots${active ? ' (next turn)' : ''}: ${writableRoots}`,
+      `Context usage: ${context}`,
       `Auto worktrees: ${this.state.channelAutoWorktrees[parentId] ? 'enabled' : 'disabled'}`,
-      `Extra roots: ${session?.workspaceRoots?.length || 0}`,
-      `Permissions: ${session?.permissions || this.config.sandbox}`,
       `Verbosity: ${this.state.channelVerbosity[parentId] || defaultVerbosity}`,
       `Queue: ${queued}`,
     ]
-    await interaction.reply({ content: lines.join('\n'), ephemeral: true })
+    await this.replyWithChunks(interaction, lines.join('\n'), { ephemeral: true })
+  }
+
+  private async handleDebugConfigCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const parentId = this.parentChannelId(interaction.channel)
+    if (!parentId) throw new Error('Config diagnostics require a project channel')
+    const project = this.config.projects[parentId]
+    if (!project) throw new Error('This channel is not mapped to a project')
+    const session = interaction.channel?.isThread() ? this.state.sessions[interaction.channel.id] : undefined
+    const cwd = session?.directory || project.directory
+    await interaction.deferReply({ ephemeral: true })
+    if (!interaction.ephemeral) {
+      await interaction.editReply('⨯ Private config diagnostics are unavailable for this interaction.')
+      return
+    }
+
+    let response: JsonObject
+    try {
+      const raw = await this.codex.request('config/read', { includeLayers: true, cwd })
+      if (!isRecord(raw) || !isRecord(raw.config)) throw new Error('Invalid config/read response')
+      response = raw
+    } catch {
+      await interaction.editReply('⨯ Codex configuration diagnostics are unavailable for this project.')
+      return
+    }
+
+    let requirements: JsonObject | null | undefined
+    try {
+      const raw = await this.codex.request('configRequirements/read', {})
+      requirements = isRecord(raw) && isRecord(raw.requirements)
+        ? raw.requirements
+        : isRecord(raw) && raw.requirements === null
+          ? null
+          : undefined
+    } catch {
+      requirements = undefined
+    }
+
+    const config = response.config as JsonObject
+    const origins = isRecord(response.origins) ? response.origins : {}
+    const describeSource = (value: unknown): string => {
+      if (!isRecord(value)) return 'unattributed'
+      const source = isRecord(value.name) ? value.name : value
+      const type = text(source.type) || 'unknown'
+      if (type === 'user' && typeof source.profile === 'string') {
+        return `profile ${discordInlineCode(truncate(source.profile, 80))}`
+      }
+      return discordInlineCode(truncate(type, 80))
+    }
+    const safeSetting = (key: string, label: string): string => {
+      const value = config[key]
+      const rendered = typeof value === 'string'
+        ? discordInlineCode(truncate(value, 100))
+        : value === null || value === undefined
+          ? 'not set'
+          : 'configured (details hidden)'
+      return `${label}: ${rendered} · source: ${describeSource(origins[key])}`
+    }
+    const hasLayers = Array.isArray(response.layers)
+    const rawLayers = hasLayers ? response.layers as unknown[] : []
+    const layers = rawLayers.filter(isRecord).reverse()
+    const layerLines = layers.map((layer, index) => {
+      const name = isRecord(layer.name) ? layer.name : {}
+      const type = text(name.type) || 'unknown'
+      const location = typeof name.dotCodexFolder === 'string'
+        ? name.dotCodexFolder
+        : typeof name.file === 'string'
+          ? name.file
+          : typeof name.name === 'string'
+            ? name.name
+            : null
+      const source = location ? ` · ${discordInlineCode(truncate(location, 160))}` : ''
+      const disabled = typeof layer.disabledReason === 'string' && layer.disabledReason
+        ? ' · disabled (reason hidden)'
+        : ' · active'
+      const keys = isRecord(layer.config) ? Object.keys(layer.config) : []
+      const shownKeys = keys.slice(0, 20).map((key) => discordInlineCode(truncate(key, 70)))
+      const keySummary = shownKeys.length
+        ? shownKeys.join(', ') + (keys.length > shownKeys.length ? `, +${keys.length - shownKeys.length} more` : '')
+        : 'no settings'
+      return `${index + 1}. ${discordInlineCode(truncate(type, 70))}${source}${disabled}\n   Keys: ${keySummary}`
+    })
+    const policyLines = requirements === undefined
+      ? ['Managed requirements: unavailable (Codex did not return them).']
+      : requirements === null
+        ? ['Managed requirements: none configured.']
+        : [
+            'Managed requirements: configured.',
+            `Policy sections: ${Object.keys(requirements).slice(0, 25).map((key) => discordInlineCode(truncate(key, 70))).join(', ') || 'none'}${Object.keys(requirements).length > 25 ? ', …' : ''}`,
+            ...(Array.isArray(requirements.allowedApprovalPolicies)
+              ? [`Allowed approvals: ${requirements.allowedApprovalPolicies.slice(0, 12).map((value) => discordInlineCode(truncate(String(value), 70))).join(', ') || 'none'}`]
+              : []),
+            ...(Array.isArray(requirements.allowedSandboxModes)
+              ? [`Allowed sandboxes: ${requirements.allowedSandboxModes.slice(0, 12).map((value) => discordInlineCode(truncate(String(value), 70))).join(', ') || 'none'}`]
+              : []),
+            ...(isRecord(requirements.network) ? ['Network requirements: configured (details hidden).'] : []),
+          ]
+    const lines = [
+      '**Codex configuration diagnostics**',
+      `Working directory: ${discordInlineCode(truncate(cwd, 300))}`,
+      '_Effective config defaults; an active turn or session override may differ._',
+      safeSetting('model', 'Model'),
+      safeSetting('model_reasoning_effort', 'Reasoning effort'),
+      safeSetting('service_tier', 'Service tier'),
+      safeSetting('approval_policy', 'Approval policy'),
+      safeSetting('sandbox_mode', 'Sandbox mode'),
+      '',
+      `**Layers (lowest precedence first):** ${hasLayers ? String(layers.length) : 'unavailable'}`,
+      ...layerLines,
+      '',
+      ...policyLines,
+      '_Only setting names and selected non-secret defaults are shown; config values are not dumped._',
+    ]
+    await this.replyWithChunks(interaction, lines.join('\n'), { ephemeral: true })
   }
 
   private async handleMessage(message: DiscordMessage): Promise<void> {
@@ -6963,13 +8538,18 @@ export class CordexDiscordBot {
     if (!parentId || !this.config.projects[parentId]) return
     if (this.removingProjects.has(parentId)) return
     if (!(await this.memberAllowed(message.author.id))) return
+    const leadingMention = message.channel.isThread()
+      ? message.content.match(/^\s*<@!?(\d+)>/)
+      : null
+    const isPassiveContext = Boolean(
+      leadingMention && leadingMention[1] !== this.client.user?.id,
+    )
+    const finishStartup = message.channel.isThread() &&
+      !isPassiveContext &&
+      !message.content.startsWith('!')
+      ? this.beginPendingStartupProgress(message.channel)
+      : () => undefined
     try {
-      const leadingMention = message.channel.isThread()
-        ? message.content.match(/^\s*<@!?(\d+)>/)
-        : null
-      const isPassiveContext = Boolean(
-        leadingMention && leadingMention[1] !== this.client.user?.id,
-      )
       let interactivePreparationError: unknown
       if (message.channel.isThread() && !isPassiveContext) {
         const channel = message.channel
@@ -7041,13 +8621,25 @@ export class CordexDiscordBot {
           reason: 'Start Codex session',
         })
         await thread.members.add(message.author.id).catch(() => undefined)
-        await this.processPrompt(thread, parentId, message, worktree)
+        const finishThreadStartup = this.beginPendingStartupProgress(thread)
+        try {
+          await this.processPrompt(thread, parentId, message, worktree)
+        } finally {
+          finishThreadStartup()
+        }
       } catch (error) {
-        if (worktree && (!thread || !this.state.sessions[thread.id])) {
+        const pendingInitial = thread && this.state.pendingInitialSessions?.[thread.id]
+        if (worktree && (!thread || (!this.state.sessions[thread.id] && !pendingInitial))) {
           await removeWorktree(worktree).catch(() => undefined)
         }
-        if (thread && !this.state.sessions[thread.id]) {
+        if (thread && !this.state.sessions[thread.id] && !pendingInitial) {
           await thread.delete('Cordex session could not be started').catch(() => undefined)
+        }
+        if (thread && pendingInitial) {
+          await message.reply(
+            `⚠ Codex session creation is pending review in ${thread}. The prompt is saved; open that thread and use /pending-prompts.`,
+          ).catch(() => undefined)
+          return
         }
         throw error
       }
@@ -7055,6 +8647,8 @@ export class CordexDiscordBot {
       const content = `⨯ ${truncate(errorText(error), 1_850)}`
       if (message.channel.isThread()) await message.channel.send(content).catch(() => undefined)
       else await message.reply(content).catch(() => undefined)
+    } finally {
+      finishStartup()
     }
   }
 
@@ -7141,6 +8735,7 @@ export class CordexDiscordBot {
   ): Promise<void> {
     this.assertDiscordThreadAvailable(channel.id)
     const session = this.state.sessions[channel.id]
+    const pendingInitial = this.state.pendingInitialSessions?.[channel.id]
     const btw = session ? parseBtwMessage(message.content) : { prompt: message.content, fork: false }
     if (session && btw.fork) {
       if (interactivePreparationError) throw interactivePreparationError
@@ -7176,6 +8771,25 @@ export class CordexDiscordBot {
       await this.buildInput(message, queuedContent),
     )
     this.assertDiscordThreadAvailable(channel.id)
+    if (pendingInitial && !session) {
+      if (channel.guildId !== this.config.guildId ||
+        channel.parentId !== pendingInitial.parentChannelId) {
+        throw new Error('Pending Codex session is outside the configured project')
+      }
+      const position = await this.enqueuePendingInitialPrompt(channel.id, {
+        id: message.id,
+        authorId: message.author.id,
+        authorName: message.author.displayName,
+        input,
+        displayText: (queuedContent ?? message.content.trim()) || '(attachment)',
+        createdAt: new Date().toISOString(),
+        sourceMessageId: message.id,
+        deliveryKind: 'queued',
+      })
+      await channel.send(`Saved prompt (position ${position}) while Codex session creation awaits review. Use /pending-prompts.`)
+      await this.pruneAttachmentCache().catch(() => undefined)
+      return
+    }
     if (queuedContent !== undefined && session) {
       const position = await this.enqueuePrompt(channel.id, {
         id: message.id,
@@ -7250,19 +8864,57 @@ export class CordexDiscordBot {
     initialLocation?: InitialSessionLocation,
   ): Promise<void> {
     this.assertDiscordThreadAvailable(channel.id)
-    await this.waitForCodexRecovery()
-    await this.projectMutationQueue.run(`channel:${parentChannelId}`, async () => {
-      await this.refreshProjectsSafely()
-      if (this.removingProjects.has(parentChannelId)) throw new Error('Project is being removed')
-      this.assertDiscordThreadAvailable(channel.id)
-      await this.dispatchInputUnlocked(
-        channel,
-        parentChannelId,
-        input,
-        clientUserMessageId,
-        initialLocation,
-      )
-    })
+    const initialPrompt: QueuedPrompt | undefined = clientUserMessageId
+      ? {
+          id: clientUserMessageId,
+          authorId: 'discord-user',
+          authorName: 'Discord user',
+          input,
+          displayText: input.flatMap((item) => item.type === 'text' ? [item.text] : [])
+            .join('\n').trim() || '(attachment)',
+          createdAt: new Date().toISOString(),
+          sourceMessageId: clientUserMessageId,
+          deliveryKind: 'direct',
+        }
+      : undefined
+    const finishStartup = this.beginPendingStartupProgress(channel)
+    try {
+      await this.waitForCodexRecovery()
+      await this.projectMutationQueue.run(`channel:${parentChannelId}`, async () => {
+        await this.refreshProjectsSafely()
+        if (this.removingProjects.has(parentChannelId)) throw new Error('Project is being removed')
+        this.assertDiscordThreadAvailable(channel.id)
+        try {
+          await this.dispatchInputUnlocked(
+            channel,
+            parentChannelId,
+            input,
+            clientUserMessageId,
+            initialLocation,
+            0,
+            initialPrompt,
+          )
+          if (initialPrompt) {
+            const queued = this.queueFor(channel.id).find((prompt) =>
+              this.queuedPromptDeliveryId(prompt) === clientUserMessageId)
+            if (queued) await this.removeQueuedPrompt(channel.id, queued)
+          }
+        } catch (error) {
+          const session = this.state.sessions[channel.id]
+          const pendingInitial = this.state.pendingInitialSessions?.[channel.id]
+          const queued = initialPrompt && this.queueFor(channel.id).find((prompt) =>
+            this.queuedPromptDeliveryId(prompt) === clientUserMessageId)
+          if (session && queued?.deliveryStarted) {
+            await this.holdUncertainPrompt(session, channel, queued)
+          } else if (!session && pendingInitial) {
+            await this.holdPendingInitialPrompt(channel, pendingInitial)
+          }
+          throw error
+        }
+      })
+    } finally {
+      finishStartup()
+    }
   }
 
   private assertDiscordThreadAvailable(threadId: string): void {
@@ -7285,6 +8937,7 @@ export class CordexDiscordBot {
     clientUserMessageId?: string,
     initialLocation?: InitialSessionLocation,
     deliveryAttempt = 0,
+    initialPrompt?: QueuedPrompt,
   ): Promise<void> {
     this.assertDiscordThreadAvailable(channel.id)
     if (this.archivingDiscordThreads.has(channel.id)) throw new Error('Session is being archived')
@@ -7297,11 +8950,32 @@ export class CordexDiscordBot {
     if (session?.abortIntent) throw new Error('Turn abort is still pending')
     if (session) this.assertCodexSessionLinked(session)
     if (session?.archived) throw new Error('Session is archived; run /resume first')
+    let persistedInitialPrompt: QueuedPrompt | undefined
+    if (session && initialPrompt) {
+      const queue = this.queueFor(channel.id)
+      persistedInitialPrompt = queue.find((prompt) =>
+        this.queuedPromptDeliveryId(prompt) === this.queuedPromptDeliveryId(initialPrompt))
+      if (!persistedInitialPrompt) {
+        queue.push(initialPrompt)
+        try {
+          await saveState(this.state)
+        } catch (error) {
+          const index = queue.indexOf(initialPrompt)
+          if (index >= 0) queue.splice(index, 1)
+          throw error
+        }
+        persistedInitialPrompt = initialPrompt
+      }
+    }
     let createdSession = false
     if (!session) {
+      if (this.state.pendingInitialSessions?.[channel.id]) {
+        throw new Error('Session creation has saved work awaiting review; use /pending-prompts')
+      }
       const model = this.state.channelModels[parentChannelId] || this.config.defaultModel
       const fastMode = this.state.channelFastMode[parentChannelId]
       const yoloMode = this.state.channelYoloMode[parentChannelId] ?? false
+      const selectedEffort = this.state.channelEfforts[parentChannelId] || this.config.defaultEffort
       const directory = initialLocation?.directory || project.directory
       const runtimeWorkspaceRoots = initialLocation?.workspaceRoots?.length
         ? [...new Set([
@@ -7309,6 +8983,40 @@ export class CordexDiscordBot {
             ...initialLocation.workspaceRoots.map((root) => path.resolve(root)),
           ])]
         : undefined
+      if (initialPrompt) {
+        const queue = this.queueFor(channel.id)
+        if (queue.length > 0) {
+          throw new Error('Thread has saved work without a Codex session; use /pending-prompts')
+        }
+        const pendingInitial: PendingInitialSession = {
+          parentChannelId,
+          directory,
+          createdAt: new Date().toISOString(),
+          ...(model ? { model } : {}),
+          ...(selectedEffort ? { effort: selectedEffort } : {}),
+          ...(fastMode !== undefined ? { fastMode } : {}),
+          ...(Object.hasOwn(this.state.channelYoloMode, parentChannelId) ? { yoloMode } : {}),
+          ...(runtimeWorkspaceRoots ? { workspaceRoots: runtimeWorkspaceRoots } : {}),
+          ...(initialLocation?.worktree
+            ? { worktree: {
+                projectDirectory: initialLocation.worktree.projectDirectory,
+                directory: initialLocation.worktree.directory,
+                branch: initialLocation.worktree.branch,
+              } }
+            : {}),
+        }
+        queue.push(initialPrompt)
+        ;(this.state.pendingInitialSessions ??= {})[channel.id] = pendingInitial
+        try {
+          await saveState(this.state)
+        } catch (error) {
+          const index = queue.indexOf(initialPrompt)
+          if (index >= 0) queue.splice(index, 1)
+          delete this.state.pendingInitialSessions[channel.id]
+          throw error
+        }
+        persistedInitialPrompt = initialPrompt
+      }
       const serviceTier = await this.serviceTierForFastMode(model, fastMode)
       const started = await this.codex.startThread({
         cwd: directory,
@@ -7319,17 +9027,15 @@ export class CordexDiscordBot {
         sandbox: yoloMode ? 'danger-full-access' : this.config.sandbox,
         approvalPolicy: yoloMode ? 'never' : this.config.approvalPolicy,
       })
+      const effectiveEffort = this.state.channelEfforts[parentChannelId] ||
+        this.config.defaultEffort || started.effort
       session = {
         discordThreadId: channel.id,
         parentChannelId,
         directory,
         codexThreadId: started.threadId,
         model: model || started.model,
-        ...(this.state.channelEfforts[parentChannelId]
-          ? { effort: this.state.channelEfforts[parentChannelId] }
-          : this.config.defaultEffort
-              ? { effort: this.config.defaultEffort }
-              : {}),
+        ...(effectiveEffort ? { effort: effectiveEffort } : {}),
         ...(fastMode !== undefined ? { fastMode } : {}),
         ...(Object.hasOwn(this.state.channelYoloMode, parentChannelId) ? { yoloMode } : {}),
         ...(initialLocation?.workspaceRoots?.length
@@ -7349,7 +9055,30 @@ export class CordexDiscordBot {
       this.state.sessions[channel.id] = session
       createdSession = true
       this.loadedThreads.add(session.codexThreadId)
-      await saveState(this.state)
+      const pendingInitial = this.state.pendingInitialSessions?.[channel.id]
+      if (pendingInitial) delete this.state.pendingInitialSessions![channel.id]
+      if (initialPrompt) {
+        const queue = this.queueFor(channel.id)
+        persistedInitialPrompt = queue.find((prompt) =>
+          this.queuedPromptDeliveryId(prompt) === this.queuedPromptDeliveryId(initialPrompt))
+        if (!persistedInitialPrompt) {
+          queue.push(initialPrompt)
+          persistedInitialPrompt = initialPrompt
+        }
+      }
+      try {
+        await saveState(this.state)
+      } catch (error) {
+        delete this.state.sessions[channel.id]
+        if (pendingInitial) this.state.pendingInitialSessions![channel.id] = pendingInitial
+        else if (initialPrompt && persistedInitialPrompt === initialPrompt) {
+          const queue = this.queueFor(channel.id)
+          const index = queue.indexOf(initialPrompt)
+          if (index >= 0) queue.splice(index, 1)
+        }
+        this.loadedThreads.delete(started.threadId)
+        throw error
+      }
       this.unlinkedCodexSessionChannels.delete(channel.id)
       if (this.deletedDiscordThreads.has(channel.id)) {
         await this.persistDeletedThreadIntent(session, 'delete')
@@ -7373,6 +9102,13 @@ export class CordexDiscordBot {
       ))
     }
 
+    if (persistedInitialPrompt) {
+      if (persistedInitialPrompt.reviewRequired || persistedInitialPrompt.deliveryStarted) {
+        throw new Error('Saved prompt needs delivery review; use /pending-prompts')
+      }
+      await this.markPromptDeliveryStarted(persistedInitialPrompt)
+    }
+
     if (await this.steerActiveTurn(session, channel, input, clientUserMessageId)) return
     this.assertDiscordThreadAvailable(channel.id)
     await channel.sendTyping()
@@ -7391,6 +9127,7 @@ export class CordexDiscordBot {
       turnId = await this.codex.startTurn({
         threadId: session.codexThreadId,
         input,
+        cwd: session.directory,
         ...(session.model ? { model: session.model } : {}),
         ...(session.effort ? { effort: session.effort } : {}),
         ...(serviceTier !== undefined ? { serviceTier } : {}),
@@ -7452,20 +9189,11 @@ export class CordexDiscordBot {
           return
         }
         const activeTurnId = await this.reconcileActiveTurn(session, channel, runtime)
+        // A missing user item immediately after an RPC error does not prove that
+        // Codex rejected the input. clientUserMessageId is not an idempotency key.
+        if (clientUserMessageId) throw error
         if (!activeTurnId) throw error
         if (await this.steerActiveTurn(session, channel, input, clientUserMessageId)) return
-        if (clientUserMessageId) {
-          let latestRuntime: CodexThreadRuntimeState
-          try {
-            latestRuntime = await this.readThreadRuntimeState(session)
-          } catch {
-            throw error
-          }
-          if (this.runtimeHasClientMessage(latestRuntime, clientUserMessageId)) {
-            await this.reconcileDeliveredInput(session, channel, latestRuntime)
-            return
-          }
-        }
         retryAfterStartFailure = true
       }
     } finally {
@@ -7568,6 +9296,7 @@ export class CordexDiscordBot {
     if (previousTurnId !== activeTurnId || run.turnId !== activeTurnId) {
       run.turnId = activeTurnId
       run.agentText.clear()
+      run.activeItems.clear()
       run.startedAt = Date.now()
       run.visibleOutput = false
     }
@@ -7635,6 +9364,17 @@ export class CordexDiscordBot {
       if (this.runtimeHasClientMessage(runtime, clientUserMessageId)) {
         await this.reconcileDeliveredInput(session, channel, runtime)
         return true
+      }
+
+      // Even a now-idle or different active turn can follow an accepted steer.
+      // Leave persisted input for explicit review instead of replaying it,
+      // but stop a stale heartbeat or follow the authoritative active turn.
+      if (clientUserMessageId) {
+        if (runtime.status === 'idle') await this.clearInactiveTurn(session, channel)
+        else if (runtime.status === 'active' && runtime.activeTurnId && runtime.activeTurnId !== expectedTurnId) {
+          await this.adoptActiveTurn(session, channel, runtime.activeTurnId)
+        }
+        throw steerError
       }
 
       if (runtime.status === 'active' && runtime.activeTurnId) {
@@ -7747,27 +9487,150 @@ export class CordexDiscordBot {
     })
   }
 
+  private stopPendingStartupProgress(discordThreadId: string): void {
+    const progress = this.pendingStartupProgress.get(discordThreadId)
+    if (!progress) return
+    clearInterval(progress.timer)
+    this.pendingStartupProgress.delete(discordThreadId)
+  }
+
+  private beginPendingStartupProgress(channel: ThreadChannel): () => void {
+    const session = this.state.sessions[channel.id]
+    if (session && this.runs.has(session.codexThreadId)) return () => undefined
+    const existing = this.pendingStartupProgress.get(channel.id)
+    if (existing) {
+      existing.references++
+      return () => {
+        if (this.pendingStartupProgress.get(channel.id) !== existing) return
+        if (--existing.references <= 0) this.stopPendingStartupProgress(channel.id)
+      }
+    }
+    const startedAt = Date.now()
+    let progress!: PendingStartupProgress
+    const timer = setInterval(() => {
+      void channel.sendTyping().catch(() => undefined)
+      this.maybeReportPendingStartupProgress(progress)
+    }, 6_000)
+    timer.unref()
+    progress = { channel, startedAt, sequence: 1, references: 1, timer }
+    this.pendingStartupProgress.set(channel.id, progress)
+    void channel.sendTyping().catch(() => undefined)
+    return () => {
+      if (this.pendingStartupProgress.get(channel.id) !== progress) return
+      if (--progress.references <= 0) this.stopPendingStartupProgress(channel.id)
+    }
+  }
+
+  private maybeReportPendingStartupProgress(progress: PendingStartupProgress): void {
+    if (this.stopping || this.pendingStartupProgress.get(progress.channel.id) !== progress || progress.sending) return
+    const now = Date.now()
+    if (now - progress.startedAt < 6_000 ||
+      (progress.lastSentAt && now - progress.lastSentAt < 60_000)) return
+    const session = this.state.sessions[progress.channel.id]
+    if (session && this.runs.has(session.codexThreadId)) {
+      this.stopPendingStartupProgress(progress.channel.id)
+      return
+    }
+    const phase = this.codexRecoveryPromise
+      ? 'recovering the Codex runtime before this turn'
+      : !session
+        ? 'starting this Codex session'
+        : this.pendingTurnStarts.has(session.codexThreadId)
+          ? 'starting this Codex turn'
+          : 'preparing this Codex turn'
+    const content = `Codex is still ${phase} (${formatDuration(now - progress.startedAt)} elapsed).`
+    const nonce = discordOutboxNonce(`startup:${progress.channel.id}:${progress.startedAt}:${progress.sequence}`)
+    const work = progress.channel.send({
+      content,
+      allowedMentions: { parse: [] },
+      flags: MessageFlags.SuppressNotifications,
+      nonce,
+      enforceNonce: true,
+    }).then(async (message) => {
+      if (this.pendingStartupProgress.get(progress.channel.id) !== progress) {
+        await message.edit({ content: '_Codex preparation finished._' }).catch(() => undefined)
+        return
+      }
+      progress.lastSentAt = Date.now()
+      progress.sequence++
+    }).catch((error: unknown) => {
+      this.logVerbose('Codex startup progress delivery deferred', {
+        discordThreadId: progress.channel.id,
+        error: errorText(error),
+      })
+    })
+    progress.sending = work
+    this.trackBackgroundWork(work, 'Codex startup progress')
+    void work.finally(() => {
+      if (progress.sending === work) delete progress.sending
+    })
+  }
+
   private startRun(session: SessionState, channel: ThreadChannel): ActiveRun {
+    this.stopPendingStartupProgress(channel.id)
     const existing = this.runs.get(session.codexThreadId)
     if (existing) return existing
-    const typingTimer = setInterval(() => void channel.sendTyping().catch(() => undefined), 6_000)
+    let run: ActiveRun | undefined
+    const typingTimer = setInterval(() => {
+      void channel.sendTyping().catch(() => undefined)
+      if (run) this.maybeReportRunProgress(run)
+    }, 6_000)
     typingTimer.unref()
     const contextPercent = contextUsagePercent(session.contextTokens || 0, session.contextWindow)
-    const run: ActiveRun = {
+    const startedAt = Date.now()
+    run = {
       session,
       channel,
       model: session.model || this.config.defaultModel || 'default',
       requestedModel: session.model || this.config.defaultModel || 'default',
       effort: session.effort || this.config.defaultEffort || 'default',
       ...(session.activeTurnId ? { turnId: session.activeTurnId } : {}),
-      startedAt: Date.now(),
+      startedAt,
       agentText: new Map(),
+      activeItems: new Map(),
       typingTimer,
       visibleOutput: false,
+      lastProgressAt: startedAt,
+      progressSequence: 0,
       ...(session.contextTokens !== undefined && contextPercent !== undefined ? { contextPercent } : {}),
     }
     this.runs.set(session.codexThreadId, run)
     return run
+  }
+
+  private maybeReportRunProgress(run: ActiveRun): void {
+    if (this.runs.get(run.session.codexThreadId) !== run || run.progressPromise) return
+    const now = Date.now()
+    if (now - run.startedAt < 6_000) return
+    if (run.lastVisibleOutputAt && now - run.lastVisibleOutputAt < 60_000) return
+    if (run.progressSequence > 0 && now - run.lastProgressAt < 60_000) return
+    const sequence = ++run.progressSequence
+    run.lastProgressAt = now
+    const hookActivity = Array.from(run.activeItems.entries()).reverse()
+      .find(([key]) => key.startsWith('hook:'))?.[1]
+    const activity = run.activeItems.get('__cordex_model_verification') ||
+      hookActivity ||
+      run.activeItems.get('__cordex_safety_buffering') ||
+      Array.from(run.activeItems.values()).at(-1)
+    const work = this.sendDurableDiscordOutput({
+      channel: run.channel,
+      codexThreadId: run.session.codexThreadId,
+      turnId: this.durableTurnId(run, {}),
+      itemKey: `progress:${sequence}`,
+      value: `Codex is still working (${formatDuration(now - run.startedAt)} elapsed)${activity ? ` — ${activity}` : ''}.`,
+      suppressNotifications: true,
+      format: false,
+    }).catch((error: unknown) => {
+      this.logVerbose('turn progress delivery deferred', {
+        threadId: run.session.codexThreadId,
+        error: errorText(error),
+      })
+    })
+    run.progressPromise = work
+    this.trackBackgroundWork(work, 'Codex turn progress')
+    void work.finally(() => {
+      if (run.progressPromise === work) delete run.progressPromise
+    })
   }
 
   private findRun(params: JsonObject): ActiveRun | undefined {
@@ -7790,16 +9653,28 @@ export class CordexDiscordBot {
 
     const existing = this.runs.get(threadId)
     if (existing) {
+      if (existing.turnId && existing.turnId !== turnId) {
+        this.logVerbose('nested Codex turn started while root turn is active', {
+          threadId,
+          rootTurnId: existing.turnId,
+          nestedTurnId: turnId,
+        })
+        return existing
+      }
       const changedTurn = existing.turnId !== turnId
       existing.turnId = turnId
       existing.session.activeTurnId = turnId
       existing.session.updatedAt = new Date().toISOString()
       if (changedTurn) {
         existing.agentText.clear()
+        existing.activeItems.clear()
         existing.visibleOutput = false
         existing.startedAt = isRecord(params.turn) && typeof params.turn.startedAt === 'number'
           ? params.turn.startedAt * 1_000
           : Date.now()
+        delete existing.lastVisibleOutputAt
+        existing.lastProgressAt = existing.startedAt
+        existing.progressSequence = 0
         await saveState(this.state)
       }
       return existing
@@ -7966,7 +9841,12 @@ export class CordexDiscordBot {
     if (notification.method === 'item/started') await this.onItemStarted(run, notification.params)
     else if (notification.method === 'item/agentMessage/delta') this.onAgentDelta(run, notification.params)
     else if (notification.method === 'item/completed') await this.onItemCompleted(run, notification.params)
-    else if (notification.method === 'model/rerouted') this.onModelRerouted(run, notification.params)
+    else if (notification.method === 'model/verification') await this.onModelVerification(run, notification.params)
+    else if (notification.method === 'model/safetyBuffering/updated') await this.onModelSafetyBuffering(run, notification.params)
+    else if (notification.method === 'model/rerouted') await this.onModelRerouted(run, notification.params)
+    else if (notification.method === 'hook/started' || notification.method === 'hook/completed') {
+      await this.onHookLifecycle(run, notification.method, notification.params)
+    }
     else if (notification.method === 'error') await this.onTurnError(run, notification.params)
     else if (notification.method === 'turn/completed') {
       await this.onTurnCompleted(run, notification.params, generation)
@@ -8358,12 +10238,12 @@ export class CordexDiscordBot {
       const channel = await this.client.channels.fetch(discordThreadId).catch(() => undefined)
       if (!channel?.isThread()) return
       await channel.send(
-        '⨯ This Codex session was deleted outside Cordex. The Discord thread is no longer linked.',
+        'This Codex session was deleted. The Discord thread is no longer linked.',
       ).catch(() => undefined)
     }))
   }
 
-  private async onItemStarted(run: ActiveRun, params: JsonObject): Promise<void> {
+  private onItemStarted(run: ActiveRun, params: JsonObject): void {
     if (!isRecord(params.item)) return
     const item = params.item
     const itemId = text(item.id)
@@ -8371,6 +10251,24 @@ export class CordexDiscordBot {
     if (item.type === 'agentMessage') {
       run.agentText.set(itemId, '')
     }
+    const activity: Record<string, string> = {
+      reasoning: 'thinking',
+      commandExecution: 'running a command',
+      fileChange: 'editing files',
+      mcpToolCall: 'using an MCP tool',
+      dynamicToolCall: 'using a tool',
+      collabAgentToolCall: 'coordinating agents',
+      collabToolCall: 'coordinating agents',
+      subAgentActivity: 'waiting for an agent',
+      webSearch: 'searching the web',
+      imageGeneration: 'generating an image',
+      contextCompaction: 'compacting context',
+      agentMessage: 'drafting a response',
+      plan: 'planning',
+      sleep: 'waiting',
+    }
+    const label = typeof item.type === 'string' ? activity[item.type] : undefined
+    if (label) run.activeItems.set(itemId, label)
   }
 
   private onAgentDelta(run: ActiveRun, params: JsonObject): void {
@@ -8403,9 +10301,73 @@ export class CordexDiscordBot {
       suppressNotifications: true,
     })
     run.visibleOutput = true
-    await this.drainDiscordOutbox(run.channel)
+    await this.drainDiscordOutbox(run.channel).then(() => {
+      run.lastVisibleOutputAt = Date.now()
+    }).catch((error: unknown) => {
+      this.logVerbose('turn item delivery deferred', {
+        threadId: run.session.codexThreadId,
+        itemId,
+        error: errorText(error),
+      })
+    })
     if (this.runs.get(run.session.codexThreadId) === run) {
       await run.channel.sendTyping().catch(() => undefined)
+    }
+  }
+
+  private async sendRunGeneratedImage(
+    run: ActiveRun,
+    params: JsonObject,
+    itemId: string,
+    item: JsonObject,
+  ): Promise<void> {
+    if (item.status === 'failed' || isRecord(item.failure)) {
+      const reason = isRecord(item.failure) && item.failure.type === 'usageLimitExceeded'
+        ? ' (usage limit exceeded)'
+        : ''
+      await this.sendRunBlock(run, params, itemId, `⨯ Image generation failed${reason}.`)
+      return
+    }
+    try {
+      const { bytes, attachment } = decodeGeneratedImage(item.result)
+      await this.outgoingMediaQueue.run('cache', async () => {
+        await cacheGeneratedImage(this.outgoingMediaDirectory, bytes, attachment)
+        await this.stageDurableDiscordOutput({
+          channel: run.channel,
+          codexThreadId: run.session.codexThreadId,
+          turnId: this.durableTurnId(run, params),
+          itemKey: `item:${itemId}`,
+          value: '🖼 Generated image',
+          suppressNotifications: true,
+          format: false,
+          attachment,
+        })
+      })
+      run.visibleOutput = true
+      await this.drainDiscordOutbox(run.channel).then(() => {
+        run.lastVisibleOutputAt = Date.now()
+      }).catch((error: unknown) => {
+        this.logVerbose('generated-image delivery deferred', {
+          threadId: run.session.codexThreadId,
+          itemId,
+          error: errorText(error),
+        })
+      })
+    } catch (error) {
+      const reason = error instanceof Error && error.message.includes('8 MiB')
+        ? ' It exceeds the 8 MiB Discord upload limit.'
+        : ''
+      await this.sendRunBlock(
+        run,
+        params,
+        itemId,
+        `⚠ Image generation completed, but Cordex could not prepare the Discord attachment.${reason} Ask Codex for its saved project path.`,
+      )
+      this.logVerbose('generated-image attachment preparation failed', {
+        threadId: run.session.codexThreadId,
+        itemId,
+        error: errorText(error),
+      })
     }
   }
 
@@ -8414,7 +10376,10 @@ export class CordexDiscordBot {
     const item = params.item
     const itemId = text(item.id)
     if (!itemId) return
-    if (item.type === 'agentMessage') {
+    run.activeItems.delete(itemId)
+    if (item.type === 'imageGeneration') {
+      await this.sendRunGeneratedImage(run, params, itemId, item)
+    } else if (item.type === 'agentMessage') {
       const finalText = text(item.text) || run.agentText.get(itemId) || ''
       run.agentText.delete(itemId)
       if (finalText.trim()) await this.sendRunBlock(run, params, itemId, finalText)
@@ -8426,7 +10391,104 @@ export class CordexDiscordBot {
     }
   }
 
-  private onModelRerouted(run: ActiveRun, params: JsonObject): void {
+  private async reportRunNotice(
+    run: ActiveRun,
+    params: JsonObject,
+    itemKey: string,
+    value: string,
+    suppressNotifications: boolean,
+  ): Promise<void> {
+    try {
+      await this.stageDurableDiscordOutput({
+        channel: run.channel,
+        codexThreadId: run.session.codexThreadId,
+        turnId: this.durableTurnId(run, params),
+        itemKey,
+        value,
+        suppressNotifications,
+        format: false,
+      })
+    } catch (error) {
+      this.logVerbose('Codex event notice persistence failed', {
+        threadId: run.session.codexThreadId,
+        itemKey,
+        error: errorText(error),
+      })
+      await run.channel.send({
+        content: value,
+        allowedMentions: { parse: [] },
+        ...(suppressNotifications ? { flags: MessageFlags.SuppressNotifications } : {}),
+      }).then(() => {
+        run.lastVisibleOutputAt = Date.now()
+      }).catch(() => undefined)
+      return
+    }
+    await this.drainDiscordOutbox(run.channel).then(() => {
+      run.lastVisibleOutputAt = Date.now()
+    }).catch((error: unknown) => {
+      this.logVerbose('Codex event notice delivery deferred', {
+        threadId: run.session.codexThreadId,
+        itemKey,
+        error: errorText(error),
+      })
+    })
+  }
+
+  private async onModelVerification(run: ActiveRun, params: JsonObject): Promise<void> {
+    const verifications = Array.isArray(params.verifications) ? params.verifications : []
+    if (verifications.length === 0) {
+      run.activeItems.delete('__cordex_model_verification')
+      return
+    }
+    run.activeItems.set('__cordex_model_verification', 'waiting for account verification')
+    const trustedAccess = verifications.includes('trustedAccessForCyber')
+    const notice = trustedAccess
+      ? '⚠ Codex requires Trusted Access for Cyber for this turn. Identity verification alone may not grant model access; approval and provisioning are account-side. Review <https://learn.chatgpt.com/docs/cyber-safety> or choose an available model with /model.'
+      : '⚠ Codex requires additional account verification for this turn. Complete the provider-side requirement or choose another available model with /model.'
+    await this.reportRunNotice(run, params, 'model-verification', notice, false)
+  }
+
+  private async onModelSafetyBuffering(run: ActiveRun, params: JsonObject): Promise<void> {
+    if (params.showBufferingUi !== true) {
+      run.activeItems.delete('__cordex_safety_buffering')
+      return
+    }
+    run.activeItems.set('__cordex_safety_buffering', 'checking the response')
+    await this.reportRunNotice(
+      run,
+      params,
+      'progress:safety-buffering',
+      'Codex is checking this response before continuing; it may take longer than usual.',
+      true,
+    )
+  }
+
+  private async onHookLifecycle(
+    run: ActiveRun,
+    method: string,
+    params: JsonObject,
+  ): Promise<void> {
+    const hook = isRecord(params.run) ? params.run : undefined
+    const hookId = hook ? text(hook.id) : undefined
+    if (!hookId) return
+    const key = `hook:${hookId}`
+    if (method === 'hook/started') {
+      run.activeItems.set(key, 'running a lifecycle hook')
+      return
+    }
+    run.activeItems.delete(key)
+    if (hook?.status === 'failed' || hook?.status === 'blocked') {
+      await this.reportRunNotice(
+        run,
+        params,
+        `hook:${hookId}:failure`,
+        `⚠ A Codex lifecycle hook ${hook.status === 'blocked' ? 'blocked work' : 'failed'}. Use /hooks to inspect its configured source.`,
+        true,
+      )
+    }
+  }
+
+  private async onModelRerouted(run: ActiveRun, params: JsonObject): Promise<void> {
     const threadId = text(params.threadId)
     const turnId = text(params.turnId)
     const fromModel = text(params.fromModel)
@@ -8434,10 +10496,19 @@ export class CordexDiscordBot {
     const reason = text(params.reason)
     const expectedTurnId = run.turnId || run.session.activeTurnId
     if (
-      !threadId || !turnId || !fromModel || !toModel || !reason ||
+      !threadId || !turnId || !fromModel || !toModel ||
       threadId !== run.session.codexThreadId || turnId !== expectedTurnId
     ) return
     run.model = toModel
+    const reasonText = reason ? ` Reason: ${discordInlineCode(truncate(reason, 120))}.` : ''
+    const key = createHash('sha256').update(`${fromModel}|${toModel}|${reason || ''}`).digest('hex').slice(0, 16)
+    await this.reportRunNotice(
+      run,
+      params,
+      `model-rerouted:${key}`,
+      `⚠ Codex rerouted this turn from ${discordInlineCode(fromModel)} to ${discordInlineCode(toModel)}.${reasonText} The next-turn model setting is unchanged.`,
+      true,
+    )
   }
 
   private async onTokenUsage(params: JsonObject): Promise<void> {
@@ -8495,10 +10566,14 @@ export class CordexDiscordBot {
     const message = isRecord(params.error) ? text(params.error.message) : undefined
     if (!message) return
     if (params.willRetry === true) {
-      await run.channel.send({
-        content: `⚠ ${truncate(message, 1_820)} Retrying.`,
-        flags: MessageFlags.SuppressNotifications,
-      })
+      const key = createHash('sha256').update(message).digest('hex').slice(0, 16)
+      await this.reportRunNotice(
+        run,
+        params,
+        `progress:retry:${key}`,
+        `⚠ ${truncate(message, 1_780)} Retrying.`,
+        true,
+      )
       return
     }
     run.lastError = message
@@ -8521,9 +10596,9 @@ export class CordexDiscordBot {
   private async onWarning(params: JsonObject): Promise<void> {
     const message = text(params.message)
     if (!message) return
+    const threadId = text(params.threadId) || text(params.conversationId)
     const channel = await this.resolveThreadChannel(params)
     if (!channel) {
-      const threadId = text(params.threadId) || text(params.conversationId)
       this.logger.warn('codex_warning_unrouted', {
         ...(threadId ? { threadId } : {}),
         bytes: Buffer.byteLength(message, 'utf8'),
@@ -8531,7 +10606,40 @@ export class CordexDiscordBot {
       })
       return
     }
-    await channel.send(`⚠ ${truncate(message, 1_850)}`)
+    const content = `⚠ ${truncate(message, 1_850)}`
+    const session = this.state.sessions[channel.id]
+    if (!session || session.codexThreadId !== threadId) {
+      await channel.send({ content, allowedMentions: { parse: [] } }).catch(() => undefined)
+      return
+    }
+    const warningTurnId = this.turnIdFrom(params)
+    const activeTurnId = this.runs.get(session.codexThreadId)?.turnId || session.activeTurnId
+    if (warningTurnId && warningTurnId !== activeTurnId) return
+    const itemKey = `warning:${createHash('sha256').update(message).digest('hex').slice(0, 16)}`
+    try {
+      await this.stageDurableDiscordOutput({
+        channel,
+        codexThreadId: session.codexThreadId,
+        turnId: warningTurnId || session.activeTurnId || `warning:${session.updatedAt}`,
+        itemKey,
+        value: content,
+        suppressNotifications: true,
+        format: false,
+      })
+    } catch (error) {
+      this.logVerbose('Codex warning persistence failed', {
+        threadId: session.codexThreadId,
+        error: errorText(error),
+      })
+      await channel.send({ content, allowedMentions: { parse: [] } }).catch(() => undefined)
+      return
+    }
+    await this.drainDiscordOutbox(channel).catch((error: unknown) => {
+      this.logVerbose('Codex warning delivery deferred', {
+        threadId: session.codexThreadId,
+        error: errorText(error),
+      })
+    })
   }
 
   private async onGoalUpdated(
@@ -8594,12 +10702,57 @@ export class CordexDiscordBot {
     })
   }
 
+  private async reportSurvivingBackgroundTerminals(run: ActiveRun, turnId: string): Promise<void> {
+    let timeout: NodeJS.Timeout | undefined
+    let terminals: Awaited<ReturnType<CodexAppServer['listBackgroundTerminals']>>
+    try {
+      terminals = await Promise.race([
+        this.codex.listBackgroundTerminals(run.session.codexThreadId),
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(() => reject(new Error('Background terminal inspection timed out')), 5_000)
+          timeout.unref()
+        }),
+      ])
+    } catch (error) {
+      this.logVerbose('post-turn background terminal query failed', {
+        threadId: run.session.codexThreadId,
+        error: errorText(error),
+      })
+      return
+    } finally {
+      if (timeout) clearTimeout(timeout)
+    }
+    if (
+      this.stopping ||
+      this.state.sessions[run.channel.id]?.codexThreadId !== run.session.codexThreadId
+    ) return
+    const known = this.reportedBackgroundTerminals.get(run.session.codexThreadId) || new Set<string>()
+    const newlyReported = terminals.filter((terminal) => !known.has(terminal.processId))
+    const current = new Set(terminals.map((terminal) => terminal.processId))
+    if (newlyReported.length === 0) {
+      this.reportedBackgroundTerminals.set(run.session.codexThreadId, current)
+      return
+    }
+    await this.stageDurableDiscordOutput({
+      channel: run.channel,
+      codexThreadId: run.session.codexThreadId,
+      turnId,
+      itemKey: 'background-terminals',
+      value: `⚠ ${newlyReported.length} background terminal${newlyReported.length === 1 ? '' : 's'} still running after this turn. Use /ps to inspect or /stop to terminate.`,
+      suppressNotifications: false,
+      format: false,
+    })
+    this.reportedBackgroundTerminals.set(run.session.codexThreadId, current)
+    await this.drainDiscordOutbox(run.channel)
+  }
+
   private async onTurnCompleted(
     run: ActiveRun,
     params: JsonObject,
     generation = this.codexGeneration,
   ): Promise<void> {
     clearInterval(run.typingTimer)
+    await run.progressPromise
     const turn = isRecord(params.turn) ? params.turn : {}
     const status = text(turn.status) || 'completed'
     const duration = typeof turn.durationMs === 'number' ? turn.durationMs : Date.now() - run.startedAt
@@ -8652,6 +10805,29 @@ export class CordexDiscordBot {
           error: errorText(error),
         })
       }
+    } else if (status === 'interrupted' || !run.visibleOutput) {
+      const terminal = status === 'completed'
+        ? 'Codex finished without a visible response.'
+        : status === 'interrupted'
+          ? 'Codex turn stopped.'
+          : `Codex turn ended (${status}).`
+      try {
+        await this.stageDurableDiscordOutput({
+          channel: run.channel,
+          codexThreadId: run.session.codexThreadId,
+          turnId: durableTurnId,
+          itemKey: 'terminal',
+          value: terminal,
+          suppressNotifications: this.queuedPromptsFor(run.channel.id).length > 0,
+          format: false,
+        })
+        shouldDrainTerminalOutput = true
+      } catch (error) {
+        this.logVerbose('silent turn completion persistence deferred', {
+          threadId: run.session.codexThreadId,
+          error: errorText(error),
+        })
+      }
     }
     delete run.session.activeTurnId
     run.session.updatedAt = new Date().toISOString()
@@ -8682,6 +10858,17 @@ export class CordexDiscordBot {
           })
         }),
         'terminal turn output delivery',
+      )
+    }
+    if (status !== 'interrupted') {
+      this.trackBackgroundWork(
+        this.reportSurvivingBackgroundTerminals(run, durableTurnId).catch((error: unknown) => {
+          this.logVerbose('post-turn background terminal notice deferred', {
+            threadId: run.session.codexThreadId,
+            error: errorText(error),
+          })
+        }),
+        'post-turn background terminal inspection',
       )
     }
     if (generation === this.codexGeneration && abortCleared) {
@@ -9046,6 +11233,11 @@ export class CordexDiscordBot {
       await currentPending.channel.send({
         content: `» **${escapeInlineMarkdown(interaction.user.displayName)}:** ${currentOption.label}`,
         allowedMentions: { parse: [] },
+      }).catch((error: unknown) => {
+        this.logVerbose('user input echo delivery failed', {
+          threadId: text(currentPending.request.params.threadId),
+          error: errorText(error),
+        })
       })
     }
     await this.finishUserInput(key)
@@ -9076,6 +11268,11 @@ export class CordexDiscordBot {
       await currentPending.channel.send({
         content: `» **${escapeInlineMarkdown(interaction.user.displayName)}:** ${answer}`,
         allowedMentions: { parse: [] },
+      }).catch((error: unknown) => {
+        this.logVerbose('user input echo delivery failed', {
+          threadId: text(currentPending.request.params.threadId),
+          error: errorText(error),
+        })
       })
     }
     await this.finishUserInput(key)
@@ -9765,6 +11962,59 @@ export class CordexDiscordBot {
     this.registerPendingRequestControl(request, 'actionButtons', key)
   }
 
+  private async handleFileUploadToolRequest(request: ServerRequest): Promise<void> {
+    const tool = text(request.params.tool)
+    if (tool !== fileUploadToolName || typeof request.params.namespace === 'string') {
+      this.respondToCodex(request, actionButtonToolResult('Unsupported Cordex upload tool.', false))
+      return
+    }
+    const threadId = text(request.params.threadId)
+    const channel = await this.resolveRunChannel(request)
+    const session = channel ? this.state.sessions[channel.id] : undefined
+    if (!threadId || !channel || !session || session.codexThreadId !== threadId) {
+      this.respondToCodex(request, actionButtonToolResult('Discord session is unavailable for file upload.', false))
+      return
+    }
+    try {
+      const requested = parseFileUploadPaths(request.params.arguments)
+      const root = path.resolve(session.directory)
+      const filePaths = requested.map((value) => {
+        const filePath = path.resolve(root, value)
+        if (!pathIsWithinOrEqual(root, filePath)) {
+          throw new Error('Upload tool paths must stay inside the current session directory')
+        }
+        const relative = path.relative(root, filePath)
+        if (relative.split(path.sep).some((segment) => segment.startsWith('.'))) {
+          throw new Error('Upload tool cannot send hidden files or hidden directories')
+        }
+        return filePath
+      })
+      const turnId = this.turnIdFrom(request.params) || ''
+      const itemId = text(request.params.itemId) || ''
+      const requestId = `tool-${createHash('sha256')
+        .update(`${threadId}|${turnId}|${itemId}|${String(request.id)}`)
+        .digest('hex').slice(0, 32)}`
+      const result = await this.uploadDaemonFiles({
+        target: { kind: 'thread', id: channel.id },
+        requestId,
+        filePaths,
+        allowOutsideProject: false,
+        rejectHidden: true,
+      })
+      this.respondToCodex(request, actionButtonToolResult(
+        result.fileCount > 0
+          ? `Queued ${result.fileCount} file${result.fileCount === 1 ? '' : 's'} for this Discord thread.`
+          : 'This upload was already queued or delivered.',
+        true,
+      ))
+    } catch (error) {
+      this.respondToCodex(request, actionButtonToolResult(
+        `File upload failed: ${truncate(errorText(error), 900)}`,
+        false,
+      ))
+    }
+  }
+
   private async resolveThreadChannel(params: JsonObject): Promise<ThreadChannel | undefined> {
     const run = this.findRun(params)
     if (run) return run.channel
@@ -10010,7 +12260,9 @@ export class CordexDiscordBot {
       return
     }
     if (request.method === 'item/tool/call') {
-      await this.handleActionButtonsRequest(request)
+      if (text(request.params.tool) === fileUploadToolName) {
+        await this.handleFileUploadToolRequest(request)
+      } else await this.handleActionButtonsRequest(request)
       return
     }
     if (request.method === 'mcpServer/elicitation/request') {
@@ -10333,9 +12585,36 @@ export class CordexDiscordBot {
       return
     }
     this.respondToCodex(pending.request, choice.result)
-    await interaction.update({
-      content: `${pending.message.content}\n\n**${choice.confirmation} by ${interaction.user}.**`,
-      components: [],
-    })
+    const content = `${pending.message.content}\n\n**${choice.confirmation} by ${interaction.user}.**`
+    try {
+      await interaction.update({ content, components: [] })
+    } catch (error) {
+      const edited = await pending.message.edit({ content, components: [] })
+        .then(() => true, () => false)
+      if (!edited) {
+        const session = this.state.sessions[pending.channel.id]
+        if (session) {
+          await this.sendDurableDiscordOutput({
+            channel: pending.channel,
+            codexThreadId: session.codexThreadId,
+            turnId: text(pending.request.params.turnId) || session.activeTurnId || `approval:${String(pending.request.id)}`,
+            itemKey: `approval:${typeof pending.request.id}:${String(pending.request.id)}`,
+            value: `Approval recorded: ${choice.confirmation} by ${escapeInlineMarkdown(interaction.user.displayName)}. The original control could not be updated.`,
+            suppressNotifications: true,
+            format: false,
+          }).catch((noticeError: unknown) => {
+            this.logVerbose('approval confirmation delivery deferred', {
+              threadId: session.codexThreadId,
+              error: errorText(noticeError),
+            })
+          })
+        }
+      }
+      this.logVerbose('approval interaction update failed', {
+        threadId: text(pending.request.params.threadId),
+        error: errorText(error),
+        fallbackEdited: edited,
+      })
+    }
   }
 }

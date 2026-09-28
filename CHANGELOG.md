@@ -1,10 +1,127 @@
 # Changelog
 
-All notable changes to Cordex will be documented in this file. The project aims
-to follow [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and semantic
-versioning once tagged releases begin.
+All notable changes to Cordex are documented here. The project follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and semantic versioning.
 
 ## [Unreleased]
+
+## [0.2.0] - 2026-09-28
+
+### Added
+
+- Added private `/pending-prompts` and exact-ID `/resolve-pending` controls
+  for direct or queued prompts whose Codex acceptance is uncertain.
+- Added private `/debug-config` diagnostics for Codex config provenance,
+  layer precedence, and managed requirements without dumping raw config.
+- Added `upload-to-discord` for grouped, durable project-file delivery by
+  Codex session or Discord thread ID, plus a project-scoped dynamic upload tool
+  for newly created Codex sessions.
+- Delivered Codex-generated images as durable Discord attachments with bounded
+  format validation, retry, and explicit unavailable/oversize notices.
+- Added `/ps` and `/stop` for Codex background terminals in a Discord session.
+- Added exact-ID-confirmed `/delete` for the current Codex session, preserving
+  project files and Discord history while archiving the thread.
+- Added title search and archived-session inclusion to `/last-sessions`.
+- Added bounded read-only `/plugins`, `/hooks`, and `/apps` discovery using the
+  stable Codex CLI plugin catalog and app-server hook/app state.
+- Added exact-ID-confirmed `/plugin` install, enable, disable, and uninstall
+  using stable CLI actions plus effective-state verification in Codex config.
+- Added `/subagents` for read-only child-thread discovery alongside
+  `/fork-subagent` continuation.
+- Added a detached live-E2E runner with private logs, process-aware status,
+  exit-code accounting, and a hashed result artifact.
+- Added a real Codex/MCP elicitation E2E fixture covering Discord tool
+  approval, a five-field form, validation, and stale-control cleanup.
+- Added `/mcp` reload to refresh loaded Codex sessions after project-local MCP
+  configuration changes without writing global config.
+
+### Fixed
+
+- Prevented startup from deleting valid project and session mappings when
+  Discord.js has not cached their guild yet; destructive pruning now checks
+  raw Discord channel metadata and retains unverifiable entries.
+- Reconciled idle or replacement Codex turns after an ambiguous steer without
+  replaying the prompt or leaving a stale Discord activity heartbeat.
+- Held restart-uncertain direct prompts and following queued work for explicit
+  review, while reconciling already accepted client IDs without replay.
+- Held direct and queued prompts after ambiguous in-process Codex turn RPC
+  failures, with a durable queued handoff marker and no automatic client-ID
+  replay; private slash commands now acknowledge before optional access lookup.
+- Held recovered running scheduled occurrences with no surviving queue entry
+  for delivery review, and stopped announcing them as delivered while held.
+- Saved a new session's first prompt with its Codex thread mapping, then
+  marked delivery before the turn RPC so an unacknowledged first message can
+  be reviewed instead of silently lost or automatically replayed.
+- Reported held first prompts even when their empty Codex thread has no
+  persisted rollout; exact-ID Retry can save a replacement thread before
+  delivery, while Discard keeps later queued work held for review.
+- Limited empty-thread status-only recovery to a just-created Codex thread
+  before any turn attempt; unsupported persisted history now holds saved work
+  for review instead of silently replaying it.
+- Persisted first prompts and settings before Codex returns a new thread ID;
+  unmapped Discord threads now show durable pending-start review, queue later
+  messages, and support exact-ID Retry or Discard without guessing an orphan
+  Codex thread ID.
+- Added privacy-safe timing diagnostics for Discord interaction age, initial
+  callback latency, gateway ping, and event-loop delay to distinguish late
+  slash-command delivery from slow acknowledgments.
+- Updated private slash-command deferral to the flags-based ephemeral API
+  and made slow successful acknowledgments visible in normal logs.
+- Preserved new Discord session threads and automatic worktrees when Codex
+  session creation fails after the first prompt is saved, and blocked project
+  removal while pending starts still need review.
+- Corrected the interrupted-turn restart notice when saved prompts are being
+  reconciled automatically, so Discord no longer tells users to resend work
+  that may already be running.
+- Added bounded pre-turn Discord activity for slow new-session creation and
+  existing-session recovery, with nonce-stable retry and timer cleanup when
+  the active Codex turn takes over.
+- Reported active-turn model verification, safety buffering, reroutes, long
+  synchronous hooks, and retry warnings through scoped durable Discord output;
+  staged-but-undelivered text no longer suppresses activity heartbeats.
+- Made `/status` distinguish active from next-turn model settings and show the
+  requested approval policy, sandbox, writable roots, working directory, and
+  context usage instead of mislabeling YOLO as `workspace-write`.
+- Restored `/rollback` on current Codex app-server versions by continuing from
+  the retained turns in a new session; removing every turn starts a fresh session.
+- Persisted a replacement managed category even when the root channel was
+  intentionally deleted, preventing duplicate empty categories on restart.
+- Made `/diff` include untracked files and work before the first Git commit,
+  while keeping size and timeout failures explicit.
+- Reloaded session-scoped Codex settings and reviews after a bot restart before
+  sending RPCs that require a loaded thread.
+- Kept root review turns active across nested review events, and added bounded,
+  activity-aware progress and terminal messages for otherwise silent work.
+- Superseded undelivered progress notices with newer activity or real output
+  so reconnect does not replay stale working messages after the final answer.
+- Retried durable Discord output with backoff while the bot remains running,
+  including after a gateway reconnect.
+- Reported background terminals still running after `/abort` instead of
+  implying that every command process stopped.
+- Warned once when a normally completed turn leaves a new background terminal
+  running, without holding the final answer on terminal inspection.
+- Queued durable notices for Codex runtime restarts and for Cordex startup
+  when a session had an in-flight turn recorded.
+- Made session history explicitly include app-server sources and page within
+  mapped project directories, avoiding the global first-100 cutoff.
+- Recognized current `collabToolCall` and legacy `collabAgentToolCall` items
+  when discovering and displaying subagent activity.
+- Stopped treating an intentional app-server shutdown as a child crash while
+  preserving restart handling for unexpected exits.
+- Kept structured-question answers moving when a Discord echo send fails, and
+  fell back to message editing or a durable notice when an approval click
+  could not update its original interaction.
+- Bound each live Cordex state object to its original state-file path so late
+  asynchronous writes cannot follow a changed `CORDEX_HOME`; live E2E fake bots
+  now drain through `stop()` before restoring their test environment.
+- Isolated the subagent, extension, and plugin-lifecycle fake bots in temporary
+  Cordex homes so their event handlers cannot overwrite the user's live state.
+- Passed the session's current directory on every Codex `turn/start`, so a
+  retained session can use relative commands after its merged worktree is removed.
+- Refused worktree creation when its deterministic managed directory already
+  exists instead of recursively deleting that path.
+- Retained Codex's effective reasoning effort from new and forked thread
+  responses so first-turn status matches the real model setting before resume.
 
 ## [0.1.7] - 2026-08-01
 

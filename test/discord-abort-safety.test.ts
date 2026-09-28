@@ -243,7 +243,7 @@ test('abort intent is durable before goal pause and interruption, then clears af
     assert.equal(session.abortIntent, undefined)
     assert.equal(session.activeTurnId, undefined)
     assert.equal((await loadState()).sessions[session.discordThreadId]?.abortIntent, undefined)
-    assert.deepEqual(replies, ['Abort requested.'])
+    assert.deepEqual(replies, ['Abort requested.\nBackground terminal status could not be verified; use /ps to inspect it.'])
   })
 })
 
@@ -414,7 +414,7 @@ test('a rejected pending start after abort is not retried or adopted', async () 
     assert.equal(session.abortIntent, undefined)
     assert.equal(internal.runs.has(session.codexThreadId), false)
     assert.equal((await loadState()).sessions[session.discordThreadId]?.abortIntent, undefined)
-    assert.deepEqual(replies, ['Abort requested.'])
+    assert.deepEqual(replies, ['Abort requested.\nBackground terminal status could not be verified; use /ps to inspect it.'])
   } finally {
     for (const active of internal.runs.values()) clearInterval(active.typingTimer)
     bot.client.destroy()

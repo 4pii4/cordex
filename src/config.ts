@@ -12,6 +12,7 @@ import { scheduledTaskDeliveryId } from './scheduler.js'
 import type {
   CordexConfig,
   CordexState,
+  PendingInitialSession,
   QueuedPrompt,
   ReasoningEffort,
   SessionAbortIntent,
@@ -44,6 +45,7 @@ type StateWriteQueue = {
 }
 
 const stateWriteQueues = new Map<string, StateWriteQueue>()
+const statePathBindings = new WeakMap<CordexState, string>()
 
 export class StateSaveInvalidatedError extends Error {
   constructor(cause: unknown) {
@@ -75,6 +77,15 @@ export function getConfigPath(): string {
 
 export function getStatePath(): string {
   return path.join(getCordexHome(), 'state.json')
+}
+
+export function bindStatePath(state: CordexState, statePath = getStatePath()): void {
+  const resolved = path.resolve(statePath)
+  const existing = statePathBindings.get(state)
+  if (existing && existing !== resolved) {
+    throw new Error('Cordex state object is already bound to another state path')
+  }
+  statePathBindings.set(state, resolved)
 }
 
 export function getManagementLockPath(): string {
@@ -192,6 +203,7 @@ export const emptyState = (): CordexState => ({
   channelAutoWorktrees: {},
   channelVerbosity: {},
   sessions: {},
+  pendingInitialSessions: {},
   queues: {},
   tasks: {},
   rootChannelTombstones: {},
@@ -333,6 +345,41 @@ function parseSessions(value: unknown): CordexState['sessions'] {
   return sessions
 }
 
+function parsePendingInitialSessions(value: unknown): Record<string, PendingInitialSession> {
+  if (!isRecord(value)) return {}
+  return Object.fromEntries(Object.entries(value).flatMap(([threadId, raw]) => {
+    if (!threadId || !isRecord(raw) ||
+      typeof raw.parentChannelId !== 'string' || !raw.parentChannelId ||
+      typeof raw.directory !== 'string' || !raw.directory ||
+      typeof raw.createdAt !== 'string' || !Number.isFinite(Date.parse(raw.createdAt))) return []
+    const worktree = isRecord(raw.worktree) &&
+      typeof raw.worktree.projectDirectory === 'string' &&
+      typeof raw.worktree.directory === 'string' &&
+      typeof raw.worktree.branch === 'string'
+      ? {
+          projectDirectory: path.resolve(raw.worktree.projectDirectory),
+          directory: path.resolve(raw.worktree.directory),
+          branch: raw.worktree.branch,
+        }
+      : undefined
+    return [[threadId, {
+      parentChannelId: raw.parentChannelId,
+      directory: path.resolve(raw.directory),
+      createdAt: raw.createdAt,
+      ...(typeof raw.model === 'string' && raw.model ? { model: raw.model } : {}),
+      ...(efforts.has(raw.effort as ReasoningEffort)
+        ? { effort: raw.effort as ReasoningEffort }
+        : {}),
+      ...(typeof raw.fastMode === 'boolean' ? { fastMode: raw.fastMode } : {}),
+      ...(typeof raw.yoloMode === 'boolean' ? { yoloMode: raw.yoloMode } : {}),
+      ...(Array.isArray(raw.workspaceRoots)
+        ? { workspaceRoots: stringList(raw.workspaceRoots).map((root) => path.resolve(root)) }
+        : {}),
+      ...(worktree ? { worktree } : {}),
+    } satisfies PendingInitialSession]]
+  }))
+}
+
 function parseSessionLifecycleIntent(value: unknown): SessionLifecycleIntent | undefined {
   if (
     !isRecord(value) ||
@@ -421,6 +468,12 @@ function parseQueues(value: unknown): CordexState['queues'] {
       } as QueuedPrompt
       if (typeof raw.sourceMessageId !== 'string') delete prompt.sourceMessageId
       if (raw.deliveryKind !== 'direct') delete prompt.deliveryKind
+      if (raw.deliveryStarted === true) prompt.deliveryStarted = true
+      else delete prompt.deliveryStarted
+      if (raw.deliveryKind === 'direct' || raw.deliveryStarted === true || raw.reviewRequired === true) {
+        prompt.reviewRequired = true
+      }
+      else delete prompt.reviewRequired
       return [prompt]
     })
   }
@@ -459,17 +512,26 @@ function alignLegacyRunningTaskDeliveries(
 }
 
 export async function loadState(): Promise<CordexState> {
-  const file = await readFile(getStatePath(), 'utf8').catch(() => undefined)
-  if (!file) return emptyState()
+  const statePath = getStatePath()
+  const file = await readFile(statePath, 'utf8').catch(() => undefined)
+  if (!file) {
+    const state = emptyState()
+    bindStatePath(state, statePath)
+    return state
+  }
   const value: unknown = JSON.parse(file)
-  if (!isRecord(value)) return emptyState()
+  if (!isRecord(value)) {
+    const state = emptyState()
+    bindStatePath(state, statePath)
+    return state
+  }
   const queues = parseQueues(value.queues)
   const tasks = parseTasks(value.tasks)
   const discordOutboxDeliveredKeys = parseDiscordOutboxDeliveredKeys(
     value.discordOutboxDeliveredKeys,
   )
   alignLegacyRunningTaskDeliveries(queues, tasks)
-  return {
+  const state: CordexState = {
     channelModels: isRecord(value.channelModels)
       ? Object.fromEntries(Object.entries(value.channelModels).filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
       : {},
@@ -509,12 +571,15 @@ export async function loadState(): Promise<CordexState> {
         )
       : {},
     sessions: parseSessions(value.sessions),
+    pendingInitialSessions: parsePendingInitialSessions(value.pendingInitialSessions),
     queues,
     tasks,
     rootChannelTombstones: parseRootChannelTombstones(value.rootChannelTombstones),
     discordOutbox: parseDiscordOutbox(value.discordOutbox, discordOutboxDeliveredKeys),
     discordOutboxDeliveredKeys,
   }
+  bindStatePath(state, statePath)
+  return state
 }
 
 async function writeJsonAtomic(filePath: string, value: unknown): Promise<void> {
@@ -568,7 +633,8 @@ export async function saveManagedConfig(
 }
 
 export async function saveState(state: CordexState): Promise<void> {
-  const statePath = getStatePath()
+  const statePath = statePathBindings.get(state) || path.resolve(getStatePath())
+  bindStatePath(state, statePath)
   const snapshot = structuredClone(state)
   const queue = stateWriteQueue(statePath)
   const sequence = ++queue.nextSequence

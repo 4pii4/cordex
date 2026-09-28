@@ -1,4 +1,6 @@
 import { spawn } from 'node:child_process'
+import { lstat } from 'node:fs/promises'
+import path from 'node:path'
 
 const defaultMaxDiffBytes = 40 * 1_024 * 1_024
 const maxStderrBytes = 64 * 1_024
@@ -11,15 +13,14 @@ export type GitDiffResult = {
   tooLarge: boolean
 }
 
-export async function readGitDiff(options: {
-  cwd: string
-  maxBytes?: number
-  timeoutMs?: number
-}): Promise<GitDiffResult> {
-  const maxBytes = options.maxBytes ?? defaultMaxDiffBytes
-  const timeoutMs = options.timeoutMs ?? 120_000
-  const child = spawn('git', ['diff', '--binary', '--no-ext-diff', 'HEAD', '--'], {
-    cwd: options.cwd,
+async function runGit(
+  cwd: string,
+  args: string[],
+  maxBytes: number,
+  timeoutMs: number,
+): Promise<GitDiffResult> {
+  const child = spawn('git', args, {
+    cwd,
     env: process.env,
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
@@ -43,8 +44,7 @@ export async function readGitDiff(options: {
   })
   child.stderr.on('data', (chunk: Buffer) => {
     if (stderrBytes >= maxStderrBytes) return
-    const remaining = maxStderrBytes - stderrBytes
-    const slice = chunk.subarray(0, remaining)
+    const slice = chunk.subarray(0, maxStderrBytes - stderrBytes)
     stderr.push(slice)
     stderrBytes += slice.byteLength
   })
@@ -56,7 +56,7 @@ export async function readGitDiff(options: {
   timer.unref()
   const exitCode = await new Promise<number | null>((resolve, reject) => {
     child.once('error', reject)
-    child.once('exit', resolve)
+    child.once('close', resolve)
   }).finally(() => clearTimeout(timer))
 
   return {
@@ -65,5 +65,104 @@ export async function readGitDiff(options: {
     exitCode,
     timedOut,
     tooLarge,
+  }
+}
+
+export async function readGitDiff(options: {
+  cwd: string
+  maxBytes?: number
+  timeoutMs?: number
+}): Promise<GitDiffResult> {
+  const maxBytes = options.maxBytes ?? defaultMaxDiffBytes
+  const timeoutMs = options.timeoutMs ?? 120_000
+  const deadline = Date.now() + timeoutMs
+  const empty = Buffer.alloc(0)
+  const run = async (args: string[], remainingBytes: number): Promise<GitDiffResult> => {
+    const remainingMs = deadline - Date.now()
+    if (remainingMs <= 0) {
+      return { patch: empty, stderr: 'Git diff timed out', exitCode: null, timedOut: true, tooLarge: false }
+    }
+    return runGit(options.cwd, args, remainingBytes, remainingMs)
+  }
+  const fail = (result: GitDiffResult): GitDiffResult => ({ ...result, patch: empty })
+
+  const repository = await run(['rev-parse', '--is-inside-work-tree'], 128)
+  if (repository.exitCode !== 0 || repository.timedOut || repository.tooLarge) {
+    return fail(repository)
+  }
+  if (repository.patch.toString('utf8').trim() !== 'true') {
+    return { patch: empty, stderr: 'Not a Git working tree', exitCode: 1, timedOut: false, tooLarge: false }
+  }
+
+  const head = await run(['rev-parse', '--verify', '-q', 'HEAD'], 128)
+  if (head.timedOut || head.tooLarge || (head.exitCode !== 0 && head.exitCode !== 1)) {
+    return fail(head)
+  }
+  const hasHead = head.exitCode === 0
+  const patches: Buffer[] = []
+  let totalBytes = 0
+
+  if (hasHead) {
+    const tracked = await run(['diff', '--binary', '--no-ext-diff', 'HEAD', '--'], maxBytes)
+    if (tracked.exitCode !== 0 || tracked.timedOut || tracked.tooLarge) return fail(tracked)
+    patches.push(tracked.patch)
+    totalBytes += tracked.patch.length
+  }
+
+  const paths = await run(
+    hasHead
+      ? ['ls-files', '--others', '--exclude-standard', '-z']
+      : ['ls-files', '--cached', '--others', '--exclude-standard', '-z'],
+    maxBytes,
+  )
+  if (paths.exitCode !== 0 || paths.timedOut || paths.tooLarge) return fail(paths)
+  const decoder = new TextDecoder('utf-8', { fatal: true })
+  let names: string[]
+  try {
+    names = decoder.decode(paths.patch).split('\0').filter(Boolean)
+  } catch {
+    return {
+      patch: empty,
+      stderr: 'Git path list contains a filename that is not valid UTF-8',
+      exitCode: 1,
+      timedOut: false,
+      tooLarge: false,
+    }
+  }
+
+  for (const name of names) {
+    let exists = true
+    try {
+      await lstat(path.join(options.cwd, name))
+    } catch (error) {
+      if (hasHead || (error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      exists = false // A staged file may have been deleted before the first commit.
+    }
+    if (!exists) continue
+    const untracked = await run(
+      ['diff', '--no-index', '--binary', '--no-ext-diff', '--', '/dev/null', name],
+      maxBytes - totalBytes,
+    )
+    if (untracked.timedOut || untracked.tooLarge) return fail(untracked)
+    if (untracked.exitCode !== 1 && untracked.exitCode !== 0) return fail(untracked)
+    if (untracked.patch.length === 0) {
+      return {
+        patch: empty,
+        stderr: untracked.stderr || `Git produced no patch for ${name}`,
+        exitCode: 1,
+        timedOut: false,
+        tooLarge: false,
+      }
+    }
+    patches.push(untracked.patch)
+    totalBytes += untracked.patch.length
+  }
+
+  return {
+    patch: Buffer.concat(patches),
+    stderr: '',
+    exitCode: 0,
+    timedOut: false,
+    tooLarge: false,
   }
 }

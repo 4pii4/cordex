@@ -135,7 +135,7 @@ test('/diff reports an empty tree and git failures without attachments', async (
     await withBot(notRepository, async (_bot, internal) => {
       await internal.handleDiffCommand(interaction(errorReplies))
     })
-    assert.match(String(errorReplies[0]), /not a git repository/i)
+    assert.match(String((errorReplies[0] as { content?: string })?.content), /not a git repository/i)
   } finally {
     await rm(repository, { recursive: true, force: true })
     await rm(notRepository, { recursive: true, force: true })

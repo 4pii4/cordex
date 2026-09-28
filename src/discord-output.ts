@@ -508,7 +508,7 @@ export function formatCompletedToolItem(
     return `${statusFailed(item) ? '⨯' : '┣'} ${name} ${summarizeFields(item.arguments)}`.trimEnd()
   }
 
-  if (type === 'collabAgentToolCall') {
+  if (type === 'collabAgentToolCall' || type === 'collabToolCall') {
     const tool = text(item.tool) || 'agent'
     const prompt = text(item.prompt)
     const icon = statusFailed(item) ? '⨯' : '┣'

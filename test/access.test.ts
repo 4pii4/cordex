@@ -150,13 +150,13 @@ test('stale channels and scheduled tasks cannot cross Discord guild boundaries',
     state,
     new FakeCodex() as unknown as CodexAppServer,
   ) as unknown as {
-    client: { channels: { fetch(channelId: string): Promise<unknown> } }
+    client: { rest: { get(route: string): Promise<unknown> } }
     cleanupProjectMapping(channelId: string, archiveSessions: boolean): Promise<number>
     pruneDeletedProjectMappings(): Promise<void>
     runScheduledTask(task: ScheduledTask): Promise<void>
   }
   const cleaned: string[] = []
-  bot.client.channels.fetch = async () => ({ guildId: 'old-guild' })
+  bot.client.rest.get = async () => ({ id: 'project', guild_id: 'old-guild', type: 0 })
   bot.cleanupProjectMapping = async (channelId) => {
     cleaned.push(channelId)
     return 0

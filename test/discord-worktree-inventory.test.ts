@@ -30,9 +30,9 @@ function makeInteraction(replies: string[]): ChatInputCommandInteraction {
     async deferReply() {
       interaction.deferred = true
     },
-    async editReply(content: string) {
+    async editReply(content: string | { content: string }) {
       interaction.replied = true
-      replies.push(content)
+      replies.push(typeof content === 'string' ? content : content.content)
       return content
     },
     async followUp(payload: string | { content: string }) {

@@ -12,6 +12,7 @@ class FakeCodex extends EventEmitter {}
 
 type InternalBot = {
   runs: Map<string, {
+    [key: string]: unknown
     session: SessionState
     model: string
     requestedModel?: string
@@ -102,9 +103,20 @@ test('bot accepts strict token snapshots outside active runs and rejects stale a
     session.activeTurnId = 'turn-current'
     internal.runs.set('codex-thread-1', {
       session,
+      channel: {
+        id: session.discordThreadId,
+        async send() { return { id: 'context-notice', async edit() { return this } } },
+      },
       model: 'gpt-test',
       requestedModel: 'gpt-test',
       effort: 'high',
+      turnId: 'turn-current',
+      startedAt: Date.now(),
+      agentText: new Map(),
+      activeItems: new Map(),
+      visibleOutput: false,
+      lastProgressAt: 0,
+      progressSequence: 0,
       contextPercent: 25,
       typingTimer: timer,
     })

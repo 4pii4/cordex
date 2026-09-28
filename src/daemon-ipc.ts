@@ -60,6 +60,18 @@ export type CordexDaemonSendResult = {
   position: number
 }
 
+export type CordexDaemonUploadRequest = {
+  requestId: string
+  target: { kind: 'thread' | 'session'; id: string }
+  filePaths: string[]
+  allowOutsideProject?: boolean
+}
+
+export type CordexDaemonUploadResult = {
+  threadId: string
+  fileCount: number
+}
+
 export type CordexDaemonIpcServer = {
   socketPath: string
   tokenPath: string
@@ -71,13 +83,18 @@ type RequestEnvelope = {
   token: string
   method: 'send'
   request: CordexDaemonSendRequest
+} | {
+  version: 1
+  token: string
+  method: 'upload'
+  request: CordexDaemonUploadRequest
 }
 
 type ResponseEnvelope = {
   version: 1
   requestId?: string
   ok: boolean
-  result?: CordexDaemonSendResult
+  result?: CordexDaemonSendResult | CordexDaemonUploadResult
   error?: string
 }
 
@@ -172,7 +189,36 @@ function validateSendRequest(value: unknown): CordexDaemonSendRequest {
   }
 }
 
-function parseRequestEnvelope(raw: string, token: string): CordexDaemonSendRequest {
+function validateUploadRequest(value: unknown): CordexDaemonUploadRequest {
+  if (!isRecord(value)) throw new Error('Invalid daemon upload request')
+  const requestId = value.requestId
+  const target = value.target
+  const filePaths = normalizeFilePaths({ filePaths: value.filePaths })
+  if (typeof requestId !== 'string' || !requestIdPattern.test(requestId)) {
+    throw new Error('Invalid daemon request ID')
+  }
+  if (!isRecord(target) || typeof target.id !== 'string' ||
+    !(
+      (target.kind === 'thread' && discordSnowflake.test(target.id)) ||
+      (target.kind === 'session' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(target.id))
+    )) {
+    throw new Error('Upload target must be a Discord thread ID or Codex session ID')
+  }
+  if (filePaths.length === 0) throw new Error('Upload requires at least one file')
+  if (value.allowOutsideProject !== undefined && typeof value.allowOutsideProject !== 'boolean') {
+    throw new Error('allowOutsideProject must be a boolean')
+  }
+  return {
+    requestId,
+    target: { kind: target.kind as 'thread' | 'session', id: target.id },
+    filePaths,
+    ...(value.allowOutsideProject === true ? { allowOutsideProject: true } : {}),
+  }
+}
+
+function parseRequestEnvelope(raw: string, token: string):
+  | { method: 'send'; request: CordexDaemonSendRequest }
+  | { method: 'upload'; request: CordexDaemonUploadRequest } {
   let value: unknown
   try {
     value = JSON.parse(raw)
@@ -182,10 +228,12 @@ function parseRequestEnvelope(raw: string, token: string): CordexDaemonSendReque
   if (!isRecord(value) || typeof value.token !== 'string' || !authenticated(value.token, token)) {
     throw new Error('Daemon authentication failed')
   }
-  if (value.version !== protocolVersion || value.method !== 'send') {
+  if (value.version !== protocolVersion || (value.method !== 'send' && value.method !== 'upload')) {
     throw new Error('Unsupported daemon IPC request')
   }
-  return validateSendRequest(value.request)
+  return value.method === 'send'
+    ? { method: 'send', request: validateSendRequest(value.request) }
+    : { method: 'upload', request: validateUploadRequest(value.request) }
 }
 
 function parseResponseEnvelope(raw: string, requestId: string): CordexDaemonSendResult {
@@ -214,6 +262,30 @@ function parseResponseEnvelope(raw: string, requestId: string): CordexDaemonSend
     threadId: value.result.threadId,
     position: Number(value.result.position),
   }
+}
+
+function parseUploadResponseEnvelope(raw: string, requestId: string): CordexDaemonUploadResult {
+  let value: unknown
+  try {
+    value = JSON.parse(raw)
+  } catch {
+    throw new Error('Cordex daemon returned invalid JSON')
+  }
+  if (!isRecord(value) || value.version !== protocolVersion || value.requestId !== requestId) {
+    throw new Error('Cordex daemon returned an invalid response')
+  }
+  if (value.ok !== true) {
+    throw new Error(typeof value.error === 'string' ? value.error : 'Cordex daemon rejected the upload')
+  }
+  if (
+    !isRecord(value.result) ||
+    typeof value.result.threadId !== 'string' ||
+    !discordSnowflake.test(value.result.threadId) ||
+    !Number.isSafeInteger(value.result.fileCount) ||
+    Number(value.result.fileCount) < 0 ||
+    Number(value.result.fileCount) > maxCordexDaemonAttachmentFiles
+  ) throw new Error('Cordex daemon returned an invalid upload result')
+  return { threadId: value.result.threadId, fileCount: Number(value.result.fileCount) }
 }
 
 function readSocketLine(socket: Socket, limit: number, timeoutMs: number): Promise<string> {
@@ -280,6 +352,7 @@ async function closeServer(server: Server): Promise<void> {
 
 export async function startCordexDaemonIpc(options: {
   onSend(request: CordexDaemonSendRequest): Promise<CordexDaemonSendResult>
+  onUpload?(request: CordexDaemonUploadRequest): Promise<CordexDaemonUploadResult>
   home?: string
   requestTimeoutMs?: number
 }): Promise<CordexDaemonIpcServer> {
@@ -300,9 +373,12 @@ export async function startCordexDaemonIpc(options: {
       let requestId: string | undefined
       try {
         const raw = await readSocketLine(socket, maxRequestBytes, requestTimeoutMs)
-        const request = parseRequestEnvelope(raw, token)
-        requestId = request.requestId
-        const result = await options.onSend(request)
+        const envelope = parseRequestEnvelope(raw, token)
+        requestId = envelope.request.requestId
+        let result: CordexDaemonSendResult | CordexDaemonUploadResult
+        if (envelope.method === 'send') result = await options.onSend(envelope.request)
+        else if (options.onUpload) result = await options.onUpload(envelope.request)
+        else throw new Error('Cordex daemon does not support file uploads')
         socket.end(responsePayload({
           version: protocolVersion,
           requestId,
@@ -376,6 +452,43 @@ export async function sendCordexDaemonPrompt(
     await once(socket, 'connect')
     socket.write(`${JSON.stringify(envelope)}\n`)
     return parseResponseEnvelope(await response, validated.requestId)
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === 'ENOENT' || code === 'ECONNREFUSED') {
+      throw new Error('Cordex daemon is not running; start it with `cordex start`')
+    }
+    throw error
+  } finally {
+    socket.destroy()
+  }
+}
+
+export async function sendCordexDaemonUpload(
+  request: CordexDaemonUploadRequest,
+  options: { home?: string; timeoutMs?: number } = {},
+): Promise<CordexDaemonUploadResult> {
+  const validated = validateUploadRequest(request)
+  const socketPath = getCordexDaemonSocketPath(options.home)
+  const tokenPath = getCordexDaemonTokenPath(options.home)
+  const token = await readFile(tokenPath, 'utf8')
+    .then((value) => value.trim())
+    .catch(() => {
+      throw new Error('Cordex daemon is not running; start it with `cordex start`')
+    })
+  if (!token) throw new Error('Cordex daemon authentication token is unavailable')
+  const envelope: RequestEnvelope = {
+    version: protocolVersion,
+    token,
+    method: 'upload',
+    request: validated,
+  }
+  const socket = createConnection(socketPath)
+  socket.on('error', () => undefined)
+  try {
+    const response = readSocketLine(socket, maxResponseBytes, options.timeoutMs ?? 30_000)
+    await once(socket, 'connect')
+    socket.write(`${JSON.stringify(envelope)}\n`)
+    return parseUploadResponseEnvelope(await response, validated.requestId)
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code
     if (code === 'ENOENT' || code === 'ECONNREFUSED') {

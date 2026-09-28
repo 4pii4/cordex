@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto'
 import type { CordexState, DiscordOutboxEntry } from './types.js'
+import { validGeneratedImageAttachment } from './discord-generated-media.js'
+import { validOutgoingFileAttachments } from './discord-outgoing-files.js'
 
 export const maxDiscordOutboxDeliveredKeys = 2_048
 const maxDiscordOutboxNonceLength = 25
@@ -51,6 +53,8 @@ export function createDiscordOutboxEntries(options: {
   turnId: string
   itemKey: string
   chunks: string[]
+  attachment?: DiscordOutboxEntry['attachment']
+  fileAttachments?: DiscordOutboxEntry['fileAttachments']
   suppressNotifications: boolean
   createdAt?: string
 }): DiscordOutboxEntry[] {
@@ -68,6 +72,8 @@ export function createDiscordOutboxEntries(options: {
       key,
       ...identity,
       content,
+      ...(chunkIndex === 0 && options.attachment ? { attachment: options.attachment } : {}),
+      ...(chunkIndex === 0 && options.fileAttachments ? { fileAttachments: options.fileAttachments } : {}),
       suppressNotifications: options.suppressNotifications,
       nonce: discordOutboxNonce(key),
       createdAt,
@@ -100,6 +106,9 @@ export function parseDiscordOutbox(
       !Number.isSafeInteger(raw.chunkIndex) ||
       Number(raw.chunkIndex) < 0 ||
       typeof raw.content !== 'string' ||
+      (raw.attachment !== undefined && (!validGeneratedImageAttachment(raw.attachment) || raw.chunkIndex !== 0)) ||
+      (raw.fileAttachments !== undefined && (!validOutgoingFileAttachments(raw.fileAttachments) || raw.chunkIndex !== 0)) ||
+      (raw.attachment !== undefined && raw.fileAttachments !== undefined) ||
       (raw.suppressNotifications !== undefined && typeof raw.suppressNotifications !== 'boolean') ||
       typeof raw.nonce !== 'string' ||
       raw.nonce.length === 0 ||
@@ -123,6 +132,12 @@ export function parseDiscordOutbox(
     pending.add(entry.key)
     return [{
       ...entry,
+      ...(raw.attachment !== undefined
+        ? { attachment: raw.attachment as NonNullable<DiscordOutboxEntry['attachment']> }
+        : {}),
+      ...(raw.fileAttachments !== undefined
+        ? { fileAttachments: raw.fileAttachments as NonNullable<DiscordOutboxEntry['fileAttachments']> }
+        : {}),
       suppressNotifications: raw.suppressNotifications === true,
       nonce: expectedNonce,
     }]

@@ -99,6 +99,7 @@ test('permission RPC failure restores the prior durable profile', async () => {
   const codex = new FakeCodex()
   codex.failSettings = true
   const bot = new CordexDiscordBot(config(home), state, codex as unknown as CodexAppServer)
+  ;(bot as unknown as { loadedThreads: Set<string> }).loadedThreads.add(session.codexThreadId)
   try {
     await assert.rejects(
       (bot as unknown as InternalBot).handlePermissionsCommand(interaction({ profile: 'trusted' })),
@@ -126,6 +127,7 @@ test('YOLO RPC failure restores the prior durable runtime policy', async () => {
   const codex = new FakeCodex()
   codex.failSettings = true
   const bot = new CordexDiscordBot(config(home), state, codex as unknown as CodexAppServer)
+  ;(bot as unknown as { loadedThreads: Set<string> }).loadedThreads.add(session.codexThreadId)
   try {
     await assert.rejects(
       (bot as unknown as InternalBot).handleYoloCommand(interaction({ action: 'on' })),

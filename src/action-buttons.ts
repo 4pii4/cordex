@@ -1,4 +1,5 @@
 import type { DynamicToolSpec, JsonObject } from './types.js'
+import { fileUploadTool } from './file-upload-tool.js'
 
 export const actionButtonsToolName = 'cordex_action_buttons'
 
@@ -52,7 +53,7 @@ export const actionButtonsTool: DynamicToolSpec = {
   },
 }
 
-export const cordexDynamicTools: DynamicToolSpec[] = [actionButtonsTool]
+export const cordexDynamicTools: DynamicToolSpec[] = [actionButtonsTool, fileUploadTool]
 
 function isRecord(value: unknown): value is JsonObject {
   return typeof value === 'object' && value !== null && !Array.isArray(value)

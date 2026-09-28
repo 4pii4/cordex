@@ -25,6 +25,7 @@ import {
   maxCordexDaemonAttachmentFiles,
   preflightCordexDaemonFilePaths,
   sendCordexDaemonPrompt,
+  sendCordexDaemonUpload,
   startCordexDaemonIpc,
   type CordexDaemonIpcServer,
 } from './daemon-ipc.js'
@@ -41,12 +42,14 @@ Commands:
   doctor                       Validate the local Codex and project setup
   start                        Start the Discord bot
   send --thread <id> <prompt>  Send a prompt to an existing Cordex thread
+  upload-to-discord --session <id> <file...>  Post files to a linked Discord session
   project <subcommand>         Manage Discord project mappings
   add-project [directory]      Alias for "project add"
 
 Options:
   --projects-dir <path>        Override the projects directory
   --file <path>                Attach up to 10 UTF-8 text files or supported images
+  --allow-outside-project     Permit an explicit upload path outside the session directory
   --verbose, -v                Enable verbose backend logging
   --help, -h                   Show this help
   --version, -V                Show the Cordex version`
@@ -169,16 +172,85 @@ async function send(commandArgs: string[]): Promise<void> {
   console.log(`Prompt accepted for Discord thread ${result.threadId}.`)
 }
 
+async function uploadToDiscord(commandArgs: string[]): Promise<void> {
+  let target: { kind: 'thread' | 'session'; id: string } | undefined
+  const filePaths: string[] = []
+  let allowOutsideProject = false
+  let requestId: string | undefined
+  let parsingOptions = true
+  for (let index = 1; index < commandArgs.length; index++) {
+    const argument = commandArgs[index]!
+    if (parsingOptions && argument === '--') {
+      parsingOptions = false
+      continue
+    }
+    if (parsingOptions && (argument === '--help' || argument === '-h')) {
+      console.log('Usage: cordex upload-to-discord (--session <codex-id> | --thread <discord-id>) [--allow-outside-project] [--request-id <id>] [--] <file...>')
+      return
+    }
+    if (parsingOptions && (argument === '--session' || argument === '--thread')) {
+      if (target) throw new Error('Specify exactly one of --session or --thread')
+      const id = commandArgs[++index]
+      if (!id) throw new Error(`${argument} requires an ID`)
+      target = { kind: argument === '--session' ? 'session' : 'thread', id }
+      continue
+    }
+    if (parsingOptions && argument === '--allow-outside-project') {
+      allowOutsideProject = true
+      continue
+    }
+    if (parsingOptions && argument === '--request-id') {
+      if (requestId) throw new Error('Specify --request-id only once')
+      requestId = commandArgs[++index]
+      if (!requestId) throw new Error('--request-id requires a value')
+      continue
+    }
+    if (parsingOptions && argument.startsWith('-')) {
+      throw new Error(`Unknown upload option: ${argument}; use -- before file paths beginning with -`)
+    }
+    filePaths.push(path.resolve(argument))
+    if (filePaths.length > maxCordexDaemonAttachmentFiles) {
+      throw new Error(`Specify at most ${maxCordexDaemonAttachmentFiles} files`)
+    }
+  }
+  if (!target || filePaths.length === 0) {
+    throw new Error('Usage: cordex upload-to-discord (--session <codex-id> | --thread <discord-id>) <file...>')
+  }
+  const result = await sendCordexDaemonUpload({
+    requestId: requestId || randomUUID(),
+    target,
+    filePaths,
+    ...(allowOutsideProject ? { allowOutsideProject: true } : {}),
+  })
+  console.log(result.fileCount > 0
+    ? `${result.fileCount} file${result.fileCount === 1 ? '' : 's'} queued for Discord thread ${result.threadId}.`
+    : `Upload request was already accepted for Discord thread ${result.threadId}.`)
+}
+
 async function start(verbose = false): Promise<void> {
   const config = await loadConfig()
   const releaseRuntimeLock = await acquireRuntimeLock()
   let state: Awaited<ReturnType<typeof loadState>>
+  const interruptedOnStartup: Array<{
+    discordThreadId: string
+    codexThreadId: string
+    turnId: string
+  }> = []
   try {
     state = await withManagementLock(async () => {
       const loaded = await loadState()
       // A previous process cannot keep an in-flight turn alive. Treat persisted
       // active turn IDs as stale so the first new Discord message starts cleanly.
-      for (const session of Object.values(loaded.sessions)) delete session.activeTurnId
+      for (const session of Object.values(loaded.sessions)) {
+        if (session.activeTurnId) {
+          interruptedOnStartup.push({
+            discordThreadId: session.discordThreadId,
+            codexThreadId: session.codexThreadId,
+            turnId: session.activeTurnId,
+          })
+        }
+        delete session.activeTurnId
+      }
       await saveState(loaded)
       return loaded
     })
@@ -187,7 +259,7 @@ async function start(verbose = false): Promise<void> {
     throw error
   }
   const codex = new CodexAppServer({ verbose })
-  const bot = new CordexDiscordBot(config, state, codex, { verbose })
+  const bot = new CordexDiscordBot(config, state, codex, { verbose, interruptedOnStartup })
   let ipc: CordexDaemonIpcServer | undefined
   let shutdown: Promise<void> | undefined
   const stop = (setExitCode: boolean): Promise<void> => {
@@ -230,6 +302,14 @@ async function start(verbose = false): Promise<void> {
           displayText: prepared.displayText,
         })
       },
+      async onUpload(request) {
+        return bot.uploadDaemonFiles({
+          target: request.target,
+          requestId: request.requestId,
+          filePaths: request.filePaths,
+          allowOutsideProject: request.allowOutsideProject === true,
+        })
+      },
     })
     if (shutdown) {
       await startedIpc.close()
@@ -251,6 +331,10 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2)
   if (args[0] === 'send') {
     await send(args)
+    return
+  }
+  if (args[0] === 'upload-to-discord') {
+    await uploadToDiscord(args)
     return
   }
   const verbose = args.includes('--verbose') || args.includes('-v') || process.env.CORDEX_VERBOSE === '1'

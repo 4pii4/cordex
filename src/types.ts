@@ -87,6 +87,26 @@ export type QueuedPrompt = {
   createdAt: string
   sourceMessageId?: string
   deliveryKind?: 'direct' | 'queued'
+  /** The prompt crossed the durable handoff boundary before a Codex turn RPC. */
+  deliveryStarted?: boolean
+  /** Delivery cannot be ruled out; hold until accepted input is found or the user resolves it. */
+  reviewRequired?: boolean
+}
+
+export type PendingInitialSession = {
+  parentChannelId: string
+  directory: string
+  createdAt: string
+  model?: string
+  effort?: ReasoningEffort
+  fastMode?: boolean
+  yoloMode?: boolean
+  workspaceRoots?: string[]
+  worktree?: {
+    projectDirectory: string
+    directory: string
+    branch: string
+  }
 }
 
 export type ScheduledTask = {
@@ -108,6 +128,16 @@ export type DiscordOutboxEntry = {
   itemKey: string
   chunkIndex: number
   content: string
+  attachment?: {
+    sha256: string
+    format: 'png' | 'jpg' | 'webp'
+    size: number
+  }
+  fileAttachments?: Array<{
+    sha256: string
+    size: number
+    name: string
+  }>
   suppressNotifications: boolean
   nonce: string
   createdAt: string
@@ -127,6 +157,7 @@ export type CordexState = {
   channelAutoWorktrees: Record<string, boolean>
   channelVerbosity: Record<string, VerbosityLevel>
   sessions: Record<string, SessionState>
+  pendingInitialSessions?: Record<string, PendingInitialSession>
   queues: Record<string, QueuedPrompt[]>
   tasks: Record<string, ScheduledTask>
   rootChannelTombstones?: Record<string, RootChannelTombstone>

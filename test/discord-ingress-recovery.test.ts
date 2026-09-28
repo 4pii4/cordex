@@ -513,7 +513,7 @@ test('enqueuePrompt rolls back an in-memory prompt when persistence fails', asyn
       assert.deepEqual(fixture.state.queues[fixture.session.discordThreadId], [prompt])
       assert.deepEqual(
         (await loadState()).queues[fixture.session.discordThreadId],
-        [prompt],
+        [{ ...prompt, reviewRequired: true }],
       )
     } finally {
       clearRunTimers(fixture.internal)

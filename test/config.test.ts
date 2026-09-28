@@ -130,6 +130,7 @@ test('config and session state round trip', async () => {
       displayText: '[reviewer skill]',
       createdAt: new Date(0).toISOString(),
       deliveryKind: 'direct',
+      reviewRequired: true,
     }]
     await saveState(state)
     assert.deepEqual(await loadState(), state)
