@@ -3,6 +3,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createInterface } from 'node:readline'
 import type {
   ApprovalPolicy,
+  ApprovalsReviewer,
   CodexModel,
   CodexThreadSummary,
   DynamicToolSpec,
@@ -131,6 +132,7 @@ export type StartThreadOptions = {
   sandbox?: SandboxMode
   permissions?: string
   approvalPolicy: ApprovalPolicy
+  approvalsReviewer?: ApprovalsReviewer
 }
 
 export type StartTurnOptions = {
@@ -142,6 +144,7 @@ export type StartTurnOptions = {
   serviceTier?: string | null
   sandbox?: SandboxMode
   approvalPolicy?: ApprovalPolicy
+  approvalsReviewer?: ApprovalsReviewer
   mode?: 'default' | 'plan'
   runtimeWorkspaceRoots?: string[]
   permissions?: string
@@ -156,6 +159,7 @@ export type ForkThreadOptions = StartThreadOptions & {
 export type ReviewTarget =
   | { type: 'uncommittedChanges' }
   | { type: 'baseBranch'; branch: string }
+  | { type: 'commit'; sha: string; title?: string }
   | { type: 'custom'; instructions: string }
 
 export type CodexAuthStatus = {
@@ -1880,6 +1884,7 @@ export class CodexAppServer extends EventEmitter {
         sandbox: options.permissions ? null : options.sandbox ?? null,
         permissions: options.permissions ?? null,
         approvalPolicy: options.approvalPolicy,
+        ...(options.approvalsReviewer ? { approvalsReviewer: options.approvalsReviewer } : {}),
       }),
       'thread/start',
     )
@@ -1918,6 +1923,7 @@ export class CodexAppServer extends EventEmitter {
         sandbox: options.permissions ? null : options.sandbox ?? null,
         permissions: options.permissions ?? null,
         approvalPolicy: options.approvalPolicy,
+        ...(options.approvalsReviewer ? { approvalsReviewer: options.approvalsReviewer } : {}),
         ...(options.includeTurns
           ? {
               initialTurnsPage: {
@@ -1959,6 +1965,7 @@ export class CodexAppServer extends EventEmitter {
         sandbox: options.permissions ? null : options.sandbox ?? null,
         permissions: options.permissions ?? null,
         approvalPolicy: options.approvalPolicy,
+        ...(options.approvalsReviewer ? { approvalsReviewer: options.approvalsReviewer } : {}),
       }),
       'thread/fork',
     )
@@ -1977,6 +1984,13 @@ export class CodexAppServer extends EventEmitter {
   async compactThread(threadId: string): Promise<void> {
     await this.ready
     await this.request('thread/compact/start', { threadId })
+  }
+
+  async approveGuardianDeniedAction(threadId: string, event: JsonObject): Promise<void> {
+    await this.ready
+    // Record native context for one exact retry, without executing or starting
+    // a turn. Never automatically replay an uncertain approval request.
+    await this.request('thread/approveGuardianDeniedAction', { threadId, event })
   }
 
   async injectThreadItems(threadId: string, items: JsonValue[]): Promise<void> {
@@ -2213,6 +2227,7 @@ export class CodexAppServer extends EventEmitter {
     serviceTier?: string | null
     sandbox?: SandboxMode
     approvalPolicy?: ApprovalPolicy
+    approvalsReviewer?: ApprovalsReviewer
   }): Promise<void> {
     await this.ready
     const params: JsonObject = { threadId: options.threadId }
@@ -2222,6 +2237,7 @@ export class CodexAppServer extends EventEmitter {
     if ('serviceTier' in options) params.serviceTier = options.serviceTier ?? null
     if (options.sandbox) params.sandboxPolicy = sandboxPolicy(options.sandbox)
     if (options.approvalPolicy) params.approvalPolicy = options.approvalPolicy
+    if (options.approvalsReviewer) params.approvalsReviewer = options.approvalsReviewer
     await this.request('thread/settings/update', params)
   }
 
@@ -2431,6 +2447,7 @@ export class CodexAppServer extends EventEmitter {
         ...('serviceTier' in options ? { serviceTier: options.serviceTier ?? null } : {}),
         ...(options.sandbox ? { sandboxPolicy: sandboxPolicy(options.sandbox) } : {}),
         ...(options.approvalPolicy ? { approvalPolicy: options.approvalPolicy } : {}),
+        ...(options.approvalsReviewer ? { approvalsReviewer: options.approvalsReviewer } : {}),
         runtimeWorkspaceRoots: options.runtimeWorkspaceRoots ?? null,
         ...(options.permissions ? { permissions: options.permissions } : {}),
         collaborationMode: options.mode
@@ -2901,6 +2918,20 @@ export class CodexAppServer extends EventEmitter {
       filePath: response.filePath,
       effectiveEnabled: effective?.enabled ?? enabled,
     }
+  }
+
+  async configuredApprovalsReviewer(cwd: string): Promise<ApprovalsReviewer> {
+    await this.ready
+    const response = asRecord(
+      await this.request('config/read', { cwd, includeLayers: false }),
+      'config/read',
+    )
+    const config = asRecord(response.config, 'config/read config')
+    const reviewer = config.approvals_reviewer ?? 'user'
+    if (reviewer !== 'user' && reviewer !== 'auto_review' && reviewer !== 'guardian_subagent') {
+      throw new Error('Codex reported an unsupported configured approvals reviewer')
+    }
+    return reviewer
   }
 
   async listPermissionProfiles(cwd?: string): Promise<JsonObject[]> {

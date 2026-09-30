@@ -1,6 +1,6 @@
 {
   "name": "@4pii4/cordex",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Control OpenAI Codex from Discord with persistent projects, sessions, approvals, and live output",
   "keywords": [
     "openai",
@@ -32,7 +32,7 @@
     "typecheck:test": "tsc -p tsconfig.test.json",
     "dev": "tsx src/cli.ts start",
     "start": "node dist/cli.js start",
-    "test": "node --import tsx --test test/*.test.ts",
+    "test": "node scripts/run-tests-isolated.mjs",
     "test:live": "cross-env CORDEX_LIVE_TEST=1 CORDEX_INPUT_TEST=1 CORDEX_WORKTREE_TEST=1 CORDEX_SCHEDULER_TEST=1 node --import tsx --test test/live-codex*.test.ts",
     "test:live-all": "npm run test:live && npm run test:live-review && npm run test:live-approval && npm run test:live-discord-controls && npm run test:live-login && npm run test:live-account && npm run test:live-mcp-config && npm run test:live-mcp-reload && npm run test:live-mcp-elicitation && npm run test:live-subagent && npm run test:live-action-buttons && npm run test:live-output-retry && npm run test:live-progress && npm run test:live-startup-progress && npm run test:live-direct-recovery && npm run test:live-ambiguous-delivery && npm run test:live-model-notices && npm run test:live-status && npm run test:live-generated-image && npm run test:live-file-upload && npm run test:live-file-upload-tool && npm run test:live-background-notice && npm run test:live-session-history && npm run test:live-extensions && npm run test:live-plugin-lifecycle && npm run test:live-lifecycle",
     "test:live-evidence": "node scripts/live-e2e-runner.mjs start",

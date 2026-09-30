@@ -280,17 +280,60 @@ Slash commands are registered in the configured Discord server.
 
 | Area | Commands |
 | --- | --- |
-| Projects | `/add-project`, `/create-new-project`, `/remove-project`, `/project` |
+| Projects | `/add-project`, `/create-new-project`, `/remove-project`, `/project`, `/init` |
 | Sessions | `/new-session`, `/resume`, `/rename`, `/fork`, `/subagents`, `/fork-subagent`, `/btw`, `/abort`, `/ps`, `/stop`, `/archive`, `/delete`, `/compact`, `/last-sessions`, `/session-id`, `/status`, `/debug-config` |
 | Models and runtime | `/model`, `/model-variant`, `/unset-model-override`, `/mode`, `/fast`, `/permissions`, `/add-dir`, `/verbosity`, `/context-usage` |
 | Goals | `/goal`, `/clear-goal` |
 | Git and worktrees | `/diff`, `/review`, `/rollback`, `/new-worktree`, `/merge-worktree`, `/delete-worktree`, `/toggle-worktrees`, `/worktrees` |
 | Automation | `/queue`, `/clear-queue`, `/pending-prompts`, `/resolve-pending`, `/schedule`, `/tasks`, `/cancel-task` |
 | Codex services | `/skill`, `/skills`, `/skill-toggle`, `/skill-roots`, `/plugins`, `/plugin`, `/hooks`, `/apps`, `/mcp`, `/mcp-status`, `/mcp-login`, `/auth-status`, `/rate-limits`, `/account-usage`, `/login` |
-| Host control | `/run-shell-command`, `!command`, `/yolo` |
+| Host control | `/run-shell-command`, `!command`, `/yolo`, `/restart` |
 
 `/diff` renders small patches inline and attaches the complete binary-capable
 patch when it exceeds Discord message limits.
+
+Discord `/init` asks Codex to generate repository-specific contributor guidance
+in `AGENTS.md` in the current session directory. In a project channel, it starts
+a session using the normal worktree preference. Existing guides require explicit
+`update=true`; refreshes preserve their instructions, and linked or non-file
+targets are rejected. Optional `instructions` adds project-specific guidance.
+Codex reports generation through its normal progress/output path. Start a fresh
+session with `/new-session` to load the updated guide. `/init` warns when
+`AGENTS.override.md` is present and leaves it untouched. In live Codex 0.159.0,
+even a zero-byte override prevented automatic loading of `AGENTS.md`; review
+the override before assuming the generated guide is active. This differs from the terminal
+`cordex init` command, which configures the Discord bot.
+
+`/permissions reviewer=auto_review` routes eligible approval requests to Codex's
+automatic reviewer; `reviewer=user` restores human approvals, and
+`reviewer=default` restores the current project-configured reviewer. A `profile`
+may be selected in the same command. Reviewer preferences apply to subsequent
+turns and persist across session resume/fork and bot restart. They do not expand
+filesystem or network access, and full access or `approval_policy=never` can
+bypass review. Automatic-review notices distinguish approval from execution,
+show separate denied/aborted/timed-out results, and omit rationale and action
+details in `text_only` mode. Stricter-review requirements are surfaced without
+claiming approval. Legacy-warning fallbacks share the thread's notification
+queue and are suppressed only after the structured notice is durable or sent.
+A completion first received after its legacy fallback was already posted can
+still produce a second notice; that legacy warning carries no review ID.
+`/approve` privately lists up to ten recent native denials in this session.
+`/approve review:<exact ID>` records approval context for one retry using the
+native `thread/approveGuardianDeniedAction` RPC and the official TUI's event
+conversion. It does not start a turn, execute the action, change permissions,
+disable review, or remember a command rule. Ask Codex to retry the exact action;
+the reviewer can still deny it. Consumed/foreign IDs and unsupported native
+payloads fail closed. Entries are in memory and expire when the native thread
+closes, the runtime is replaced, or the session is deleted.
+An uncertain RPC acceptance is not automatically resent. Approval commands and
+their diagnostics have no public-output fallback.
+
+`/review` supports uncommitted changes, a base branch, a specific commit, or
+custom instructions. For `target=commit`, supply `commit` as a SHA, abbreviated
+SHA, tag, or other Git revision; Cordex resolves it to an immutable commit in
+the current session checkout and shows the full SHA when the review starts.
+The optional `title` applies only to commit reviews. Review preserves project
+files and the Git index.
 
 During quiet turns, Cordex posts a status after about six seconds and then at
 most once a minute without visible output. It reports the current activity
@@ -426,6 +469,9 @@ buffering, model reroutes, slow lifecycle hooks, and retry warnings without
 exposing internal classifier labels or hook source paths. A staged message
 counts as visible activity only after Discord accepts it; offline progress is
 superseded by newer real output before reconnect delivery.
+Duplicate events that produce no new message do not reset the quiet-turn clock.
+Reconnect sends count for their owning active turn, not a newer turn, and nonce
+retries retain the message's original creation time for visibility accounting.
 Before a turn exists, slow session creation and existing-session recovery send
 non-notifying startup progress after a short grace period. The bot retries a
 failed startup notice with the same nonce and stops that timer when the real
@@ -501,6 +547,7 @@ A representative configuration is:
   "allowShellCommands": false,
   "allowedUserIds": ["TRUSTED_DISCORD_USER_ID"],
   "allowedRoleIds": ["TRUSTED_DISCORD_ROLE_ID"],
+  "runtimeRestartUserIds": ["HOST_OPERATOR_DISCORD_USER_ID"],
   "projectsDirectory": "/absolute/path/for/new/projects",
   "projects": {}
 }
@@ -567,6 +614,23 @@ lets every server member invoke Cordex. Replies and command results are generall
 public to anyone who can view the channel, so do not map Cordex to a public
 channel or weaken the managed category permissions casually.
 
+### Managed runtime restart
+
+`/restart` is disabled unless the exact requesting Discord user ID appears in
+`runtimeRestartUserIds` (or `CORDEX_RUNTIME_RESTART_USER_IDS`). It works only in
+a linked session thread, first reports readiness, and then requires the current
+Codex session ID as `confirm`. Cordex refuses the handoff while turns, queued or
+uncertain prompts, running schedules, approvals, background terminals, lifecycle
+mutations, or undelivered output remain.
+
+After confirmation, Cordex acknowledges the interaction, stages a durable
+replacement-ready message without sending it, shuts down cleanly, releases its
+IPC/runtime lock, and exits with code `75`. An external supervisor must restart
+nonzero exits, for example a systemd service with `Restart=on-failure`. The
+replacement's normal outbox recovery sends the completion exactly once. This
+command does not install updates; update the Codex/Cordex packages separately,
+then use the handoff to load them.
+
 For safer deployments, run Cordex under a dedicated operating-system account,
 grant the bot only the required Discord permissions, map only intended projects,
 and keep backups or version control for writable files.
@@ -582,6 +646,11 @@ npm link
 ```
 
 `npm link` makes the checkout's `cordex` command available on the current machine.
+The default `npm test` and `npm run check` commands always run with an isolated,
+temporary `CORDEX_HOME`; an ambient live `CORDEX_HOME` is ignored. For retained
+debug state, provide an empty safe directory through `CORDEX_TEST_HOME`, or set
+`CORDEX_TEST_KEEP_HOME=1` to retain a generated directory after success. Live
+integration scripts remain separate and opt-in.
 
 The live suites launch real Codex integrations and may create Discord messages,
 channels, sessions, worktrees, files, or account flows:

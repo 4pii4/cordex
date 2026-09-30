@@ -5,6 +5,42 @@ All notable changes to Cordex are documented here. The project follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-01
+
+### Fixed
+
+- Isolated the default package test suite from ambient live Cordex state, with
+  fail-closed explicit test-home validation and failure-state retention.
+- Serialized automatic-review warning fallbacks with native notifications and
+  retained the fallback when both persistence and best-effort delivery fail.
+  Surfaced native strict-review requirements without implying approval.
+- Counted visible activity from actual Discord sends rather than completed
+  outbox drains. Duplicate notices/items no longer suppress quiet-turn updates;
+  reconnect delivery refreshes the owning active turn even if acknowledgment
+  persistence fails. Older-turn output and nonce retries of old messages do not
+  reset a newer turn's visibility clock.
+
+### Added
+
+- Added opt-in, exact-user `/restart` handoff with exact session confirmation,
+  comprehensive idle checks, graceful exit code 75, and durable replacement-only
+  Discord confirmation for restart-on-failure supervisors.
+- Added private `/approve` denial listing and exact-ID one-retry authorization
+  through the native app-server RPC, retaining normal automatic review and
+  preventing automatic replay after uncertain acceptance. Verified real guarded
+  export approval and a non-overridable denial after an exact retry marker.
+- Added `/permissions reviewer` selection and durable, privacy-aware native
+  automatic-review progress/outcome notices, including concurrent and targetless
+  reviews, distinct terminal statuses, and stale/duplicate notification guards.
+  Coalesced native legacy review warnings with their structured outcomes while
+  keeping a privacy-aware fallback when a structured completion is missing.
+- Added Discord `/init` to generate or explicitly refresh `AGENTS.md` through
+  durable prompt delivery in session or project directories, with linked-target
+  protection, preservation of existing guidance, and visible override warnings,
+  including the zero-byte override discovery case.
+- Added specific-commit reviews to `/review`, including checkout-scoped
+  revision resolution, annotated tags, and a full-SHA start acknowledgment.
+
 ## [0.2.1] - 2026-09-28
 
 ### Fixed

@@ -276,6 +276,10 @@ function parseConfig(value: unknown): CordexConfig {
   const allowedUserIds = environmentList('CORDEX_ALLOWED_USER_IDS', value.allowedUserIds)
   const allowedRoleIds = environmentList('CORDEX_ALLOWED_ROLE_IDS', value.allowedRoleIds)
     .filter((roleId) => roleId !== guildId)
+  const runtimeRestartUserIds = environmentList(
+    'CORDEX_RUNTIME_RESTART_USER_IDS',
+    value.runtimeRestartUserIds,
+  ).filter((userId) => /^\d+$/.test(userId))
   return {
     token,
     applicationId,
@@ -289,6 +293,7 @@ function parseConfig(value: unknown): CordexConfig {
     allowShellCommands: value.allowShellCommands === true,
     ...(allowedUserIds.length > 0 ? { allowedUserIds } : {}),
     ...(allowedRoleIds.length > 0 ? { allowedRoleIds } : {}),
+    ...(runtimeRestartUserIds.length > 0 ? { runtimeRestartUserIds } : {}),
     ...(typeof value.categoryId === 'string' && value.categoryId
       ? { categoryId: value.categoryId }
       : {}),
@@ -323,6 +328,9 @@ function parseSessions(value: unknown): CordexState['sessions'] {
     ) continue
 
     const session = { ...raw } as CordexState['sessions'][string]
+    if (!['user', 'auto_review', 'guardian_subagent'].includes(String(raw.approvalsReviewer))) {
+      delete session.approvalsReviewer
+    }
     if (raw.archived !== true) delete session.archived
     const lifecycleIntent = parseSessionLifecycleIntent(raw.lifecycleIntent)
     if (lifecycleIntent) session.lifecycleIntent = lifecycleIntent

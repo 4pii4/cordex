@@ -18,10 +18,11 @@ async function runGit(
   args: string[],
   maxBytes: number,
   timeoutMs: number,
+  env: NodeJS.ProcessEnv = process.env,
 ): Promise<GitDiffResult> {
   const child = spawn('git', args, {
     cwd,
-    env: process.env,
+    env,
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   })
@@ -66,6 +67,37 @@ async function runGit(
     timedOut,
     tooLarge,
   }
+}
+
+export async function resolveGitCommit(options: {
+  cwd: string
+  revision: string
+  timeoutMs?: number
+}): Promise<string> {
+  if (
+    !options.revision.trim() ||
+    options.revision.length > 512 ||
+    /[\u0000-\u001f\u007f]/.test(options.revision)
+  ) throw new Error('Commit revision must be a nonempty, single-line Git revision')
+
+  const gitEnvironment: NodeJS.ProcessEnv = { ...process.env, GIT_OPTIONAL_LOCKS: '0' }
+  for (const name of [
+    'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE',
+    'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE',
+  ]) delete gitEnvironment[name]
+  const result = await runGit(
+    options.cwd,
+    ['rev-parse', '--verify', '--end-of-options', `${options.revision.trim()}^{commit}`],
+    128,
+    options.timeoutMs ?? 10_000,
+    gitEnvironment,
+  )
+  if (result.timedOut) throw new Error('Git commit lookup timed out')
+  const sha = result.patch.toString('utf8').trim()
+  if (result.exitCode !== 0 || result.tooLarge || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(sha)) {
+    throw new Error('Unable to resolve a commit from that revision in this session checkout')
+  }
+  return sha.toLowerCase()
 }
 
 export async function readGitDiff(options: {

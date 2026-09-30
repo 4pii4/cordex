@@ -109,8 +109,11 @@ import {
   type DiscordInputResult,
 } from './discord-input.js'
 import { formatThreadHistory } from './history.js'
-import { readGitDiff } from './git-diff.js'
+import { autoReviewSignature, formatAutoReviewNotice, parseLegacyAutoReviewWarning } from './auto-review.js'
+import { RecentAutoReviewDenials } from './auto-review-denials.js'
+import { readGitDiff, resolveGitCommit } from './git-diff.js'
 import { parseQueueMessage } from './queue.js'
+import { assertRepositoryInitTarget, repositoryInitOverrideNotice, repositoryInitPrompt } from './repository-init.js'
 import {
   buildFileAutocompleteChoices,
   parseFileAutocomplete,
@@ -171,6 +174,7 @@ import type {
   CodexThreadSummary,
   CordexConfig,
   CordexState,
+  ApprovalsReviewer,
   JsonObject,
   JsonValue,
   PendingInitialSession,
@@ -290,6 +294,9 @@ type ActiveRun = {
   startedAt: number
   agentText: Map<string, string>
   activeItems: Map<string, string>
+  autoReviews?: Map<string, 'started' | 'completed'>
+  autoReviewSummaries?: Set<string>
+  approvalsReviewer?: ApprovalsReviewer
   typingTimer: NodeJS.Timeout
   visibleOutput: boolean
   lastVisibleOutputAt?: number
@@ -318,6 +325,7 @@ type InitialSessionLocation = {
 
 const ephemeralChatCommands = new Set([
   'account-usage',
+  'approve',
   'apps',
   'auth-status',
   'debug-config',
@@ -448,6 +456,8 @@ export class CordexDiscordBot {
   private readonly discordOutboxDeliveryQueue = new KeyedSerialQueue()
   private readonly pluginMutationQueue = new KeyedSerialQueue()
   private readonly reportedBackgroundTerminals = new Map<string, Set<string>>()
+  private readonly threadApprovalsReviewers = new Map<string, ApprovalsReviewer>()
+  private readonly autoReviewDenials = new RecentAutoReviewDenials()
   private discordOutboxRetryTimer?: NodeJS.Timeout
   private discordOutboxRetryInFlight = false
   private discordOutboxRetryDelayMs = 5_000
@@ -506,6 +516,7 @@ export class CordexDiscordBot {
     this.resolveShutdownRequested = resolve
   })
   private stopping = false
+  private runtimeRestartRequested = false
   private stopPromise: Promise<void> | undefined
   private modelCache: { expiresAt: number; models: CodexModel[] } | undefined
   private skillCacheGeneration = 0
@@ -526,6 +537,7 @@ export class CordexDiscordBot {
         codexThreadId: string
         turnId: string
       }>
+      requestRuntimeRestart?: () => void
     } = {},
   ) {
     bindStatePath(this.state)
@@ -744,6 +756,8 @@ export class CordexDiscordBot {
         error,
       })
       this.codexGeneration += 1
+      this.threadApprovalsReviewers.clear()
+      this.autoReviewDenials.clear()
       this.beginCodexRecovery(this.codexLifecycleGeneration())
     })
     this.codex.on('restarting', (event: CodexAppServerRestartEvent) => {
@@ -1663,6 +1677,7 @@ export class CordexDiscordBot {
           ? { permissions: session.permissions }
           : { sandbox: yoloMode ? 'danger-full-access' : this.config.sandbox }),
         approvalPolicy: yoloMode ? 'never' : this.config.approvalPolicy,
+        ...(session.approvalsReviewer ? { approvalsReviewer: session.approvalsReviewer } : {}),
       },
     }
   }
@@ -2125,6 +2140,28 @@ export class CordexDiscordBot {
     })
   }
 
+  private recordVisibleDiscordOutput(
+    identity: {
+      discordThreadId: string
+      codexThreadId: string
+      turnId: string
+    },
+    message: { createdTimestamp?: number },
+  ): void {
+    const run = this.runs.get(identity.codexThreadId)
+    if (!run || run.channel.id !== identity.discordThreadId ||
+      this.durableTurnId(run, {}) !== identity.turnId) return
+    const now = Date.now()
+    // A nonce retry can return an already-created message. Its original date
+    // must not make old output look freshly visible. Count the send even when
+    // the following durable acknowledgment fails.
+    const createdAt = typeof message.createdTimestamp === 'number' &&
+      Number.isFinite(message.createdTimestamp) && message.createdTimestamp > 0
+      ? Math.min(message.createdTimestamp, now)
+      : now
+    run.lastVisibleOutputAt = Math.max(run.lastVisibleOutputAt ?? 0, createdAt)
+  }
+
   private async drainDiscordOutbox(channel: ThreadChannel): Promise<void> {
     try {
       await this.discordOutboxDeliveryQueue.run(channel.id, async () => {
@@ -2175,8 +2212,9 @@ export class CordexDiscordBot {
             enforceNonce: true,
             ...(files && !attachmentUnavailable ? { files } : {}),
           }
+          let deliveredMessage: DiscordMessage
           try {
-            await channel.send(sendOptions)
+            deliveredMessage = await channel.send(sendOptions)
           } catch (error) {
             const rejection = files?.length ? discordUploadRejection(error) : undefined
             if (!rejection) throw error
@@ -2187,12 +2225,13 @@ export class CordexDiscordBot {
               : entry.fileAttachments
                 ? 'Discord rejected one or more file attachments; check file types and names, then rerun the upload.'
                 : 'Discord rejected the generated image attachment; ask Codex for its saved project path.'
-            await channel.send({
+            deliveredMessage = await channel.send({
               ...sendOptions,
               content: `${entry.content}\n⚠ ${notice}`,
               files: [],
             })
           }
+          this.recordVisibleDiscordOutput(entry, deliveredMessage)
           await this.acknowledgeDiscordOutput(entry.key)
           await this.pruneOutgoingMediaCache().catch((error: unknown) => {
             this.logVerbose('generated-image cache cleanup deferred', { error: errorText(error) })
@@ -3212,6 +3251,18 @@ export class CordexDiscordBot {
     const focused = interaction.options.getFocused(true)
     const focusedValue = typeof focused.value === 'string' ? focused.value : String(focused.value)
     const query = focusedValue.toLowerCase()
+    if (interaction.commandName === 'approve' && focused.name === 'review') {
+      const session = this.state.sessions[interaction.channelId]
+      if (!session || session.archived || session.lifecycleIntent) {
+        await interaction.respond([])
+        return
+      }
+      await interaction.respond(this.autoReviewDenials.list(session.codexThreadId)
+        .filter(entry => !entry.unavailable && entry.id.length <= 100 &&
+          `${entry.id} ${entry.summary}`.toLowerCase().includes(query))
+        .map(entry => ({ name: truncate(entry.summary, 100), value: entry.id })))
+      return
+    }
     if (
       (interaction.commandName === 'new-worktree' && focused.name === 'base-branch') ||
       (interaction.commandName === 'merge-worktree' && focused.name === 'target-branch')
@@ -3653,6 +3704,7 @@ export class CordexDiscordBot {
       else if (interaction.commandName === 'create-new-project') await this.handleCreateNewProjectCommand(interaction)
       else if (interaction.commandName === 'add-dir') await this.handleAddDirCommand(interaction)
       else if (interaction.commandName === 'permissions') await this.handlePermissionsCommand(interaction)
+      else if (interaction.commandName === 'approve') await this.handleApproveCommand(interaction)
       else if (interaction.commandName === 'model') await this.handleModelCommand(interaction)
       else if (interaction.commandName === 'model-variant') await this.handleModelVariantCommand(interaction)
       else if (interaction.commandName === 'unset-model-override') await this.handleUnsetModelOverrideCommand(interaction)
@@ -3660,6 +3712,7 @@ export class CordexDiscordBot {
       else if (interaction.commandName === 'fast') await this.handleFastCommand(interaction)
       else if (interaction.commandName === 'yolo') await this.handleYoloCommand(interaction)
       else if (interaction.commandName === 'new-session') await this.handleNewSessionCommand(interaction)
+      else if (interaction.commandName === 'init') await this.handleInitCommand(interaction)
       else if (interaction.commandName === 'resume') await this.handleResumeCommand(interaction)
       else if (interaction.commandName === 'rename') await this.handleRenameCommand(interaction)
       else if (interaction.commandName === 'fork') await this.handleForkCommand(interaction)
@@ -3710,6 +3763,7 @@ export class CordexDiscordBot {
       else if (interaction.commandName === 'ps') await this.handlePsCommand(interaction)
       else if (interaction.commandName === 'stop') await this.handleStopCommand(interaction)
       else if (interaction.commandName === 'status') await this.handleStatusCommand(interaction)
+      else if (interaction.commandName === 'restart') await this.handleRestartCommand(interaction)
       else if (interaction.commandName === 'debug-config') await this.handleDebugConfigCommand(interaction)
     } catch (error) {
       const payload = { content: `⨯ ${truncate(errorText(error), 1_850)}` }
@@ -4119,6 +4173,7 @@ export class CordexDiscordBot {
             ? { permissions: session.permissions }
             : { sandbox: session.yoloMode ? 'danger-full-access' as const : this.config.sandbox }),
           approvalPolicy: session.yoloMode ? 'never' : this.config.approvalPolicy,
+          ...(session.approvalsReviewer ? { approvalsReviewer: session.approvalsReviewer } : {}),
         })
         if (session.effort && resumed.effort !== session.effort) {
           await this.codex.updateThreadSettings({
@@ -4163,6 +4218,49 @@ export class CordexDiscordBot {
     })
   }
 
+  private async handleApproveCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral })
+    if (interaction.ephemeral !== true) throw new Error('Exact-action approval requires a private interaction')
+    const { session } = this.requireThreadSession(interaction)
+    if (session.archived || session.abortIntent) throw new Error('Resume or finish stopping this session before approving a retry')
+    const threadId = session.codexThreadId
+    const reviewer = this.runs.get(threadId)?.approvalsReviewer || session.approvalsReviewer ||
+      this.threadApprovalsReviewers.get(threadId) || await this.codex.configuredApprovalsReviewer(session.directory)
+    if (session.yoloMode || reviewer === 'user') {
+      await interaction.reply({ content: 'Exact denied-action retries are available while automatic review is active. This command never changes the reviewer or permission profile.' })
+      return
+    }
+    const reviewId = interaction.options.getString('review')
+    const entries = this.autoReviewDenials.list(threadId)
+    if (!reviewId) {
+      const lines = entries.map(entry => `• ${discordInlineCode(entry.id)} — ${entry.summary.split(' · ')[0]}${entry.unavailable ? ' (unsupported exact conversion; use the native TUI)' : ''}`)
+      await this.replyWithChunks(interaction, lines.length
+        ? `Recent native automatic-review denials (at most ten):\n${lines.join('\n')}\n\nUse /approve review:<exact ID> to record one retry. The action is not executed by this command, and its retry remains subject to native review.`
+        : 'No recent native auto-review denials in this session. Denials expire across runtime restarts or session mapping changes.', { ephemeral: true })
+      return
+    }
+    const candidate = entries.find(entry => entry.id === reviewId)
+    if (!candidate) throw new Error('That exact denial is stale, consumed, or belongs to another session')
+    if (candidate.unavailable) throw new Error('This native denial cannot be converted exactly by this client; use the native TUI')
+    if (!this.loadedThreads.has(threadId)) throw new Error('Native thread context is no longer loaded; obtain a fresh denial after recovery')
+    const generation = this.codexGeneration
+    // Consume before the first async RPC boundary. An uncertain acceptance is
+    // not safe to replay, even if the private confirmation cannot be delivered.
+    const denial = this.autoReviewDenials.take(threadId, reviewId)
+    if (!denial) throw new Error('That denial has already been consumed')
+    try {
+      await this.codex.approveGuardianDeniedAction(threadId, denial.event)
+    } catch {
+      await interaction.reply({ content: '⨯ Native retry approval was not confirmed. Its acceptance may be uncertain; this client did not resend it. No broader permissions or command rule were granted. Inspect the session before requesting another retry.' })
+      return
+    }
+    const changed = generation !== this.codexGeneration || this.state.sessions[interaction.channelId]?.codexThreadId !== threadId
+    await interaction.reply({
+      content: `Approval context recorded for one retry of native denial ${discordInlineCode(reviewId)}. The retry still goes through automatic review; this is not execution success. ${changed ? 'The runtime/session changed meanwhile; do not reuse this approval in its replacement context.' : 'Ask Codex to retry that exact action when ready.'}`,
+      allowedMentions: { parse: [] },
+    })
+  }
+
   private async handlePermissionsCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     const parentId = this.parentChannelId(interaction.channel)
     const project = this.requireProject(parentId).project
@@ -4170,6 +4268,11 @@ export class CordexDiscordBot {
       ? this.state.sessions[interaction.channel.id]
       : undefined
     const profile = interaction.options.getString('profile')?.trim()
+    const reviewer = interaction.options.getString('reviewer')?.trim()
+    if (reviewer) {
+      await this.handleReviewerPreference(interaction, profile, reviewer)
+      return
+    }
     if (profile && !session) throw new Error('Selecting a permission profile requires a Cordex thread')
     const directory = session?.directory || project.directory
     await interaction.deferReply()
@@ -4186,7 +4289,7 @@ export class CordexDiscordBot {
       })
       await this.replyWithChunks(
         interaction,
-        `${session ? `Current: \`${session.permissions || this.config.sandbox}\`\n` : ''}${lines.join('\n') || 'No permission profiles reported.'}`,
+        `${session ? `Current: \`${session.permissions || this.config.sandbox}\`\nReviewer preference: \`${session.approvalsReviewer || 'configured default'}\`\n` : ''}${lines.join('\n') || 'No permission profiles reported.'}`,
       )
       return
     }
@@ -4250,6 +4353,68 @@ export class CordexDiscordBot {
       throw error
     }
     await interaction.editReply(`Permission profile: \`${profile}\`.`)
+  }
+
+  private async handleReviewerPreference(
+    interaction: ChatInputCommandInteraction,
+    profile: string | undefined,
+    selection: string,
+  ): Promise<void> {
+    const { session } = this.requireThreadSession(interaction)
+    if (session.archived) throw new Error('Session is archived; run /resume first')
+    if (!['user', 'auto_review', 'default'].includes(selection)) throw new Error('Unknown approvals reviewer')
+    await interaction.deferReply()
+    if (profile && profile !== 'default') {
+      const selected = (await this.codex.listPermissionProfiles(session.directory))
+        .find((entry) => entry.id === profile)
+      if (!selected) throw new Error(`Unknown permission profile: ${profile}`)
+      if (selected.allowed === false) throw new Error(`Permission profile is not allowed: ${profile}`)
+    }
+    const reviewer = selection === 'default'
+      ? await this.codex.configuredApprovalsReviewer(session.directory)
+      : selection as ApprovalsReviewer
+    await this.ensureSessionLoaded(session)
+    const previousPermissions = session.permissions
+    const previousReviewer = session.approvalsReviewer
+    const previousUpdatedAt = session.updatedAt
+    if (profile === 'default') delete session.permissions
+    else if (profile) session.permissions = profile
+    if (selection === 'default') delete session.approvalsReviewer
+    else session.approvalsReviewer = reviewer
+    session.updatedAt = new Date().toISOString()
+    const restore = () => {
+      if (previousPermissions === undefined) delete session.permissions
+      else session.permissions = previousPermissions
+      if (previousReviewer === undefined) delete session.approvalsReviewer
+      else session.approvalsReviewer = previousReviewer
+      session.updatedAt = previousUpdatedAt
+    }
+    try {
+      await saveState(this.state)
+    } catch (error) {
+      restore()
+      throw error
+    }
+    try {
+      await this.codex.updateThreadSettings({
+        threadId: session.codexThreadId,
+        approvalsReviewer: reviewer,
+        ...(profile ? { permissions: profile === 'default' ? null : profile } : {}),
+      })
+    } catch (error) {
+      restore()
+      await saveState(this.state)
+      throw error
+    }
+    this.threadApprovalsReviewers.set(session.codexThreadId, reviewer)
+    const deferred = session.activeTurnId ? ' beginning with the next turn; pending approvals keep their original reviewer' : ''
+    const automatic = reviewer !== 'user'
+    const inactive = session.yoloMode || this.config.approvalPolicy === 'never' ||
+      session.permissions === ':danger-full-access' ||
+      (!session.permissions && this.config.sandbox === 'danger-full-access')
+    await interaction.editReply(
+      `Approval reviewer: ${discordInlineCode(reviewer)}${selection === 'default' ? ' (configured default)' : ''}${deferred}.${profile ? `\nPermission profile: ${discordInlineCode(profile === 'default' ? this.config.sandbox : profile)}.` : ''}${automatic ? `\n${inactive ? '⚠ Full access or approval_policy=never can bypass review. ' : ''}Automatic review only covers actions that require approval; it does not expand filesystem or network permissions.` : ''}`,
+    )
   }
 
   private async handleModelCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -4878,10 +5043,13 @@ export class CordexDiscordBot {
     }
   }
 
-  private async handleNewSessionCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+  private async handleNewSessionCommand(
+    interaction: ChatInputCommandInteraction,
+    preset?: { prompt: string; title: string; validateDirectory: (directory: string) => Promise<string | undefined> },
+  ): Promise<void> {
     const { parentChannelId, project } = this.requireProject(this.parentChannelId(interaction.channel))
-    const prompt = interaction.options.getString('prompt', true)
-    const requestedFiles = interaction.options.getString('files')
+    const prompt = preset?.prompt ?? interaction.options.getString('prompt', true)
+    const requestedFiles = preset ? null : interaction.options.getString('files')
     await interaction.deferReply()
     const sourceThreadId = interaction.channel?.isThread() ? interaction.channel.id : undefined
     let reservedDirectory: string | undefined
@@ -4914,7 +5082,7 @@ export class CordexDiscordBot {
       const files = requestedFiles ? await resolveProjectFiles(directory, requestedFiles) : []
       worktree = inherited
         ? undefined
-        : await this.createAutomaticWorktree(parentChannelId, prompt)
+        : await this.createAutomaticWorktree(parentChannelId, preset?.title || prompt)
       const initialLocation: InitialSessionLocation | undefined = inherited
         ? {
             directory,
@@ -4925,10 +5093,11 @@ export class CordexDiscordBot {
         : worktree
           ? { directory: worktree.directory, worktree }
           : undefined
+      const notice = await preset?.validateDirectory(initialLocation?.directory || directory)
       if (this.removingProjects.has(parentChannelId)) throw new Error('Project is being removed')
       thread = await this.createSessionThread({
         parentChannelId,
-        name: `${worktree || inherited?.worktree ? '⬦ ' : ''}${prompt}`,
+        name: `${worktree || inherited?.worktree ? '⬦ ' : ''}${preset?.title || prompt}`,
         userId: interaction.user.id,
       })
       await this.dispatchInput(
@@ -4945,7 +5114,7 @@ export class CordexDiscordBot {
         initialLocation,
       )
       await interaction.editReply(
-        `Session started: ${thread}${worktree ? `\nWorktree: \`${worktree.branch}\`` : inherited?.worktree ? `\nDirectory: \`${directory}\`` : ''}${files.length ? `\nFiles: ${files.map((file) => `\`${file}\``).join(', ')}` : ''}`,
+        `Session started: ${thread}${worktree ? `\nWorktree: \`${worktree.branch}\`` : inherited?.worktree ? `\nDirectory: \`${directory}\`` : ''}${files.length ? `\nFiles: ${files.map((file) => `\`${file}\``).join(', ')}` : ''}${notice ? `\n${notice}` : ''}`,
       )
     } catch (error) {
       const pendingInitial = thread && this.state.pendingInitialSessions?.[thread.id]
@@ -4969,6 +5138,50 @@ export class CordexDiscordBot {
         else this.pendingSessionDirectoryReservations.set(reservedDirectory, reservations - 1)
       }
     }
+  }
+
+  private async handleInitCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const update = interaction.options.getBoolean('update') ?? false
+    const instructions = interaction.options.getString('instructions') || undefined
+    const prompt = repositoryInitPrompt({ update, ...(instructions ? { instructions } : {}) })
+    if (!interaction.channel?.isThread()) {
+      await this.handleNewSessionCommand(interaction, {
+        prompt,
+        title: update ? 'Refresh AGENTS.md' : 'Initialize AGENTS.md',
+        validateDirectory: async (directory) => {
+          await assertRepositoryInitTarget(directory, update)
+          return repositoryInitOverrideNotice(directory)
+        },
+      })
+      return
+    }
+    const { channel, session } = this.requireThreadSession(interaction)
+    if (session.archived) throw new Error('Session is archived; run /resume first')
+    await interaction.deferReply()
+    await assertRepositoryInitTarget(session.directory, update)
+    const notice = await repositoryInitOverrideNotice(session.directory)
+    const suffix = notice ? `\n${notice}` : ''
+    try {
+      await this.persistAndDeliverDirectPrompt(session, channel, {
+        id: interaction.id,
+        authorId: interaction.user.id,
+        authorName: interaction.user.displayName,
+        input: [{ type: 'text', text: prompt, text_elements: [] }],
+        displayText: update ? '[Refresh AGENTS.md]' : '[Initialize AGENTS.md]',
+        createdAt: new Date().toISOString(),
+        deliveryKind: 'direct',
+      })
+    } catch (error) {
+      if (!this.queueFor(channel.id).some((entry) => entry.id === interaction.id)) throw error
+      await interaction.editReply(
+        `AGENTS.md request is saved, but Codex delivery is deferred. Use /pending-prompts to inspect it.\n${truncate(errorText(error), 900)}${suffix}`,
+      )
+      return
+    }
+    const pending = this.queueFor(channel.id).find((entry) => entry.id === interaction.id)
+    await interaction.editReply(pending
+      ? `AGENTS.md request is saved for later delivery.${pending.reviewRequired ? ' Use /pending-prompts to review it.' : ''}${suffix}`
+      : `AGENTS.md initialization submitted. Codex will report progress and the result in this thread.${suffix}`)
   }
 
   private async handleResumeCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -5047,6 +5260,7 @@ export class CordexDiscordBot {
             ? { permissions: knownSession.permissions }
             : { sandbox: yoloMode ? 'danger-full-access' as const : this.config.sandbox }),
           approvalPolicy: yoloMode ? 'never' as const : this.config.approvalPolicy,
+          ...(knownSession?.approvalsReviewer ? { approvalsReviewer: knownSession.approvalsReviewer } : {}),
         }
 
         let resumed
@@ -5176,6 +5390,7 @@ export class CordexDiscordBot {
         if (knownSession?.worktree) session.worktree = { ...knownSession.worktree }
         if (knownSession?.workspaceRoots) session.workspaceRoots = [...knownSession.workspaceRoots]
         if (knownSession?.permissions) session.permissions = knownSession.permissions
+        if (knownSession?.approvalsReviewer) session.approvalsReviewer = knownSession.approvalsReviewer
         if (resumedFastMode !== undefined) session.fastMode = resumedFastMode
         session.yoloMode = yoloMode
         if (
@@ -5587,6 +5802,7 @@ export class CordexDiscordBot {
         ? { permissions: options.source.permissions }
         : { sandbox: yoloMode ? 'danger-full-access' as const : this.config.sandbox }),
       approvalPolicy: yoloMode ? 'never' : this.config.approvalPolicy,
+      ...(options.source.approvalsReviewer ? { approvalsReviewer: options.source.approvalsReviewer } : {}),
     })
     const modelTransition = !isSubagentFork && options.source.model !== undefined &&
       options.source.model !== forked.model
@@ -5610,6 +5826,7 @@ export class CordexDiscordBot {
       ...(options.source.yoloMode !== undefined ? { yoloMode: options.source.yoloMode } : {}),
       ...(options.source.workspaceRoots ? { workspaceRoots: [...options.source.workspaceRoots] } : {}),
       ...(options.source.permissions ? { permissions: options.source.permissions } : {}),
+      ...(options.source.approvalsReviewer ? { approvalsReviewer: options.source.approvalsReviewer } : {}),
       updatedAt: new Date().toISOString(),
     }
     if (modelTransition) {
@@ -5969,19 +6186,31 @@ export class CordexDiscordBot {
     if (session.abortIntent) throw new Error('Turn abort is still pending')
     if (session.activeTurnId) throw new Error('Wait for active turn or run /abort first')
     const kind = interaction.options.getString('target') || 'uncommitted'
+    const branch = interaction.options.getString('branch')
+    const instructions = interaction.options.getString('instructions')
+    const commit = interaction.options.getString('commit')
+    const title = interaction.options.getString('title')?.trim()
+    if (!['uncommitted', 'base', 'commit', 'custom'].includes(kind)) throw new Error('Unknown review target')
+    if (kind !== 'base' && branch) throw new Error('Branch option requires target=base')
+    if (kind !== 'custom' && instructions) throw new Error('Instructions option requires target=custom')
+    if (kind !== 'commit' && (commit || title)) throw new Error('Commit and title options require target=commit')
     let target: ReviewTarget
     if (kind === 'base') {
-      const branch = interaction.options.getString('branch')
-      if (!branch) throw new Error('Base review requires branch option')
-      target = { type: 'baseBranch', branch }
+      if (!branch?.trim()) throw new Error('Base review requires branch option')
+      target = { type: 'baseBranch', branch: branch.trim() }
+    } else if (kind === 'commit') {
+      if (!commit?.trim()) throw new Error('Commit review requires commit option')
+      target = { type: 'commit', sha: commit, ...(title ? { title } : {}) }
     } else if (kind === 'custom') {
-      const instructions = interaction.options.getString('instructions')
-      if (!instructions) throw new Error('Custom review requires instructions option')
+      if (!instructions?.trim()) throw new Error('Custom review requires instructions option')
       target = { type: 'custom', instructions }
     } else {
       target = { type: 'uncommittedChanges' }
     }
     await interaction.deferReply()
+    if (target.type === 'commit') {
+      target.sha = await resolveGitCommit({ cwd: session.directory, revision: target.sha })
+    }
     await this.ensureSessionLoaded(session)
     const review = await this.codex.startReview({
       threadId: session.codexThreadId,
@@ -5992,7 +6221,9 @@ export class CordexDiscordBot {
     session.updatedAt = new Date().toISOString()
     this.startRun(session, channel)
     await saveState(this.state)
-    await interaction.editReply(`Review started (${kind}).`)
+    await interaction.editReply(target.type === 'commit'
+      ? `Review started (commit ${discordInlineCode(target.sha)}).`
+      : `Review started (${kind}).`)
   }
 
   private async handleRollbackCommand(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -6739,6 +6970,7 @@ export class CordexDiscordBot {
           ? { permissions: session.permissions }
           : { sandbox: session.yoloMode ? 'danger-full-access' as const : this.config.sandbox }),
         approvalPolicy: session.yoloMode ? 'never' : this.config.approvalPolicy,
+        ...(session.approvalsReviewer ? { approvalsReviewer: session.approvalsReviewer } : {}),
       })
       const modelTransition = session.model !== undefined && session.model !== forked.model
       const thread = await this.createSessionThread({
@@ -6758,6 +6990,7 @@ export class CordexDiscordBot {
         ...(session.yoloMode !== undefined ? { yoloMode: session.yoloMode } : {}),
         ...(session.workspaceRoots ? { workspaceRoots: [...session.workspaceRoots] } : {}),
         ...(session.permissions ? { permissions: session.permissions } : {}),
+        ...(session.approvalsReviewer ? { approvalsReviewer: session.approvalsReviewer } : {}),
         worktree: {
           projectDirectory: created.projectDirectory,
           directory: created.directory,
@@ -7975,6 +8208,7 @@ export class CordexDiscordBot {
           ? { permissions: session.permissions }
           : { sandbox: session.yoloMode ? 'danger-full-access' as const : this.config.sandbox }),
         approvalPolicy: session.yoloMode ? 'never' : this.config.approvalPolicy,
+        ...(session.approvalsReviewer ? { approvalsReviewer: session.approvalsReviewer } : {}),
       })
     } catch (error) {
       if (this.isMissingCodexRolloutError(error, threadId)) return true
@@ -8016,6 +8250,7 @@ export class CordexDiscordBot {
         ? { permissions: session.permissions }
         : { sandbox: session.yoloMode ? 'danger-full-access' as const : this.config.sandbox }),
       approvalPolicy: session.yoloMode ? 'never' : this.config.approvalPolicy,
+      ...(session.approvalsReviewer ? { approvalsReviewer: session.approvalsReviewer } : {}),
     })
     this.assertCodexSessionLinked(session)
     const oldThreadId = session.codexThreadId
@@ -8354,6 +8589,112 @@ export class CordexDiscordBot {
     )
   }
 
+  private async runtimeRestartBlockers(): Promise<string[]> {
+    const blockers: string[] = []
+    if (this.runtimeRestartRequested || this.stopping) blockers.push('a shutdown or restart is already pending')
+    if (this.codexRecoveryPromise || this.codexUnavailableError) blockers.push('the Codex runtime is recovering or unavailable')
+    if (this.runs.size > 0 || Object.values(this.state.sessions).some((session) => session.activeTurnId)) {
+      blockers.push('a Codex turn is active or being finalized')
+    }
+    if (this.pendingTurnStarts.size > 0 || Object.keys(this.state.pendingInitialSessions || {}).length > 0) {
+      blockers.push('session or turn creation is pending')
+    }
+    if (Object.values(this.state.queues).some((queue) => queue.length > 0)) {
+      blockers.push('queued or uncertain prompts remain')
+    }
+    if ((this.state.discordOutbox?.length || 0) > 0 || this.discordOutboxRetryTimer) {
+      blockers.push('Discord output is pending delivery')
+    }
+    if (Object.values(this.state.tasks).some((task) => task.status === 'running')) {
+      blockers.push('a scheduled occurrence is running')
+    }
+    if (Object.values(this.state.sessions).some((session) => session.lifecycleIntent || session.abortIntent)) {
+      blockers.push('a session lifecycle or abort intent is pending')
+    }
+    if (
+      this.approvals.size > 0 ||
+      this.pendingUserInputs.size > 0 ||
+      this.pendingActionButtons.size > 0 ||
+      this.pendingMcpElicitations.size > 0 ||
+      this.pendingRequestControls.size > 0
+    ) blockers.push('an approval, question, action, or elicitation is pending')
+    if (
+      this.archivingDiscordThreads.size > 0 ||
+      this.removingProjects.size > 0 ||
+      this.pendingSessionDirectoryReservations.size > 0
+    ) blockers.push('a project or session mutation is pending')
+    if (blockers.length > 0) return blockers
+
+    try {
+      const terminals = await Promise.all(
+        [...this.loadedThreads].map((threadId) => this.codex.listBackgroundTerminals(threadId)),
+      )
+      if (terminals.some((entries) => entries.length > 0)) blockers.push('a background terminal is still running')
+    } catch {
+      blockers.push('background-terminal readiness could not be verified')
+    }
+    return blockers
+  }
+
+  private async handleRestartCommand(interaction: ChatInputCommandInteraction): Promise<void> {
+    const { channel, session } = this.requireThreadSession(interaction)
+    if (!this.config.runtimeRestartUserIds?.includes(interaction.user.id)) {
+      throw new Error('Runtime restart is disabled for this Discord user')
+    }
+    if (!this.options.requestRuntimeRestart) throw new Error('This Cordex host does not support managed restart handoff')
+
+    const blockers = await this.runtimeRestartBlockers()
+    const confirm = interaction.options.getString('confirm')?.trim()
+    if (!confirm) {
+      await interaction.reply({
+        content: blockers.length > 0
+          ? `Runtime restart is currently blocked:\n${blockers.map((blocker) => `• ${blocker}`).join('\n')}`
+          : `Runtime restart is ready. Re-run /restart with confirm set to the exact current session ID ${discordInlineCode(session.codexThreadId)}. The host must use a restart-on-failure supervisor; Cordex exits with code 75.`,
+        allowedMentions: { parse: [] },
+      })
+      return
+    }
+    if (confirm !== session.codexThreadId) throw new Error('Restart confirmation must exactly match the current Codex session ID')
+    if (blockers.length > 0) throw new Error(`Runtime restart blocked: ${blockers.join('; ')}`)
+
+    this.runtimeRestartRequested = true
+    const requestedAt = new Date().toISOString()
+    const epochSeconds = Math.floor(Date.parse(requestedAt) / 1_000)
+    const restartId = interaction.id
+    const turnId = `cordex-restart:${restartId}`
+    const itemKey = 'replacement-ready'
+    try {
+      await interaction.reply({
+        content: 'Restart checks passed. Persisting the supervisor handoff now; Cordex has not exited yet.',
+        allowedMentions: { parse: [] },
+      })
+      await this.stageDurableDiscordOutput({
+        channel,
+        codexThreadId: session.codexThreadId,
+        turnId,
+        itemKey,
+        value: `✓ Cordex restarted after the supervisor handoff requested <t:${epochSeconds}:R>. This confirms the replacement reached Discord and recovered the durable outbox. Use /status to verify session state.`,
+        suppressNotifications: false,
+        format: false,
+      })
+      const staged = this.state.discordOutbox?.some((entry) =>
+        entry.discordThreadId === channel.id &&
+        entry.codexThreadId === session.codexThreadId &&
+        entry.turnId === turnId &&
+        entry.itemKey === itemKey)
+      if (!staged) throw new Error('Durable restart completion could not be staged')
+      await interaction.reply({
+        content: 'Restart handoff persisted. Cordex is exiting with code 75 and waiting for the configured external supervisor.',
+        allowedMentions: { parse: [] },
+      }).catch(() => undefined)
+    } catch (error) {
+      this.runtimeRestartRequested = false
+      throw error
+    }
+
+    setImmediate(() => this.options.requestRuntimeRestart?.())
+  }
+
   private async handleStatusCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     const parentId = this.parentChannelId(interaction.channel)
     if (!parentId) throw new Error('Status requires a project channel')
@@ -8378,7 +8719,7 @@ export class CordexDiscordBot {
     const policy = yolo
       ? { sandbox: 'danger-full-access', approval: 'never' }
       : session?.permissions
-        ? { sandbox: 'controlled by permission profile', approval: 'controlled by permission profile' }
+        ? { sandbox: 'controlled by permission profile', approval: this.config.approvalPolicy }
         : { sandbox: this.config.sandbox, approval: this.config.approvalPolicy }
     const writableRoots = yolo || (!session?.permissions && this.config.sandbox === 'danger-full-access')
       ? 'unrestricted'
@@ -8407,6 +8748,8 @@ export class CordexDiscordBot {
       `Sandbox${active ? ' (next turn)' : ''}: ${policy.sandbox}`,
       `Approval policy${active ? ' (next turn)' : ''}: ${policy.approval}`,
       ...(session?.permissions ? [`Permission profile: ${discordInlineCode(session.permissions)}${yolo ? ' (bypassed by YOLO)' : ''}`] : []),
+      ...(active ? [`Current turn reviewer: ${run?.approvalsReviewer || 'configured default (not captured)'}`] : []),
+      `Reviewer preference${active ? ' (next turn)' : ''}: ${session?.approvalsReviewer || 'configured default'}`,
       `Writable roots${active ? ' (next turn)' : ''}: ${writableRoots}`,
       `Context usage: ${context}`,
       `Auto worktrees: ${this.state.channelAutoWorktrees[parentId] ? 'enabled' : 'disabled'}`,
@@ -9132,6 +9475,7 @@ export class CordexDiscordBot {
         ...(session.effort ? { effort: session.effort } : {}),
         ...(serviceTier !== undefined ? { serviceTier } : {}),
         ...(session.mode ? { mode: session.mode } : {}),
+        ...(session.approvalsReviewer ? { approvalsReviewer: session.approvalsReviewer } : {}),
         ...(runtimeRoots ? { runtimeWorkspaceRoots: runtimeRoots } : {}),
         ...(!session.yoloMode && session.permissions ? { permissions: session.permissions } : {}),
         ...(session.yoloMode
@@ -9588,6 +9932,10 @@ export class CordexDiscordBot {
       startedAt,
       agentText: new Map(),
       activeItems: new Map(),
+      autoReviews: new Map(),
+      ...(session.approvalsReviewer || this.threadApprovalsReviewers.get(session.codexThreadId)
+        ? { approvalsReviewer: session.approvalsReviewer || this.threadApprovalsReviewers.get(session.codexThreadId)! }
+        : {}),
       typingTimer,
       visibleOutput: false,
       lastProgressAt: startedAt,
@@ -9783,6 +10131,7 @@ export class CordexDiscordBot {
       return
     }
     if (notification.method === 'warning' || notification.method === 'guardianWarning') {
+      if (this.handleLegacyAutoReviewWarning(notification.params, generation)) return
       await this.onWarning(notification.params)
       return
     }
@@ -9839,6 +10188,17 @@ export class CordexDiscordBot {
       await this.adoptCodexStartedRun(notification.params, true)
     if (!run || !this.notificationMatchesRun(run, notification.params)) return
     if (notification.method === 'item/started') await this.onItemStarted(run, notification.params)
+    else if (notification.method === 'item/autoApprovalReview/started' || notification.method === 'item/autoApprovalReview/completed') {
+      await this.onAutoApprovalReview(run, notification.method, notification.params)
+    }
+    else if (notification.method === 'autoApprovalReview/strictReviewRequired') {
+      const startedAt = typeof notification.params.startedAtMs === 'number' &&
+        Number.isSafeInteger(notification.params.startedAtMs) && notification.params.startedAtMs >= 0
+        ? String(notification.params.startedAtMs)
+        : 'unidentified'
+      await this.reportRunNotice(run, notification.params, `auto-review:strict:${startedAt}`,
+        '⚠ Codex requires a stricter automatic approval review for this turn. This notice is not an approval or an execution result.', true)
+    }
     else if (notification.method === 'item/agentMessage/delta') this.onAgentDelta(run, notification.params)
     else if (notification.method === 'item/completed') await this.onItemCompleted(run, notification.params)
     else if (notification.method === 'model/verification') await this.onModelVerification(run, notification.params)
@@ -9928,6 +10288,10 @@ export class CordexDiscordBot {
     const threadId = text(params.threadId)
     const settings = isRecord(params.threadSettings) ? params.threadSettings : undefined
     if (!threadId || !settings) return
+    const reviewer = text(settings.approvalsReviewer)
+    if (reviewer === 'user' || reviewer === 'auto_review' || reviewer === 'guardian_subagent') {
+      this.threadApprovalsReviewers.set(threadId, reviewer)
+    }
     const model = text(settings.model)
     const effort = settings.effort === null ? null : reasoningEffort(settings.effort)
     const serviceTier = settings.serviceTier === null || typeof settings.serviceTier === 'string'
@@ -10157,12 +10521,18 @@ export class CordexDiscordBot {
 
   private onThreadClosed(params: JsonObject): void {
     const threadId = text(params.threadId)
-    if (threadId) this.loadedThreads.delete(threadId)
+    if (threadId) {
+      this.loadedThreads.delete(threadId)
+      // Exact retry context is only valid while this native thread context is
+      // loaded. A later resume must obtain a fresh denial.
+      this.autoReviewDenials.delete(threadId)
+    }
   }
 
   private async onThreadDeleted(params: JsonObject): Promise<void> {
     const threadId = text(params.threadId)
     if (!threadId) return
+    this.autoReviewDenials.delete(threadId)
     this.loadedThreads.delete(threadId)
     this.pendingTurnStarts.delete(threadId)
     this.preserveArchivedUntilResume.delete(threadId)
@@ -10301,9 +10671,7 @@ export class CordexDiscordBot {
       suppressNotifications: true,
     })
     run.visibleOutput = true
-    await this.drainDiscordOutbox(run.channel).then(() => {
-      run.lastVisibleOutputAt = Date.now()
-    }).catch((error: unknown) => {
+    await this.drainDiscordOutbox(run.channel).catch((error: unknown) => {
       this.logVerbose('turn item delivery deferred', {
         threadId: run.session.codexThreadId,
         itemId,
@@ -10344,9 +10712,7 @@ export class CordexDiscordBot {
         })
       })
       run.visibleOutput = true
-      await this.drainDiscordOutbox(run.channel).then(() => {
-        run.lastVisibleOutputAt = Date.now()
-      }).catch((error: unknown) => {
+      await this.drainDiscordOutbox(run.channel).catch((error: unknown) => {
         this.logVerbose('generated-image delivery deferred', {
           threadId: run.session.codexThreadId,
           itemId,
@@ -10397,41 +10763,131 @@ export class CordexDiscordBot {
     itemKey: string,
     value: string,
     suppressNotifications: boolean,
-  ): Promise<void> {
+  ): Promise<boolean> {
+    const identity = {
+      discordThreadId: run.channel.id,
+      codexThreadId: run.session.codexThreadId,
+      turnId: this.durableTurnId(run, params),
+    }
+    const outputKey = discordOutboxOutputKey({ ...identity, itemKey })
     try {
       await this.stageDurableDiscordOutput({
         channel: run.channel,
-        codexThreadId: run.session.codexThreadId,
-        turnId: this.durableTurnId(run, params),
+        codexThreadId: identity.codexThreadId,
+        turnId: identity.turnId,
         itemKey,
         value,
         suppressNotifications,
         format: false,
       })
+      // Staging can be a no-op after a session was replaced or deleted. Only
+      // claim a notice when it is durable, already delivered, or actually sent.
+      if (!this.state.discordOutboxDeliveredKeys?.includes(outputKey) &&
+        !this.state.discordOutbox?.some((entry) => discordOutboxOutputKey(entry) === outputKey)) return false
     } catch (error) {
       this.logVerbose('Codex event notice persistence failed', {
         threadId: run.session.codexThreadId,
         itemKey,
         error: errorText(error),
       })
+      let sent = false
       await run.channel.send({
         content: value,
         allowedMentions: { parse: [] },
         ...(suppressNotifications ? { flags: MessageFlags.SuppressNotifications } : {}),
-      }).then(() => {
-        run.lastVisibleOutputAt = Date.now()
+      }).then((message) => {
+        sent = true
+        this.recordVisibleDiscordOutput(identity, message)
       }).catch(() => undefined)
-      return
+      return sent
     }
-    await this.drainDiscordOutbox(run.channel).then(() => {
-      run.lastVisibleOutputAt = Date.now()
-    }).catch((error: unknown) => {
+    await this.drainDiscordOutbox(run.channel).catch((error: unknown) => {
       this.logVerbose('Codex event notice delivery deferred', {
         threadId: run.session.codexThreadId,
         itemKey,
         error: errorText(error),
       })
     })
+    return true
+  }
+
+  private handleLegacyAutoReviewWarning(params: JsonObject, generation: number): boolean {
+    const message = text(params.message)
+    const parsed = message ? parseLegacyAutoReviewWarning(message) : undefined
+    const run = parsed ? this.findRun(params) : undefined
+    if (!parsed || !run || !this.notificationMatchesRun(run, params)) return false
+    const signature = autoReviewSignature(parsed)
+    if (!signature) return false
+    const threadId = run.session.codexThreadId
+    const context = { ...params, threadId, turnId: this.durableTurnId(run, params) }
+    // Native 0.159 emits the legacy warning immediately before the structured
+    // completion. Keep a delayed fallback if that completion is unavailable.
+    this.trackBackgroundWork(new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, 2_000)
+      timer.unref()
+    }).then(() => this.codexEventQueue.run(threadId, async () => {
+      // Join the same thread queue as native completions. A slow earlier send
+      // must not let this timer overtake an already-received structured result.
+      if (this.stopping || generation !== this.codexGeneration ||
+        run.autoReviewSummaries?.has(signature) ||
+        this.deletedDiscordThreads.has(run.channel.id) ||
+        this.state.sessions[run.channel.id]?.codexThreadId !== threadId) return
+      const reported = await this.reportRunNotice(run, context, `auto-review:legacy:${signature}`,
+        formatAutoReviewNotice(parsed, this.verbosityFor(run.session)), true)
+      if (reported) (run.autoReviewSummaries ??= new Set()).add(signature)
+    })), 'automatic-review legacy fallback')
+    return true
+  }
+
+  private async onAutoApprovalReview(
+    run: ActiveRun,
+    method: string,
+    params: JsonObject,
+  ): Promise<void> {
+    const reviewId = text(params.reviewId)
+    if (!reviewId) {
+      await this.reportRunNotice(run, params, `auto-review:unidentified:${method}`,
+        '⚠ Codex sent an automatic-review notice without its review ID; this client cannot track that result reliably.', true)
+      return
+    }
+    const completed = method.endsWith('/completed')
+    const review = isRecord(params.review) ? params.review : undefined
+    const status = review ? text(review.status) : undefined
+    const terminal = completed && ['approved', 'denied', 'timedOut', 'aborted'].includes(status || '')
+    if (terminal && status === 'denied') this.autoReviewDenials.record(run.session.codexThreadId, params)
+    const key = `auto-review:${reviewId}`
+    const statuses = run.autoReviews ??= new Map()
+    const completionItemKey = `${key}:completed`
+    const completionOutputKey = discordOutboxOutputKey({
+      discordThreadId: run.channel.id,
+      codexThreadId: run.session.codexThreadId,
+      turnId: this.durableTurnId(run, params),
+      itemKey: completionItemKey,
+    })
+    if (statuses.get(reviewId) === 'completed' ||
+      this.state.discordOutboxDeliveredKeys?.includes(completionOutputKey) ||
+      this.state.discordOutbox?.some((entry) => entry.turnId === this.durableTurnId(run, params) &&
+        entry.codexThreadId === run.session.codexThreadId && entry.itemKey === completionItemKey)) return
+    if (!completed && statuses.get(reviewId) === 'started') return
+    const signature = terminal ? autoReviewSignature(params) : undefined
+    run.approvalsReviewer = 'auto_review'
+    if (completed) run.activeItems.delete(key)
+    else run.activeItems.set(key, 'waiting for automatic approval review')
+    const displayedParams = completed && !terminal
+      ? { ...params, review: { ...review, status: 'unknown' } }
+      : params
+    const reported = await this.reportRunNotice(
+      run,
+      params,
+      terminal ? completionItemKey : completed ? `${key}:unknown` : `progress:${key}:started`,
+      formatAutoReviewNotice(displayedParams, this.verbosityFor(run.session)),
+      true,
+    )
+    if (reported) {
+      if (signature) (run.autoReviewSummaries ??= new Set()).add(signature)
+      if (terminal) statuses.set(reviewId, 'completed')
+      else if (!completed) statuses.set(reviewId, 'started')
+    }
   }
 
   private async onModelVerification(run: ActiveRun, params: JsonObject): Promise<void> {

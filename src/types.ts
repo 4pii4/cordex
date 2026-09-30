@@ -1,5 +1,6 @@
 export type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access'
 export type ApprovalPolicy = 'untrusted' | 'on-request' | 'never'
+export type ApprovalsReviewer = 'user' | 'auto_review' | 'guardian_subagent'
 export type ReasoningEffort =
   | 'minimal'
   | 'low'
@@ -30,6 +31,7 @@ export type CordexConfig = {
   allowShellCommands: boolean
   allowedUserIds?: string[]
   allowedRoleIds?: string[]
+  runtimeRestartUserIds?: string[]
   categoryId?: string
   projectsDirectory?: string
   projects: Record<string, ProjectConfig>
@@ -63,6 +65,7 @@ export type SessionState = {
   mode?: 'default' | 'plan'
   workspaceRoots?: string[]
   permissions?: string
+  approvalsReviewer?: ApprovalsReviewer
   worktree?: {
     projectDirectory: string
     directory: string

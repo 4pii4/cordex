@@ -13,7 +13,11 @@ npm ci
 npm run check
 ```
 
-`npm run check` builds the TypeScript project and runs the local test suite.
+`npm run check` builds the TypeScript project and runs the local test suite in a
+generated isolated Cordex home. It never uses ambient `CORDEX_HOME`. Set
+`CORDEX_TEST_KEEP_HOME=1` when the generated state is needed for debugging, or
+set `CORDEX_TEST_HOME` to an existing empty safe directory outside your home and
+the repository. The wrapper never deletes an explicit test home.
 
 ## Pull requests
 

@@ -144,10 +144,28 @@ export function buildSlashCommands() {
       )
       .setDMPermission(false),
     new SlashCommandBuilder()
+      .setName('approve')
+      .setDescription(discordDescription('List native auto-review denials or approve one exact retry'))
+      .addStringOption((option) => option
+        .setName('review')
+        .setDescription(discordDescription('Exact recent denied review ID; omit to list'))
+        .setAutocomplete(true))
+      .setDMPermission(false),
+    new SlashCommandBuilder()
       .setName('permissions')
       .setDescription(discordDescription('List or select a Codex permission profile for this session'))
       .addStringOption((option) =>
         option.setName('profile').setDescription(discordDescription('Profile ID, or default to clear override')),
+      )
+      .addStringOption((option) =>
+        option
+          .setName('reviewer')
+          .setDescription(discordDescription('Who reviews approval requests for subsequent turns'))
+          .addChoices(
+            { name: 'ask me', value: 'user' },
+            { name: 'automatic review', value: 'auto_review' },
+            { name: 'configured default', value: 'default' },
+          ),
       )
       .setDMPermission(false),
     new SlashCommandBuilder()
@@ -162,6 +180,19 @@ export function buildSlashCommands() {
           .setDescription(discordDescription('Comma-separated files; longer lists can be typed manually'))
           .setAutocomplete(true)
           .setMaxLength(6_000),
+      )
+      .setDMPermission(false),
+    new SlashCommandBuilder()
+      .setName('init')
+      .setDescription(discordDescription('Generate project guidance in AGENTS.md for the current directory'))
+      .addBooleanOption((option) =>
+        option.setName('update').setDescription(discordDescription('Refresh an existing guide while preserving its instructions')),
+      )
+      .addStringOption((option) =>
+        option
+          .setName('instructions')
+          .setDescription(discordDescription('Additional project guidance to include'))
+          .setMaxLength(2_000),
       )
       .setDMPermission(false),
     new SlashCommandBuilder()
@@ -250,10 +281,13 @@ export function buildSlashCommands() {
           .addChoices(
             { name: 'uncommitted changes', value: 'uncommitted' },
             { name: 'base branch', value: 'base' },
+            { name: 'specific commit', value: 'commit' },
             { name: 'custom instructions', value: 'custom' },
           ),
       )
       .addStringOption((option) => option.setName('branch').setDescription(discordDescription('Base branch, when target=base')))
+      .addStringOption((option) => option.setName('commit').setDescription(discordDescription('Git commit SHA or revision, when target=commit')).setMaxLength(512))
+      .addStringOption((option) => option.setName('title').setDescription(discordDescription('Optional commit review title, when target=commit')).setMaxLength(200))
       .addStringOption((option) => option.setName('instructions').setDescription(discordDescription('Custom review instructions')))
       .setDMPermission(false),
     new SlashCommandBuilder()
@@ -561,6 +595,13 @@ export function buildSlashCommands() {
     new SlashCommandBuilder()
       .setName('status')
       .setDescription(discordDescription('Show Cordex session status'))
+      .setDMPermission(false),
+    new SlashCommandBuilder()
+      .setName('restart')
+      .setDescription(discordDescription('Safely hand Cordex to an external restart-on-failure supervisor'))
+      .addStringOption((option) => option
+        .setName('confirm')
+        .setDescription(discordDescription('Exact current Codex session ID; omit for readiness check')))
       .setDMPermission(false),
     new SlashCommandBuilder()
       .setName('debug-config')

@@ -84,6 +84,9 @@ async function init(): Promise<void> {
       ...(!guildChanged && existing?.allowedRoleIds
         ? { allowedRoleIds: existing.allowedRoleIds }
         : {}),
+      ...(!guildChanged && existing?.runtimeRestartUserIds
+        ? { runtimeRestartUserIds: existing.runtimeRestartUserIds }
+        : {}),
       ...(!guildChanged && existing?.categoryId ? { categoryId: existing.categoryId } : {}),
       ...(process.env.CORDEX_PROJECTS_DIR
         ? { projectsDirectory: path.resolve(process.env.CORDEX_PROJECTS_DIR) }
@@ -259,23 +262,36 @@ async function start(verbose = false): Promise<void> {
     throw error
   }
   const codex = new CodexAppServer({ verbose })
-  const bot = new CordexDiscordBot(config, state, codex, { verbose, interruptedOnStartup })
+  let requestRuntimeRestart = (): void => undefined
+  const bot = new CordexDiscordBot(config, state, codex, {
+    verbose,
+    interruptedOnStartup,
+    requestRuntimeRestart: () => requestRuntimeRestart(),
+  })
   let ipc: CordexDaemonIpcServer | undefined
   let shutdown: Promise<void> | undefined
-  const stop = (setExitCode: boolean): Promise<void> => {
+  let requestedExitCode: number | undefined
+  const stop = (exitCode?: number): Promise<void> => {
+    if (exitCode !== undefined && requestedExitCode === undefined) requestedExitCode = exitCode
     shutdown ??= (async () => {
       try {
         await ipc?.close()
         await bot.stop()
-        if (setExitCode) process.exitCode = 0
       } finally {
         await releaseRuntimeLock()
+        if (requestedExitCode !== undefined) process.exitCode = requestedExitCode
       }
     })()
     return shutdown
   }
-  process.once('SIGINT', () => void stop(true))
-  process.once('SIGTERM', () => void stop(true))
+  requestRuntimeRestart = () => {
+    void stop(75).catch((error: unknown) => {
+      console.error(`Cordex managed restart shutdown failed: ${error instanceof Error ? error.message : String(error)}`)
+      process.exitCode = 1
+    })
+  }
+  process.once('SIGINT', () => void stop(0))
+  process.once('SIGTERM', () => void stop(0))
   try {
     await bot.start()
     if (shutdown) {
@@ -319,7 +335,7 @@ async function start(verbose = false): Promise<void> {
     ipc = startedIpc
   } catch (error) {
     const shutdownAlreadyRequested = shutdown !== undefined
-    await stop(false).catch(() => undefined)
+    await stop().catch(() => undefined)
     if (shutdownAlreadyRequested) return
     throw error
   }
