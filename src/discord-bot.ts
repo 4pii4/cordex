@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import path from 'node:path'
 import { monitorEventLoopDelay } from 'node:perf_hooks'
 import {
@@ -425,6 +425,7 @@ class CordexStoppingError extends Error {
 }
 
 export class CordexDiscordBot {
+  private readonly runtimeInstanceId = randomUUID()
   readonly client: Client
   private readonly logger: StructuredLogger
   private readonly eventLoopDelay = monitorEventLoopDelay({ resolution: 20 })
@@ -1111,7 +1112,7 @@ export class CordexDiscordBot {
       }
     })))
     await saveState(this.state)
-    if (announceRestart && generation === this.codexLifecycleGeneration()) {
+    if (announceRestart) {
       await Promise.all([...this.restartAffectedChannels].map(async (channelId) => {
         const run = interruptedRuns.find((candidate) => candidate.channel.id === channelId)
         const codexThreadId = run?.session.codexThreadId ||
@@ -1119,7 +1120,7 @@ export class CordexDiscordBot {
         await this.queueRuntimeNotice({
           discordThreadId: channelId,
           codexThreadId,
-          turnId: `runtime-restart:${generation}`,
+          turnId: `runtime-restart:${this.runtimeInstanceId}:${generation}`,
           itemKey: `attempt:${event.attempt}`,
           value: `⚠ Codex runtime stopped unexpectedly and is restarting (attempt ${event.attempt}). The interrupted turn was ended.`,
         }).catch((error: unknown) => {
@@ -1165,7 +1166,7 @@ export class CordexDiscordBot {
       await this.queueRuntimeNotice({
         discordThreadId: channelId,
         codexThreadId: this.state.sessions[channelId]?.codexThreadId || 'runtime',
-        turnId: `runtime-recovery:${generation}`,
+        turnId: `runtime-recovery:${this.runtimeInstanceId}:${generation}`,
         itemKey: 'recovered',
         value: '✓ Codex runtime recovered.',
       }).catch((error: unknown) => {
@@ -1181,7 +1182,7 @@ export class CordexDiscordBot {
       await this.queueRuntimeNotice({
         discordThreadId: channelId,
         codexThreadId: this.state.sessions[channelId]?.codexThreadId || 'runtime',
-        turnId: `runtime-recovery:${this.codexLifecycleGeneration()}`,
+        turnId: `runtime-recovery:${this.runtimeInstanceId}:${this.codexLifecycleGeneration()}`,
         itemKey: 'failed',
         value: `⨯ Codex runtime recovery failed: ${truncate(error.message, 1_750)}`,
       }).catch((noticeError: unknown) => {
