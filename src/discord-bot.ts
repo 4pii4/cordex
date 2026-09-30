@@ -3131,6 +3131,12 @@ export class CordexDiscordBot {
       await this.reconcileDeletedThreadIntents()
       changed = true
     }
+    for (const [threadId, queue] of Object.entries(this.state.queues)) {
+      if (queue.length > 0 || this.state.sessions[threadId] ||
+        this.state.pendingInitialSessions?.[threadId]) continue
+      delete this.state.queues[threadId]
+      changed = true
+    }
     if (changed) await saveState(this.state)
   }
 
@@ -8072,12 +8078,18 @@ export class CordexDiscordBot {
           if (action === 'discard') {
             const previousQueue = [...queue]
             const previousReviews = queue.map((prompt) => prompt.reviewRequired === true)
+            let removedEmptyQueue = false
             queue.splice(queue.indexOf(selected), 1)
             if (queue.length > 0) queue[0]!.reviewRequired = true
-            else delete this.state.pendingInitialSessions![channel.id]
+            else {
+              delete this.state.pendingInitialSessions![channel.id]
+              delete this.state.queues[channel.id]
+              removedEmptyQueue = true
+            }
             try {
               await saveState(this.state)
             } catch (error) {
+              if (removedEmptyQueue) this.state.queues[channel.id] = queue
               queue.splice(0, queue.length, ...previousQueue)
               previousQueue.forEach((prompt, index) => {
                 if (previousReviews[index]) prompt.reviewRequired = true

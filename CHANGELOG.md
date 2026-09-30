@@ -12,6 +12,9 @@ All notable changes to Cordex are documented here. The project follows
 - Scoped Codex runtime restart/recovery notice identities to each Cordex process
   and retained restart warnings when a fast replacement becomes ready before
   state-reset persistence finishes.
+- Removed empty queue records when the last pending new-session prompt is
+  discarded, while retaining rollback on persistence failure, and pruned
+  legacy empty unlinked queue records during startup.
 
 ## [0.3.0] - 2026-10-01
 
