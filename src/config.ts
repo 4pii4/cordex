@@ -370,10 +370,26 @@ function parsePendingInitialSessions(value: unknown): Record<string, PendingInit
           branch: raw.worktree.branch,
         }
       : undefined
+    const rawAbortIntent = isRecord(raw.abortIntent) ? raw.abortIntent : undefined
+    const abortIntent = rawAbortIntent &&
+      typeof rawAbortIntent.requestedAt === 'string' &&
+      Number.isFinite(Date.parse(rawAbortIntent.requestedAt))
+      ? {
+          requestedAt: rawAbortIntent.requestedAt,
+          ...(typeof rawAbortIntent.codexThreadId === 'string' && rawAbortIntent.codexThreadId
+            ? { codexThreadId: rawAbortIntent.codexThreadId }
+            : {}),
+          ...(typeof rawAbortIntent.reconciledAt === 'string' &&
+            Number.isFinite(Date.parse(rawAbortIntent.reconciledAt))
+            ? { reconciledAt: rawAbortIntent.reconciledAt }
+            : {}),
+        }
+      : undefined
     return [[threadId, {
       parentChannelId: raw.parentChannelId,
       directory: path.resolve(raw.directory),
       createdAt: raw.createdAt,
+      ...(abortIntent ? { abortIntent } : {}),
       ...(typeof raw.model === 'string' && raw.model ? { model: raw.model } : {}),
       ...(efforts.has(raw.effort as ReasoningEffort)
         ? { effort: raw.effort as ReasoningEffort }

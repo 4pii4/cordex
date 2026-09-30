@@ -100,6 +100,11 @@ export type PendingInitialSession = {
   parentChannelId: string
   directory: string
   createdAt: string
+  abortIntent?: {
+    requestedAt: string
+    codexThreadId?: string
+    reconciledAt?: string
+  }
   model?: string
   effort?: ReasoningEffort
   fastMode?: boolean

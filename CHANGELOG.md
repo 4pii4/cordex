@@ -15,6 +15,9 @@ All notable changes to Cordex are documented here. The project follows
 - Removed empty queue records when the last pending new-session prompt is
   discarded, while retaining rollback on persistence failure, and pruned
   legacy empty unlinked queue records during startup.
+- Made `/abort` durable during pre-ID Codex session creation: the saved prompt
+  is held for review, a later successful `thread/start` is deleted instead of
+  delivered, and restart recovery finishes any persisted cleanup.
 
 ## [0.3.0] - 2026-10-01
 

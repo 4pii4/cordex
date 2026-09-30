@@ -2051,6 +2051,14 @@ export class CordexDiscordBot {
     for (const [threadId, pending] of Object.entries(this.state.pendingInitialSessions || {})) {
       if (this.state.sessions[threadId]) continue
       if (!this.queueFor(threadId).length) continue
+      if (pending.abortIntent) {
+        await this.reconcilePendingInitialAbort(threadId, pending).catch((error: unknown) => {
+          this.logVerbose('pending initial-session abort recovery failed', {
+            discordThreadId: threadId,
+            error: errorText(error),
+          })
+        })
+      }
       const channel = await this.client.channels.fetch(threadId).catch(() => undefined)
       if (!channel?.isThread() || channel.guildId !== this.config.guildId ||
         channel.parentId !== pending.parentChannelId) continue
@@ -5142,9 +5150,9 @@ export class CordexDiscordBot {
         await thread.delete('Cordex session could not be started').catch(() => undefined)
       }
       if (thread && pendingInitial) {
-        await interaction.editReply(
-          `Codex session creation is pending review in ${thread}. Your initial prompt is saved; open that thread and use /pending-prompts.`,
-        )
+        await interaction.editReply(pendingInitial.abortIntent
+          ? `Codex session creation was cancelled in ${thread}. Saved prompts are held; open that thread and use /pending-prompts.`
+          : `Codex session creation is pending review in ${thread}. Your initial prompt is saved; open that thread and use /pending-prompts.`)
         return
       }
       throw error
@@ -7523,7 +7531,9 @@ export class CordexDiscordBot {
       codexThreadId: `pending-session:${channel.id}`,
       turnId: `pending-start:${this.queuedPromptDeliveryId(first)}`,
       itemKey: 'review',
-      value: `⚠ Cordex could not confirm Codex session creation. The first prompt is saved and will not run automatically. Source ID: ${discordInlineCode(this.queuedPromptDeliveryId(first))}. Review it with /pending-prompts, then use /resolve-pending to retry or discard it. Later work is held too.`,
+      value: pending.abortIntent
+        ? `⚠ Codex session creation ${pending.abortIntent.reconciledAt ? 'was cancelled' : 'cancellation is pending'}. The first prompt is saved and will not run automatically. Source ID: ${discordInlineCode(this.queuedPromptDeliveryId(first))}. Review it with /pending-prompts, then use /resolve-pending to retry or discard it. Later work is held too.`
+        : `⚠ Cordex could not confirm Codex session creation. The first prompt is saved and will not run automatically. Source ID: ${discordInlineCode(this.queuedPromptDeliveryId(first))}. Review it with /pending-prompts, then use /resolve-pending to retry or discard it. Later work is held too.`,
       suppressNotifications: false,
       format: false,
     }).catch((error: unknown) => {
@@ -7560,6 +7570,73 @@ export class CordexDiscordBot {
           entry.codexThreadId === `pending-session:${threadId}`) outbox.splice(index, 1)
       }
       return outbox.length !== originalLength
+    })
+  }
+
+  private async reconcilePendingInitialAbort(
+    threadId: string,
+    pending: PendingInitialSession,
+    startedThreadId?: string,
+  ): Promise<void> {
+    if (startedThreadId) {
+      try {
+        await this.promptQueue.run(threadId, async () => {
+          if (this.state.pendingInitialSessions?.[threadId] !== pending || !pending.abortIntent) {
+            throw new Error('Pending Codex session abort is no longer available')
+          }
+          if (pending.abortIntent.codexThreadId &&
+            pending.abortIntent.codexThreadId !== startedThreadId) {
+            throw new Error('Pending Codex session abort references a different Codex thread')
+          }
+          const previous = { ...pending.abortIntent }
+          pending.abortIntent = { ...pending.abortIntent, codexThreadId: startedThreadId }
+          try {
+            await saveState(this.state)
+          } catch (error) {
+            pending.abortIntent = previous
+            throw error
+          }
+        })
+      } catch (error) {
+        try {
+          await this.codex.deleteThread(startedThreadId)
+        } catch (cleanupError) {
+          throw new AggregateError(
+            [error, cleanupError],
+            'Could not persist or clean up the cancelled Codex session',
+          )
+        }
+        throw error
+      }
+    }
+
+    const cleanupThreadId = pending.abortIntent?.codexThreadId
+    if (cleanupThreadId) {
+      try {
+        await this.codex.deleteThread(cleanupThreadId)
+      } catch (error) {
+        if (!this.isUnloadedCodexThreadError(error, cleanupThreadId) &&
+          !this.isMissingCodexRolloutError(error, cleanupThreadId)) throw error
+      }
+      this.loadedThreads.delete(cleanupThreadId)
+    }
+
+    await this.promptQueue.run(threadId, async () => {
+      if (this.state.pendingInitialSessions?.[threadId] !== pending || !pending.abortIntent) return
+      if (cleanupThreadId && pending.abortIntent.codexThreadId !== cleanupThreadId) {
+        throw new Error('Pending Codex session abort changed during cleanup')
+      }
+      const previous = { ...pending.abortIntent }
+      pending.abortIntent = {
+        requestedAt: pending.abortIntent.requestedAt,
+        reconciledAt: new Date().toISOString(),
+      }
+      try {
+        await saveState(this.state)
+      } catch (error) {
+        pending.abortIntent = previous
+        throw error
+      }
     })
   }
 
@@ -8070,6 +8147,9 @@ export class CordexDiscordBot {
             this.deletedDiscordThreads.has(channel.id)) {
             throw new Error('Pending Codex session is no longer available')
           }
+          if (pendingInitial.abortIntent && !pendingInitial.abortIntent.reconciledAt) {
+            throw new Error('Pending Codex session cancellation is still being reconciled')
+          }
           const queue = this.queueFor(channel.id)
           const selected = queue.find((prompt) =>
             prompt.reviewRequired && this.queuedPromptDeliveryId(prompt) === sourceId)
@@ -8514,16 +8594,53 @@ export class CordexDiscordBot {
 
   private async handleAbortCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     if (!interaction.channel?.isThread()) throw new Error('Abort must run inside a Cordex thread')
-    const session = this.state.sessions[interaction.channel.id]
+    const channel = interaction.channel
+    const session = this.state.sessions[channel.id]
     if (!session) {
-      await interaction.reply({ content: 'No active turn.' })
+      const pending = this.state.pendingInitialSessions?.[channel.id]
+      if (!pending) {
+        await interaction.reply({ content: 'No active turn.' })
+        return
+      }
+      const state = await this.promptQueue.run(channel.id, async () => {
+        if (this.state.pendingInitialSessions?.[channel.id] !== pending ||
+          this.state.sessions[channel.id]) {
+          throw new Error('Pending Codex session is no longer available')
+        }
+        const first = this.queueFor(channel.id)[0]
+        if (!first) return 'empty' as const
+        if (pending.abortIntent?.reconciledAt) return 'reconciled' as const
+        if (pending.abortIntent) return 'pending' as const
+        const previousReview = first.reviewRequired === true
+        pending.abortIntent = { requestedAt: new Date().toISOString() }
+        first.reviewRequired = true
+        try {
+          await saveState(this.state)
+        } catch (error) {
+          delete pending.abortIntent
+          if (!previousReview) delete first.reviewRequired
+          throw error
+        }
+        return 'requested' as const
+      })
+      if (state === 'empty') {
+        await interaction.reply({ content: 'No active turn.' })
+        return
+      }
+      this.stopPendingStartupProgress(channel.id)
+      await this.sendPendingInitialSessionNotice(channel, pending)
+      await interaction.reply(state === 'reconciled'
+        ? 'Codex session creation is already cancelled. Saved prompts remain held for review.'
+        : state === 'pending'
+          ? 'Codex session creation cancellation is already pending. Saved prompts will not run automatically.'
+          : 'Abort requested. Codex session creation will be cancelled; saved prompts will not run automatically.')
       return
     }
     const activeTurnId = this.runs.get(session.codexThreadId)?.turnId || session.activeTurnId
     const hadPendingStart = this.pendingTurnStarts.has(session.codexThreadId)
     const hadIntent = session.abortIntent !== undefined
     await this.persistAbortIntent(session, activeTurnId)
-    await this.dismissPendingControlsForChannel(interaction.channel.id, '_Turn aborted._')
+    await this.dismissPendingControlsForChannel(channel.id, '_Turn aborted._')
     const result = await this.reconcileAbortIntent(session, activeTurnId)
     if (result.errors.length > 0) {
       await interaction.reply({
@@ -9384,15 +9501,29 @@ export class CordexDiscordBot {
         persistedInitialPrompt = initialPrompt
       }
       const serviceTier = await this.serviceTierForFastMode(model, fastMode)
-      const started = await this.codex.startThread({
-        cwd: directory,
-        ...(model ? { model } : {}),
-        ...(serviceTier !== undefined ? { serviceTier } : {}),
-        dynamicTools: cordexDynamicTools,
-        ...(runtimeWorkspaceRoots ? { runtimeWorkspaceRoots } : {}),
-        sandbox: yoloMode ? 'danger-full-access' : this.config.sandbox,
-        approvalPolicy: yoloMode ? 'never' : this.config.approvalPolicy,
-      })
+      let started!: Awaited<ReturnType<CodexAppServer['startThread']>>
+      try {
+        started = await this.codex.startThread({
+          cwd: directory,
+          ...(model ? { model } : {}),
+          ...(serviceTier !== undefined ? { serviceTier } : {}),
+          dynamicTools: cordexDynamicTools,
+          ...(runtimeWorkspaceRoots ? { runtimeWorkspaceRoots } : {}),
+          sandbox: yoloMode ? 'danger-full-access' : this.config.sandbox,
+          approvalPolicy: yoloMode ? 'never' : this.config.approvalPolicy,
+        })
+        const abortedPending = this.state.pendingInitialSessions?.[channel.id]
+        if (abortedPending?.abortIntent) {
+          await this.reconcilePendingInitialAbort(channel.id, abortedPending, started.threadId)
+          throw new Error('Codex session creation was cancelled')
+        }
+      } catch (error) {
+        const abortedPending = this.state.pendingInitialSessions?.[channel.id]
+        if (!started && abortedPending?.abortIntent) {
+          await this.reconcilePendingInitialAbort(channel.id, abortedPending)
+        }
+        throw error
+      }
       const effectiveEffort = this.state.channelEfforts[parentChannelId] ||
         this.config.defaultEffort || started.effort
       session = {
