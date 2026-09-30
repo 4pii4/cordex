@@ -1230,7 +1230,7 @@ export class CordexDiscordBot {
     await this.dismissPendingControlsForChannel(session.discordThreadId, '_Turn aborted._')
   }
 
-  private async pauseGoalForAbort(
+  private async pauseActiveGoal(
     session: SessionState,
   ): Promise<{ safe: boolean; paused: boolean; error?: string }> {
     const codex = this.codex as unknown as {
@@ -1278,7 +1278,7 @@ export class CordexDiscordBot {
     }
     if (!session.abortIntent) return result
 
-    const goal = await this.pauseGoalForAbort(session)
+    const goal = await this.pauseActiveGoal(session)
     result.goalPaused = goal.paused
     if (!goal.safe && goal.error) result.errors.push(goal.error)
 
@@ -2362,16 +2362,26 @@ export class CordexDiscordBot {
       const uncertainPrompt = this.state.queues[interrupted.discordThreadId]?.some(
         (prompt) => prompt.reviewRequired,
       ) || false
+      const goal = await this.pauseActiveGoal(session)
+      const prefix = '⚠ Cordex restarted while this Codex turn was recorded as active.'
+      let value = uncertainPrompt
+        ? `${prefix} A saved prompt needs delivery review; Cordex will not retry it automatically. Use /pending-prompts to inspect it.`
+        : savedPromptCount > 0
+        ? `${prefix} ${savedPromptCount} saved prompt${savedPromptCount === 1 ? '' : 's'} ${savedPromptCount === 1 ? 'is' : 'are'} being reconciled; any not already accepted may run automatically. Watch this thread and check /status before sending more work.`
+        : `${prefix} Check the latest output, then send a new message to continue.`
+      if (goal.paused) {
+        value = uncertainPrompt || savedPromptCount > 0
+          ? `${value} The active persistent goal was also paused; resolve saved prompts before resuming it with /goal status:active.`
+          : `${prefix} The active persistent goal was paused after the interruption. Check the latest output, then use /goal status:active to resume it.`
+      } else if (!goal.safe) {
+        value = `${value} Cordex could not verify whether an active persistent goal was paused. Use /goal to inspect it before continuing.`
+      }
       await this.queueRuntimeNotice({
         discordThreadId: interrupted.discordThreadId,
         codexThreadId: interrupted.codexThreadId,
         turnId: interrupted.turnId,
         itemKey: 'startup-interrupted',
-        value: uncertainPrompt
-          ? '⚠ Cordex restarted while this Codex turn was recorded as active. A saved prompt needs delivery review; Cordex will not retry it automatically. Use /pending-prompts to inspect it.'
-          : savedPromptCount > 0
-          ? `⚠ Cordex restarted while this Codex turn was recorded as active. ${savedPromptCount} saved prompt${savedPromptCount === 1 ? '' : 's'} ${savedPromptCount === 1 ? 'is' : 'are'} being reconciled; any not already accepted may run automatically. Watch this thread and check /status before sending more work.`
-          : '⚠ Cordex restarted while this Codex turn was recorded as active. Check the latest output, then send a new message to continue.',
+        value,
       }).catch((error: unknown) => {
         this.logger.error('runtime_notice_failed', error, {
           channelId: interrupted.discordThreadId,

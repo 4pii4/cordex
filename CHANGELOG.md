@@ -5,6 +5,11 @@ All notable changes to Cordex are documented here. The project follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Paused active persistent goals during full-process crash recovery and posted
+  explicit Discord resume guidance instead of leaving goals active but idle.
+
 ## [0.3.0] - 2026-10-01
 
 ### Fixed

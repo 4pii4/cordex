@@ -414,13 +414,17 @@ values such as MCP environment variables.
 
 `/goal` with an objective creates or updates Codex's persistent thread goal.
 Active goal turns, including continuations started directly by Codex, stream to
-the linked Discord thread, resume when Cordex restarts, and can accept queued or
-follow-up messages. Omitted status and token-budget options preserve their
-existing values.
+the linked Discord thread and can accept queued or follow-up messages. Omitted
+status and token-budget options preserve their existing values. If the whole
+Cordex process exits during a turn, replacement startup pauses an active goal
+and posts a durable Discord notice; inspect the latest output, then explicitly
+resume it with `/goal status:active`. This prevents an interrupted goal from
+remaining active but idle or replaying work without confirmation.
 
 If the Codex app-server exits unexpectedly, Cordex retries it with bounded
 exponential backoff, clears controls belonging to the failed process, reloads
-persistent goal sessions, and resumes eligible queued work. Initialization and
+persistent goal sessions, and resumes eligible queued work inside the surviving
+Cordex process. Initialization and
 RPC watchdogs also recycle a child that remains alive but stops responding.
 After an ambiguous turn start or steer failure, Cordex checks Codex's persisted
 client message IDs. That ID is a correlation field, not a guaranteed
