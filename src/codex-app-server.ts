@@ -62,6 +62,13 @@ export class CodexRpcError extends Error {
   }
 }
 
+export class CodexProviderStateReadOnlyError extends Error {
+  constructor(readonly method: string) {
+    super(`Cordex provider state is read-only; refusing Codex RPC ${method}`)
+    this.name = 'CodexProviderStateReadOnlyError'
+  }
+}
+
 function isRecord(value: unknown): value is JsonObject {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -69,6 +76,39 @@ function isRecord(value: unknown): value is JsonObject {
 function asRecord(value: unknown, label: string): JsonObject {
   if (!isRecord(value)) throw new Error(`Invalid ${label} response from Codex`)
   return value
+}
+
+const readOnlyAccountMethods = new Set([
+  'account/gatewayOAuth/read',
+  'account/rateLimits/read',
+  'account/read',
+  'account/usage/read',
+  'account/workspaceMessages/read',
+])
+
+function isExplicitlySafeConfigWrite(params: unknown): boolean {
+  if (!isRecord(params) || typeof params.keyPath !== 'string' || typeof params.value !== 'boolean') {
+    return false
+  }
+  return /^(?:plugins|mcp_servers)\."(?:[^"\\]|\\.)+"\.enabled$/.test(params.keyPath)
+}
+
+function mutatesProviderState(method: string, params: unknown): boolean {
+  if (method === 'account/read') {
+    return isRecord(params) && params.refreshToken === true
+  }
+  if (method.startsWith('account/')) return !readOnlyAccountMethods.has(method)
+  if (method.startsWith('modelProvider/')) {
+    return method !== 'modelProvider/capabilities/read'
+  }
+  if (method.startsWith('userVerification/')) return method !== 'userVerification/status'
+  if (method.startsWith('externalAgentConfig/')) {
+    return method !== 'externalAgentConfig/detect' &&
+      method !== 'externalAgentConfig/import/readHistories'
+  }
+  if (method === 'config/batchWrite') return true
+  if (method === 'config/value/write') return !isExplicitlySafeConfigWrite(params)
+  return false
 }
 
 function parseReasoningEffort(value: unknown): ReasoningEffort | undefined {
@@ -195,10 +235,6 @@ export type CodexAuthStatus = {
   hasToken: boolean
   requiresOpenaiAuth: boolean
 }
-
-export type AccountLoginResult =
-  | { type: 'chatgpt'; loginId: string; authUrl: string }
-  | { type: 'chatgptDeviceCode'; loginId: string; verificationUrl: string; userCode: string }
 
 export type CodexThreadGoal = {
   threadId: string
@@ -1876,6 +1912,9 @@ export class CodexAppServer extends EventEmitter {
   }
 
   async request(method: string, params: unknown): Promise<unknown> {
+    if (mutatesProviderState(method, params)) {
+      throw new CodexProviderStateReadOnlyError(method)
+    }
     if (method === 'turn/start' && isRecord(params) && typeof params.threadId === 'string') {
       this.freshEmptyThreadIds.delete(params.threadId)
     }
@@ -3030,47 +3069,6 @@ export class CodexAppServer extends EventEmitter {
   async getAccountUsage(): Promise<JsonObject> {
     await this.ready
     return asRecord(await this.request('account/usage/read', {}), 'account/usage/read')
-  }
-
-  async startAccountLogin(method: 'chatgpt' | 'chatgptDeviceCode' = 'chatgpt'): Promise<AccountLoginResult> {
-    await this.ready
-    const response = asRecord(
-      await this.request('account/login/start',
-        method === 'chatgpt' ? { type: 'chatgpt' } : { type: 'chatgptDeviceCode' },
-      ),
-      'account/login/start',
-    )
-    if (
-      response.type === 'chatgpt' &&
-      typeof response.loginId === 'string' &&
-      typeof response.authUrl === 'string'
-    ) {
-      return { type: 'chatgpt', loginId: response.loginId, authUrl: response.authUrl }
-    }
-    if (
-      response.type === 'chatgptDeviceCode' &&
-      typeof response.loginId === 'string' &&
-      typeof response.verificationUrl === 'string' &&
-      typeof response.userCode === 'string'
-    ) {
-      return {
-        type: 'chatgptDeviceCode',
-        loginId: response.loginId,
-        verificationUrl: response.verificationUrl,
-        userCode: response.userCode,
-      }
-    }
-    throw new Error('Codex account/login/start returned an invalid response')
-  }
-
-  async cancelAccountLogin(loginId: string): Promise<void> {
-    await this.ready
-    await this.request('account/login/cancel', { loginId })
-  }
-
-  async logoutAccount(): Promise<void> {
-    await this.ready
-    await this.request('account/logout', undefined)
   }
 
   async getAccountWorkspaceMessages(): Promise<CodexWorkspaceMessagesResult> {

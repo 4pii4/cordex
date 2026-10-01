@@ -451,12 +451,6 @@ lines.on('line', (line) => {
     send({ id: message.id, result: { authorizationUrl: 'https://example.test/mcp-login' } })
   } else if (message.method === 'getAuthStatus') {
     send({ id: message.id, result: { authMethod: 'apikey', authToken: 'fixture-secret', requiresOpenaiAuth: false } })
-  } else if (message.method === 'account/login/start') {
-    send({ id: message.id, result: message.params.type === 'chatgptDeviceCode'
-      ? { type: 'chatgptDeviceCode', loginId: 'fixture-login', verificationUrl: 'https://example.test/device', userCode: 'ABCD-EFGH' }
-      : { type: 'chatgpt', loginId: 'fixture-login', authUrl: 'https://example.test/oauth' } })
-  } else if (message.method === 'account/login/cancel') {
-    send({ id: message.id, result: {} })
   } else if (message.method === 'account/read') {
     send({ id: message.id, result: { account: { type: 'apiKey' }, requiresOpenaiAuth: false } })
   } else if (message.method === 'account/rateLimits/read') {

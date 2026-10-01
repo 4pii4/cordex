@@ -11,6 +11,13 @@ All notable changes to Cordex are documented here. The project follows
   attachment cache, exposing the verified local file to Codex without claiming
   app-server-native audio support.
 
+### Changed
+
+- Made Codex account and model-provider state read-only from Cordex. Removed the
+  Discord `/login` surface and account mutation wrappers, and added a fail-closed
+  RPC boundary for auth, provider, verification, import, and generic config
+  mutations while retaining account reads, per-session models, and MCP OAuth.
+
 ### Fixed
 
 - Added a durable channel fallback for `/abort` results when Discord fails

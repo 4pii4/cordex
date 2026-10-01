@@ -448,19 +448,6 @@ export function buildSlashCommands() {
       .setDescription(discordDescription('Show Codex lifetime token and streak statistics'))
       .setDMPermission(false),
     new SlashCommandBuilder()
-      .setName('login')
-      .setDescription(discordDescription('Start Codex account login'))
-      .addStringOption((option) =>
-        option
-          .setName('method')
-          .setDescription(discordDescription('Login flow'))
-          .addChoices(
-            { name: 'Browser OAuth', value: 'chatgpt' },
-            { name: 'Device code', value: 'chatgptDeviceCode' },
-          ),
-      )
-      .setDMPermission(false),
-    new SlashCommandBuilder()
       .setName('rollback')
       .setDescription(discordDescription('Remove recent turns from Codex history; files stay unchanged'))
       .addIntegerOption((option) =>

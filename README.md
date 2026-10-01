@@ -286,11 +286,17 @@ Slash commands are registered in the configured Discord server.
 | Goals | `/goal`, `/clear-goal` |
 | Git and worktrees | `/diff`, `/review`, `/rollback`, `/new-worktree`, `/merge-worktree`, `/delete-worktree`, `/toggle-worktrees`, `/worktrees` |
 | Automation | `/queue`, `/clear-queue`, `/pending-prompts`, `/resolve-pending`, `/schedule`, `/tasks`, `/cancel-task` |
-| Codex services | `/skill`, `/skills`, `/skill-toggle`, `/skill-roots`, `/plugins`, `/plugin`, `/hooks`, `/apps`, `/mcp`, `/mcp-status`, `/mcp-login`, `/auth-status`, `/rate-limits`, `/account-usage`, `/login` |
+| Codex services | `/skill`, `/skills`, `/skill-toggle`, `/skill-roots`, `/plugins`, `/plugin`, `/hooks`, `/apps`, `/mcp`, `/mcp-status`, `/mcp-login`, `/auth-status`, `/rate-limits`, `/account-usage` |
 | Host control | `/run-shell-command`, `!command`, `/yolo`, `/restart` |
 
 `/diff` renders small patches inline and attaches the complete binary-capable
 patch when it exceeds Discord message limits.
+
+Cordex treats Codex account and model-provider state as read-only. Manage
+provider login, logout, credentials, and provider configuration directly on the
+host with the Codex CLI. Discord can inspect authentication, limits, and usage,
+but cannot mutate provider state. Per-session `/model` choices and MCP-server
+OAuth are separate and remain available.
 
 Discord `/init` asks Codex to generate repository-specific contributor guidance
 in `AGENTS.md` in the current session directory. In a project channel, it starts

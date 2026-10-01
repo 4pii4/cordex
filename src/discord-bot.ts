@@ -333,7 +333,6 @@ const ephemeralChatCommands = new Set([
   'delete',
   'hooks',
   'last-sessions',
-  'login',
   'mcp',
   'mcp-login',
   'mcp-status',
@@ -3947,7 +3946,6 @@ export class CordexDiscordBot {
       else if (interaction.commandName === 'auth-status') await this.handleAuthStatusCommand(interaction)
       else if (interaction.commandName === 'rate-limits') await this.handleRateLimitsCommand(interaction)
       else if (interaction.commandName === 'account-usage') await this.handleAccountUsageCommand(interaction)
-      else if (interaction.commandName === 'login') await this.handleLoginCommand(interaction)
       else if (interaction.commandName === 'rollback') await this.handleRollbackCommand(interaction)
       else if (interaction.commandName === 'new-worktree') await this.handleNewWorktreeCommand(interaction)
       else if (interaction.commandName === 'toggle-worktrees') await this.handleToggleWorktreesCommand(interaction)
@@ -7069,21 +7067,6 @@ export class CordexDiscordBot {
       `**Longest streak:** ${this.formatUsageNumber(summary.longestStreakDays)} days`,
       `**Longest turn:** ${this.formatUsageNumber(summary.longestRunningTurnSec)} seconds`,
     ].join('\n'))
-  }
-
-  private async handleLoginCommand(interaction: ChatInputCommandInteraction): Promise<void> {
-    const method = (interaction.options.getString('method') || 'chatgpt') as 'chatgpt' | 'chatgptDeviceCode'
-    await interaction.deferReply({ ephemeral: true })
-    const login = await this.codex.startAccountLogin(method)
-    if (login.type === 'chatgpt') {
-      await interaction.editReply(
-        `Codex login started. Open this URL to authenticate:\n${login.authUrl}\n\nLogin ID: \`${login.loginId}\``,
-      )
-      return
-    }
-    await interaction.editReply(
-      `Codex device login started. Open ${login.verificationUrl} and enter code \`${login.userCode}\`.\n\nLogin ID: \`${login.loginId}\``,
-    )
   }
 
   private async runScheduledTask(task: ScheduledTask, recoverRunning: boolean): Promise<void> {

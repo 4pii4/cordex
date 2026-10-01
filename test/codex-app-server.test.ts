@@ -439,18 +439,6 @@ test('Codex app-server client covers thread, turn, stream, model, steer, interru
     assert.deepEqual(await codex.getAccount(), { type: 'apiKey' })
     assert.equal((await codex.getAccountRateLimits()).rateLimits !== undefined, true)
     assert.equal((await codex.getAccountUsage()).summary !== undefined, true)
-    assert.deepEqual(await codex.startAccountLogin('chatgpt'), {
-      type: 'chatgpt',
-      loginId: 'fixture-login',
-      authUrl: 'https://example.test/oauth',
-    })
-    assert.deepEqual(await codex.startAccountLogin('chatgptDeviceCode'), {
-      type: 'chatgptDeviceCode',
-      loginId: 'fixture-login',
-      verificationUrl: 'https://example.test/device',
-      userCode: 'ABCD-EFGH',
-    })
-    await codex.cancelAccountLogin('fixture-login')
   } finally {
     await codex.close()
   }
@@ -964,7 +952,6 @@ test('Codex app-server exposes stable skill, hook, plugin, marketplace, and acco
         errors: [{ marketplaceName: 'broken-marketplace', message: 'fixture failure' }],
       },
     },
-    { method: 'account/logout', params: undefined, result: {} },
     {
       method: 'account/workspaceMessages/read',
       params: undefined,
@@ -1069,7 +1056,6 @@ test('Codex app-server exposes stable skill, hook, plugin, marketplace, and acco
       upgradedRoots: ['/tmp/fixture-marketplace'],
       errors: [{ marketplaceName: 'broken-marketplace', message: 'fixture failure' }],
     })
-    await codex.logoutAccount()
     assert.deepEqual(await codex.getAccountWorkspaceMessages(), {
       featureEnabled: true,
       messages: [

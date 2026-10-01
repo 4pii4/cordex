@@ -64,7 +64,6 @@ test('Discord command registry includes core and ported controls', () => {
     'auth-status',
     'rate-limits',
     'account-usage',
-    'login',
     'rollback',
     'new-worktree',
     'toggle-worktrees',
