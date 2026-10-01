@@ -8821,6 +8821,37 @@ export class CordexDiscordBot {
     })
   }
 
+  private async replyAbortResult(
+    interaction: ChatInputCommandInteraction,
+    channel: ThreadChannel,
+    session: SessionState,
+    turnId: string | undefined,
+    content: string,
+  ): Promise<void> {
+    try {
+      await interaction.reply({ content })
+    } catch (replyError) {
+      try {
+        await this.queueRuntimeNotice({
+          discordThreadId: channel.id,
+          codexThreadId: session.codexThreadId,
+          turnId: turnId || `abort:${interaction.id}`,
+          itemKey: 'abort-result',
+          value: content,
+        })
+      } catch (fallbackError) {
+        throw new AggregateError(
+          [replyError, fallbackError],
+          'Abort completed but its Discord result could not be persisted',
+        )
+      }
+      this.logVerbose('abort interaction result deferred to durable output', {
+        threadId: session.codexThreadId,
+        error: errorText(replyError),
+      })
+    }
+  }
+
   private async handleAbortCommand(interaction: ChatInputCommandInteraction): Promise<void> {
     if (!interaction.channel?.isThread()) throw new Error('Abort must run inside a Cordex thread')
     const channel = interaction.channel
@@ -8872,9 +8903,13 @@ export class CordexDiscordBot {
     await this.dismissPendingControlsForChannel(channel.id, '_Turn aborted._')
     const result = await this.reconcileAbortIntent(session, activeTurnId)
     if (result.errors.length > 0) {
-      await interaction.reply({
-        content: `Abort requested; confirmation pending: ${truncate(result.errors.join('; '), 1_700)}`,
-      })
+      await this.replyAbortResult(
+        interaction,
+        channel,
+        session,
+        activeTurnId,
+        `Abort requested; confirmation pending: ${truncate(result.errors.join('; '), 1_700)}`,
+      )
       return
     }
     let backgroundWarning = ''
@@ -8900,10 +8935,22 @@ export class CordexDiscordBot {
       !result.goalPaused &&
       !result.interrupted
     ) {
-      await interaction.reply({ content: `No active turn.${backgroundWarning}` })
+      await this.replyAbortResult(
+        interaction,
+        channel,
+        session,
+        activeTurnId,
+        `No active turn.${backgroundWarning}`,
+      )
       return
     }
-    await interaction.reply(`Abort requested.${backgroundWarning}`)
+    await this.replyAbortResult(
+      interaction,
+      channel,
+      session,
+      activeTurnId,
+      `Abort requested.${backgroundWarning}`,
+    )
   }
 
   private async handlePsCommand(interaction: ChatInputCommandInteraction): Promise<void> {

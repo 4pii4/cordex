@@ -13,6 +13,9 @@ All notable changes to Cordex are documented here. The project follows
 
 ### Fixed
 
+- Added a durable channel fallback for `/abort` results when Discord fails
+  after acknowledging the interaction, preserving background-terminal warnings
+  alongside the already durable terminal turn output.
 - Distinguished explicit `turn/steer` RPC rejection from response loss,
   retaining the rejected input as normal next-turn work instead of incorrectly
   holding it for manual uncertain-delivery review.

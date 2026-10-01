@@ -476,6 +476,8 @@ source ID. Retrying may duplicate side effects if Codex accepted the prompt
 without persisting it yet; inspect the thread and files before choosing.
 Completed Discord output and run footers use a separate durable outbox, so a partial
 send or bot restart resumes only missing chunks and does not block the next queued turn.
+If Discord becomes unavailable after acknowledging `/abort`, Cordex also stages
+the abort result and any background-terminal warning in that durable outbox.
 During a Discord connection outage, saved Codex work continues and its output
 waits in the outbox. When the gateway reconnects, Cordex also catches up missed
 messages in configured project channels and their session threads, even if
