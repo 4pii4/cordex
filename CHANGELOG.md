@@ -47,6 +47,8 @@ All notable changes to Cordex are documented here. The project follows
 - Reconciled positively matched scheduled occurrences before posting uncertain
   delivery warnings, and made scheduled-prompt announcements durable and
   idempotent across crash recovery.
+- Limited `/debug-config` managed-policy section summaries to requirements with
+  meaningful values instead of reporting every nullable schema field as active.
 
 ## [0.3.0] - 2026-10-01
 

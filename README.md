@@ -420,7 +420,8 @@ working directory, writable roots, and context usage when available.
 shows Codex's resolved layers from lowest to highest precedence, and reports
 managed requirements separately. It sends only setting names and selected
 non-secret defaults in a private Discord reply; it never dumps raw config
-values such as MCP environment variables.
+values such as MCP environment variables. Managed-policy summaries omit null
+and empty schema fields instead of presenting them as active sections.
 
 `/goal` with an objective creates or updates Codex's persistent thread goal.
 Active goal turns, including continuations started directly by Codex, stream to

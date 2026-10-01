@@ -9285,17 +9285,25 @@ export class CordexDiscordBot {
       ? ['Managed requirements: unavailable (Codex did not return them).']
       : requirements === null
         ? ['Managed requirements: none configured.']
-        : [
-            'Managed requirements: configured.',
-            `Policy sections: ${Object.keys(requirements).slice(0, 25).map((key) => discordInlineCode(truncate(key, 70))).join(', ') || 'none'}${Object.keys(requirements).length > 25 ? ', …' : ''}`,
-            ...(Array.isArray(requirements.allowedApprovalPolicies)
-              ? [`Allowed approvals: ${requirements.allowedApprovalPolicies.slice(0, 12).map((value) => discordInlineCode(truncate(String(value), 70))).join(', ') || 'none'}`]
-              : []),
-            ...(Array.isArray(requirements.allowedSandboxModes)
-              ? [`Allowed sandboxes: ${requirements.allowedSandboxModes.slice(0, 12).map((value) => discordInlineCode(truncate(String(value), 70))).join(', ') || 'none'}`]
-              : []),
-            ...(isRecord(requirements.network) ? ['Network requirements: configured (details hidden).'] : []),
-          ]
+        : (() => {
+            const configuredSections = Object.entries(requirements).flatMap(([key, value]) => {
+              if (value === null || value === undefined) return []
+              if (Array.isArray(value) && value.length === 0) return []
+              if (isRecord(value) && Object.keys(value).length === 0) return []
+              return [key]
+            })
+            return [
+              'Managed requirements: configured.',
+              `Policy sections: ${configuredSections.slice(0, 25).map((key) => discordInlineCode(truncate(key, 70))).join(', ') || 'none'}${configuredSections.length > 25 ? ', …' : ''}`,
+              ...(Array.isArray(requirements.allowedApprovalPolicies)
+                ? [`Allowed approvals: ${requirements.allowedApprovalPolicies.slice(0, 12).map((value) => discordInlineCode(truncate(String(value), 70))).join(', ') || 'none'}`]
+                : []),
+              ...(Array.isArray(requirements.allowedSandboxModes)
+                ? [`Allowed sandboxes: ${requirements.allowedSandboxModes.slice(0, 12).map((value) => discordInlineCode(truncate(String(value), 70))).join(', ') || 'none'}`]
+                : []),
+              ...(isRecord(requirements.network) ? ['Network requirements: configured (details hidden).'] : []),
+            ]
+          })()
     const lines = [
       '**Codex configuration diagnostics**',
       `Working directory: ${discordInlineCode(truncate(cwd, 300))}`,
