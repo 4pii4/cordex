@@ -12,6 +12,7 @@ export const defaultDiscordInputLimits = {
   messageTextCharacters: 120_000,
   textAttachmentBytes: 1_000_000,
   imageAttachmentBytes: 20_000_000,
+  audioAttachmentBytes: 20_000_000,
   messageAttachmentBytes: 40_000_000,
   downloadTimeoutMs: 30_000,
 } as const
@@ -27,6 +28,7 @@ export type DiscordInputLimits = {
   messageTextCharacters: number
   textAttachmentBytes: number
   imageAttachmentBytes: number
+  audioAttachmentBytes: number
   messageAttachmentBytes: number
   downloadTimeoutMs: number
 }
@@ -36,6 +38,7 @@ export type DiscordInputFeedbackCode =
   | 'attachment-total-too-large'
   | 'attachment-too-large'
   | 'attachment-unsupported'
+  | 'attachment-storage-failed'
   | 'image-storage-failed'
   | 'reply-unavailable'
 
@@ -98,7 +101,20 @@ const imageMimeExtensions = new Map([
   ['image/webp', '.webp'],
 ])
 
-const managedImageName = /^[a-f0-9]{64}\.(?:gif|jpe?g|png|webp)$/
+const audioMimeExtensions = new Map([
+  ['audio/aac', '.aac'],
+  ['audio/flac', '.flac'],
+  ['audio/mp4', '.m4a'],
+  ['audio/mpeg', '.mp3'],
+  ['audio/ogg', '.ogg'],
+  ['audio/opus', '.opus'],
+  ['audio/wav', '.wav'],
+  ['audio/webm', '.webm'],
+  ['audio/x-flac', '.flac'],
+  ['audio/x-wav', '.wav'],
+])
+
+const managedAttachmentName = /^[a-f0-9]{64}\.(?:aac|flac|gif|jpe?g|m4a|mp3|ogg|opus|png|wav|webm|webp)$/
 
 function normalizeMimeType(value: string | null | undefined): string {
   return (value || '').split(';', 1)[0]?.trim().toLowerCase() || ''
@@ -114,6 +130,10 @@ export function isSupportedTextMimeType(value: string | null | undefined): boole
 
 export function isSupportedImageMimeType(value: string | null | undefined): boolean {
   return imageMimeExtensions.has(normalizeMimeType(value))
+}
+
+export function isSupportedAudioMimeType(value: string | null | undefined): boolean {
+  return audioMimeExtensions.has(normalizeMimeType(value))
 }
 
 function escapeRegExp(value: string): string {
@@ -441,9 +461,13 @@ async function downloadAttachment(
   }
 }
 
-async function persistImage(directory: string, mime: string, bytes: Buffer): Promise<string> {
-  const extension = imageMimeExtensions.get(mime)
-  if (!extension) throw new Error(`Unsupported image MIME type: ${mime}`)
+async function persistAttachment(
+  directory: string,
+  mime: string,
+  bytes: Buffer,
+): Promise<{ path: string; sha256: string }> {
+  const extension = imageMimeExtensions.get(mime) || audioMimeExtensions.get(mime)
+  if (!extension) throw new Error(`Unsupported attachment MIME type: ${mime}`)
   const digest = createHash('sha256').update(bytes).digest('hex')
   const target = path.resolve(directory, `${digest}${extension}`)
   await mkdir(path.dirname(target), { recursive: true, mode: 0o700 })
@@ -459,7 +483,7 @@ async function persistImage(directory: string, mime: string, bytes: Buffer): Pro
   } finally {
     await unlink(temporary).catch(() => undefined)
   }
-  return target
+  return { path: target, sha256: digest }
 }
 
 export async function pruneDiscordAttachmentCache(options: {
@@ -490,7 +514,7 @@ export async function pruneDiscordAttachmentCache(options: {
     throw error
   }
   const files = (await Promise.all(entries.flatMap((entry) => {
-    if (!entry.isFile() || !managedImageName.test(entry.name)) return []
+    if (!entry.isFile() || !managedAttachmentName.test(entry.name)) return []
     const filePath = path.resolve(directory, entry.name)
     return [stat(filePath).then((metadata) => ({
       path: filePath,
@@ -521,6 +545,7 @@ export async function pruneDiscordAttachmentCache(options: {
 type AttachmentResult = {
   text?: string
   image?: UserInput
+  file?: UserInput
   feedback?: DiscordInputFeedback
   consumedBytes?: number
 }
@@ -547,7 +572,8 @@ async function processAttachment(
   const declaredMime = normalizeMimeType(attachment.contentType)
   const textAttachment = isSupportedTextMimeType(declaredMime)
   const imageAttachment = isSupportedImageMimeType(declaredMime)
-  if (!textAttachment && !imageAttachment) {
+  const audioAttachment = isSupportedAudioMimeType(declaredMime)
+  if (!textAttachment && !imageAttachment && !audioAttachment) {
     return {
       feedback: {
         code: 'attachment-unsupported',
@@ -555,7 +581,7 @@ async function processAttachment(
         message: [
           `Attachment ${JSON.stringify(name)} has unsupported type`,
           `${JSON.stringify(declaredMime || 'unknown')}; supported inputs are text files`,
-          'and PNG, JPEG, GIF, or WebP images.',
+          'PNG, JPEG, GIF, or WebP images, and common audio files.',
         ].join(' '),
       },
     }
@@ -563,7 +589,9 @@ async function processAttachment(
 
   const perFileLimit = textAttachment
     ? options.limits.textAttachmentBytes
-    : options.limits.imageAttachmentBytes
+    : imageAttachment
+      ? options.limits.imageAttachmentBytes
+      : options.limits.audioAttachmentBytes
   if (attachment.size > options.remainingBytes) {
     return { feedback: aggregateTooLargeFeedback(name, options.remainingBytes) }
   }
@@ -612,7 +640,7 @@ async function processAttachment(
   const responseMime = downloaded.responseMime && downloaded.responseMime !== 'application/octet-stream'
     ? downloaded.responseMime
     : declaredMime
-  if (!isSupportedImageMimeType(responseMime)) {
+  if (imageAttachment && !isSupportedImageMimeType(responseMime)) {
     return {
       consumedBytes,
       feedback: {
@@ -622,16 +650,39 @@ async function processAttachment(
       },
     }
   }
+  if (audioAttachment && !isSupportedAudioMimeType(responseMime)) {
+    return {
+      consumedBytes,
+      feedback: {
+        code: 'attachment-unsupported',
+        attachmentName: name,
+        message: `Attachment ${JSON.stringify(name)} was served as unsupported audio type ${JSON.stringify(responseMime || 'unknown')}.`,
+      },
+    }
+  }
   try {
-    const localPath = await persistImage(options.directory, responseMime, downloaded.bytes)
-    return { image: { type: 'localImage', path: localPath }, consumedBytes }
+    const persisted = await persistAttachment(options.directory, responseMime, downloaded.bytes)
+    if (imageAttachment) {
+      return { image: { type: 'localImage', path: persisted.path }, consumedBytes }
+    }
+    return {
+      file: {
+        type: 'localFile',
+        path: persisted.path,
+        name,
+        mimeType: responseMime,
+        size: downloaded.bytes.length,
+        sha256: persisted.sha256,
+      },
+      consumedBytes,
+    }
   } catch {
     return {
       consumedBytes,
       feedback: {
-        code: 'image-storage-failed',
+        code: imageAttachment ? 'image-storage-failed' : 'attachment-storage-failed',
         attachmentName: name,
-        message: `Could not store image attachment ${JSON.stringify(name)} for Codex.`,
+        message: `Could not store ${imageAttachment ? 'image' : 'audio'} attachment ${JSON.stringify(name)} for Codex.`,
       },
     }
   }
@@ -688,6 +739,7 @@ export async function buildDiscordInput(options: BuildDiscordInputOptions): Prom
       ? [{ type: 'text' as const, text: boundedText, text_elements: [] as [] }]
       : []),
     ...attachmentResults.flatMap((result) => result.image ? [result.image] : []),
+    ...attachmentResults.flatMap((result) => result.file ? [result.file] : []),
   ]
   return { input, feedback }
 }

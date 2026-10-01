@@ -5,6 +5,12 @@ All notable changes to Cordex are documented here. The project follows
 
 ## [Unreleased]
 
+### Added
+
+- Added bounded Discord audio inputs through the private content-addressed
+  attachment cache, exposing the verified local file to Codex without claiming
+  app-server-native audio support.
+
 ### Fixed
 
 - Kept saved queued work running when Discord typing delivery fails, and caught

@@ -1195,7 +1195,7 @@ export class CordexDiscordBot {
     await this.attachmentCacheQueue.run('attachments', async () => {
       const protectedPaths = Object.values(this.state.queues).flatMap((queue) =>
         queue.flatMap((prompt) => prompt.input.flatMap((item) =>
-          item.type === 'localImage' ? [item.path] : [])))
+          item.type === 'localImage' || item.type === 'localFile' ? [item.path] : [])))
       await pruneDiscordAttachmentCache({ protectedPaths })
     })
   }
@@ -2694,6 +2694,7 @@ export class CordexDiscordBot {
         const retryableFeedback = built.feedback.filter((item) =>
           item.retryable === true ||
           item.code === 'attachment-download-failed' ||
+          item.code === 'attachment-storage-failed' ||
           item.code === 'image-storage-failed')
         if (retryableFeedback.length > 0) {
           throw new Error(

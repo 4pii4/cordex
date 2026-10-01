@@ -179,6 +179,14 @@ export type UserInput =
   | { type: 'text'; text: string; text_elements: [] }
   | { type: 'image'; url: string; detail?: ImageDetail }
   | { type: 'localImage'; path: string; detail?: ImageDetail }
+  | {
+      type: 'localFile'
+      path: string
+      name: string
+      mimeType: string
+      size: number
+      sha256: string
+    }
   | { type: 'skill'; name: string; path: string }
 
 export type CodexReasoningEffortOption = {

@@ -386,11 +386,14 @@ validation for Codex Apps. Arbitrary `openai/form` schemas remain disabled and a
 declined rather than rendered approximately.
 
 Replies include a bounded quote and the referenced Discord author. Text
-attachments use a MIME allowlist; PNG, JPEG, GIF, and WebP images are downloaded
-to a bounded local cache before being sent to Codex. Unsupported, oversized, or
-timed-out attachments are reported in the session instead of being silently
-ignored. The final rendered text input also has an independent aggregate character
-limit so multiple attachments and forwarded context cannot create an unbounded prompt.
+attachments use a MIME allowlist; PNG, JPEG, GIF, WebP, and common audio files
+are downloaded to a bounded local cache before being sent to Codex. Audio is
+described to app-server as an untrusted local file for inspection with project
+tools; Cordex does not claim native model audio input. Unsupported, oversized,
+or timed-out attachments are reported in the session instead of being silently
+ignored. The final rendered text input also has an independent aggregate
+character limit so multiple attachments and forwarded context cannot create an
+unbounded prompt.
 
 Generated PNG, JPEG, and WebP images are validated from Codex's app-server
 output and sent back as Discord attachments, including at text-only verbosity.
