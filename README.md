@@ -453,6 +453,9 @@ until that acceptance is confirmed. A scheduled task found in `running`
 state after restart reuses its occurrence ID. If no queue entry survives,
 Cordex holds that occurrence for review unless persisted Codex history proves
 acceptance; the ID alone does not guarantee Codex-side idempotency.
+Positive history is reconciled before any uncertainty warning is posted, and
+queued-delivery announcements use a durable delivery identity so restart
+reconciliation cannot announce the same accepted prompt twice.
 Before Codex returns a new thread ID, Cordex also saves the intended first
 prompt and session settings as a pending start. If creation is interrupted,
 Discord shows a durable warning; later messages are saved behind that prompt.

@@ -44,6 +44,9 @@ All notable changes to Cordex are documented here. The project follows
 - Made `/abort` durable during pre-ID Codex session creation: the saved prompt
   is held for review, a later successful `thread/start` is deleted instead of
   delivered, and restart recovery finishes any persisted cleanup.
+- Reconciled positively matched scheduled occurrences before posting uncertain
+  delivery warnings, and made queued-prompt announcements durable and
+  idempotent across crash recovery.
 
 ## [0.3.0] - 2026-10-01
 

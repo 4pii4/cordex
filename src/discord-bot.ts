@@ -7591,9 +7591,38 @@ export class CordexDiscordBot {
   }
 
   private async announceQueuedPrompt(channel: ThreadChannel, prompt: QueuedPrompt): Promise<void> {
-    await channel.send({
-      content: `» **${escapeInlineMarkdown(prompt.authorName)}:** ${truncate(prompt.displayText, 1_700)}`,
-      allowedMentions: { parse: [] },
+    const content = `» **${escapeInlineMarkdown(prompt.authorName)}:** ${truncate(prompt.displayText, 1_700)}`
+    const session = this.state.sessions[channel.id]
+    if (!session) {
+      await channel.send({ content, allowedMentions: { parse: [] } })
+      return
+    }
+    const deliveryId = this.queuedPromptDeliveryId(prompt)
+    try {
+      await this.stageDurableDiscordOutput({
+        channel,
+        codexThreadId: session.codexThreadId,
+        turnId: `queued:${deliveryId}`,
+        itemKey: 'announcement',
+        value: content,
+        suppressNotifications: false,
+        format: false,
+      })
+    } catch (error) {
+      this.logVerbose('queued prompt announcement persistence failed', {
+        threadId: session.codexThreadId,
+        deliveryId,
+        error: errorText(error),
+      })
+      await channel.send({ content, allowedMentions: { parse: [] } }).catch(() => undefined)
+      return
+    }
+    await this.drainDiscordOutbox(channel).catch((error: unknown) => {
+      this.logVerbose('queued prompt announcement delivery deferred', {
+        threadId: session.codexThreadId,
+        deliveryId,
+        error: errorText(error),
+      })
     })
   }
 
@@ -7927,16 +7956,21 @@ export class CordexDiscordBot {
       this.deletedDiscordThreads.has(channel.id)
     ) return
     const uncertain = this.queueFor(channel.id).find((prompt) => prompt.reviewRequired)
-    if (uncertain) await this.sendUncertainPromptNotice(current, channel, uncertain)
     if (current.abortIntent) {
       const reconciliation = await this.reconcileAbortIntent(current)
-      if (!reconciliation.cleared) return
+      if (!reconciliation.cleared) {
+        if (uncertain) await this.sendUncertainPromptNotice(current, channel, uncertain)
+        return
+      }
     }
     let runtime: CodexThreadRuntimeState
     try {
       runtime = await this.readThreadRuntimeState(current)
     } catch (error) {
-      if (uncertain) return
+      if (uncertain) {
+        await this.sendUncertainPromptNotice(current, channel, uncertain)
+        return
+      }
       if ((this.isUnloadedCodexThreadError(error, current.codexThreadId) ||
         this.isMissingCodexRolloutError(error, current.codexThreadId) ||
         this.isUnsupportedCodexHistoryError(error)) &&
@@ -7949,7 +7983,13 @@ export class CordexDiscordBot {
     }
     this.assertCodexSessionLinked(current)
     await this.removeDeliveredQueuePrompts(current, channel, runtime)
-    if (uncertain && this.queueFor(channel.id).includes(uncertain)) return
+    const remainingUncertain = this.queueFor(channel.id).find(
+      (prompt) => prompt.reviewRequired,
+    )
+    if (remainingUncertain) {
+      await this.sendUncertainPromptNotice(current, channel, remainingUncertain)
+      return
+    }
     if (runtime.status === 'active' && runtime.activeTurnId) {
       await this.adoptActiveTurn(current, channel, runtime.activeTurnId)
     } else if (runtime.status === 'idle') {
