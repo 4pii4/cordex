@@ -7592,12 +7592,16 @@ export class CordexDiscordBot {
 
   private async announceQueuedPrompt(channel: ThreadChannel, prompt: QueuedPrompt): Promise<void> {
     const content = `» **${escapeInlineMarkdown(prompt.authorName)}:** ${truncate(prompt.displayText, 1_700)}`
+    const deliveryId = this.queuedPromptDeliveryId(prompt)
+    if (!deliveryId.startsWith('scheduled:')) {
+      await channel.send({ content, allowedMentions: { parse: [] } })
+      return
+    }
     const session = this.state.sessions[channel.id]
     if (!session) {
       await channel.send({ content, allowedMentions: { parse: [] } })
       return
     }
-    const deliveryId = this.queuedPromptDeliveryId(prompt)
     try {
       await this.stageDurableDiscordOutput({
         channel,
