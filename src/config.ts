@@ -497,7 +497,9 @@ function parseQueues(value: unknown): CordexState['queues'] {
           : raw.id,
       } as QueuedPrompt
       if (typeof raw.sourceMessageId !== 'string') delete prompt.sourceMessageId
-      if (raw.deliveryKind !== 'direct') delete prompt.deliveryKind
+      if (raw.deliveryKind !== 'direct' && raw.deliveryKind !== 'deferred') {
+        delete prompt.deliveryKind
+      }
       if (raw.deliveryStarted === true) prompt.deliveryStarted = true
       else delete prompt.deliveryStarted
       if (raw.deliveryKind === 'direct' || raw.deliveryStarted === true || raw.reviewRequired === true) {

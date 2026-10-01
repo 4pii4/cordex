@@ -46,6 +46,7 @@ import {
 } from './channel-management.js'
 import {
   CodexAppServer,
+  CodexRpcError,
   type CodexAppServerReadyEvent,
   type CodexAppServerRestartEvent,
   type CodexSkillMetadata,
@@ -5615,7 +5616,9 @@ export class CordexDiscordBot {
           const queued = this.state.queues[knownEntry[0]]
           if (queued) {
             const migrated = queued.filter((prompt) =>
-              this.promptDeliveryKind(prompt) === 'direct' || !prompt.sourceMessageId)
+              this.promptDeliveryKind(prompt) === 'direct' ||
+              this.promptDeliveryKind(prompt) === 'deferred' ||
+              !prompt.sourceMessageId)
             if (migrated.length > 0) this.state.queues[thread.id] = migrated
             delete this.state.queues[knownEntry[0]]
           }
@@ -6343,7 +6346,7 @@ export class CordexDiscordBot {
       }
       if (session.abortIntent) throw new Error('Turn abort is still pending')
       const prompts = this.state.queues[channel.id] || []
-      if (prompts.some((prompt) => this.promptDeliveryKind(prompt) === 'queued')) {
+      if (prompts.some((prompt) => this.promptDeliveryKind(prompt) !== 'direct')) {
         throw new Error('Clear queued prompts before deleting')
       }
       if (prompts.some((prompt) => this.promptDeliveryKind(prompt) === 'direct')) {
@@ -7518,7 +7521,8 @@ export class CordexDiscordBot {
   }
 
   private queuedPromptsFor(threadId: string): QueuedPrompt[] {
-    return this.queueFor(threadId).filter((prompt) => this.promptDeliveryKind(prompt) === 'queued')
+    return this.queueFor(threadId).filter((prompt) =>
+      this.promptDeliveryKind(prompt) !== 'direct')
   }
 
   private async enqueuePrompt(
@@ -7553,7 +7557,7 @@ export class CordexDiscordBot {
       if (existingIndex >= 0) {
         return queue
           .slice(0, existingIndex + 1)
-          .filter((queued) => this.promptDeliveryKind(queued) === 'queued')
+          .filter((queued) => this.promptDeliveryKind(queued) !== 'direct')
           .length
       }
       queue.push(prompt)
@@ -7570,8 +7574,8 @@ export class CordexDiscordBot {
       ) {
         throw new Error('Thread has no Codex session')
       }
-      return this.promptDeliveryKind(prompt) === 'queued'
-        ? queue.filter((queued) => this.promptDeliveryKind(queued) === 'queued').length
+      return this.promptDeliveryKind(prompt) !== 'direct'
+        ? queue.filter((queued) => this.promptDeliveryKind(queued) !== 'direct').length
         : 0
     })
   }
@@ -7614,12 +7618,12 @@ export class CordexDiscordBot {
     return prompt.sourceMessageId || prompt.id
   }
 
-  private promptDeliveryKind(prompt: QueuedPrompt): 'direct' | 'queued' {
+  private promptDeliveryKind(prompt: QueuedPrompt): 'direct' | 'queued' | 'deferred' {
     return prompt.deliveryKind || 'queued'
   }
 
   private async announceDeliveredPrompt(channel: ThreadChannel, prompt: QueuedPrompt): Promise<void> {
-    if (this.promptDeliveryKind(prompt) === 'queued') {
+    if (this.promptDeliveryKind(prompt) !== 'direct') {
       await this.announceQueuedPrompt(channel, prompt)
     }
   }
@@ -7835,6 +7839,48 @@ export class CordexDiscordBot {
     await this.sendUncertainPromptNotice(session, channel, prompt)
   }
 
+  private async deferRejectedSteerPrompt(
+    session: SessionState,
+    channel: ThreadChannel,
+    prompt: QueuedPrompt,
+    error: CodexRpcError,
+  ): Promise<void> {
+    if (!this.queueFor(channel.id).includes(prompt)) return
+    const previous = {
+      deliveryKind: prompt.deliveryKind,
+      deliveryStarted: prompt.deliveryStarted,
+      reviewRequired: prompt.reviewRequired,
+    }
+    prompt.deliveryKind = 'deferred'
+    delete prompt.deliveryStarted
+    delete prompt.reviewRequired
+    try {
+      await saveState(this.state)
+    } catch (saveError) {
+      if (previous.deliveryKind === undefined) delete prompt.deliveryKind
+      else prompt.deliveryKind = previous.deliveryKind
+      if (previous.deliveryStarted === undefined) delete prompt.deliveryStarted
+      else prompt.deliveryStarted = previous.deliveryStarted
+      if (previous.reviewRequired === undefined) delete prompt.reviewRequired
+      else prompt.reviewRequired = previous.reviewRequired
+      throw saveError
+    }
+    await this.sendDurableDiscordOutput({
+      channel,
+      codexThreadId: session.codexThreadId,
+      turnId: `rejected-steer:${this.queuedPromptDeliveryId(prompt)}`,
+      itemKey: 'queued',
+      value: `⚠ Codex rejected this live steer before accepting it (${truncate(error.message, 500)}). The prompt remains saved and will run as the next turn. Source ID: ${discordInlineCode(this.queuedPromptDeliveryId(prompt))}.`,
+      suppressNotifications: false,
+      format: false,
+    }).catch((noticeError: unknown) => {
+      this.logVerbose('rejected steer notice delivery deferred', {
+        threadId: session.codexThreadId,
+        error: errorText(noticeError),
+      })
+    })
+  }
+
   private async deliverPersistedDirectPromptsUnlocked(
     session: SessionState,
     channel: ThreadChannel,
@@ -7874,6 +7920,10 @@ export class CordexDiscordBot {
         )
         await this.removeQueuedPrompt(channel.id, next)
       } catch (error) {
+        if (error instanceof CodexRpcError && error.method === 'turn/steer') {
+          await this.deferRejectedSteerPrompt(current, channel, next, error)
+          return
+        }
         await this.holdUncertainPrompt(current, channel, next)
         throw error
       }
@@ -8262,7 +8312,7 @@ export class CordexDiscordBot {
           return [selected]
         }
         for (let index = queue.length - 1; index >= 0; index--) {
-          if (this.promptDeliveryKind(queue[index]!) === 'queued') queue.splice(index, 1)
+          if (this.promptDeliveryKind(queue[index]!) !== 'direct') queue.splice(index, 1)
         }
         await saveState(this.state)
         return queued

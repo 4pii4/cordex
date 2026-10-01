@@ -435,6 +435,10 @@ client message IDs. That ID is a correlation field, not a guaranteed
 idempotency key in the current Codex app-server. An unconfirmed turn RPC does
 not cause an automatic client-ID replay: direct and queued prompts with
 uncertain delivery require explicit review, including after a restart.
+An explicit `turn/steer` RPC error is definitive rather than ambiguous. Cordex
+keeps that input under the same delivery ID as ordinary queued work and runs it
+as the next turn after the current turn ends; it does not require manual
+Retry/Discard review.
 Once Codex returns a new thread ID, Cordex persists that session mapping and
 its first prompt together before starting a turn. Existing-session messages,
 `/skill`, queued prompts, scheduled occurrences, and post-conflict recovery

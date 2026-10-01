@@ -13,6 +13,9 @@ All notable changes to Cordex are documented here. The project follows
 
 ### Fixed
 
+- Distinguished explicit `turn/steer` RPC rejection from response loss,
+  retaining the rejected input as normal next-turn work instead of incorrectly
+  holding it for manual uncertain-delivery review.
 - Kept cached image and audio inputs protected for the full active-turn
   lifetime, including process recovery, so unrelated cache pruning cannot
   remove an attachment after its persisted queue record is consumed.

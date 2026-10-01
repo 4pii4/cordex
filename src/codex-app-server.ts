@@ -51,6 +51,17 @@ const FAILED_CHILD_KILL_WAIT_MS = 500
 const DEFAULT_INITIALIZE_TIMEOUT_MS = 60_000
 const DEFAULT_REQUEST_TIMEOUT_MS = 300_000
 
+export class CodexRpcError extends Error {
+  constructor(
+    readonly method: string,
+    readonly code: string | number,
+    readonly rpcMessage: string,
+  ) {
+    super(`Codex RPC ${String(code)}: ${rpcMessage}`)
+    this.name = 'CodexRpcError'
+  }
+}
+
 function isRecord(value: unknown): value is JsonObject {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -1777,11 +1788,14 @@ export class CodexAppServer extends EventEmitter {
           latencyMs,
           errorCode: String(object.error.code ?? 'error'),
         })
-        pending.reject(
-          new Error(
-            `Codex RPC ${String(object.error.code ?? 'error')}: ${String(object.error.message ?? 'Unknown error')}`,
-          ),
-        )
+        const code = typeof object.error.code === 'string' || typeof object.error.code === 'number'
+          ? object.error.code
+          : 'error'
+        pending.reject(new CodexRpcError(
+          pending.method,
+          code,
+          String(object.error.message ?? 'Unknown error'),
+        ))
       }
       else {
         this.logger.info('rpc_complete', {

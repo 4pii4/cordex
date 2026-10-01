@@ -90,7 +90,7 @@ export type QueuedPrompt = {
   displayText: string
   createdAt: string
   sourceMessageId?: string
-  deliveryKind?: 'direct' | 'queued'
+  deliveryKind?: 'direct' | 'queued' | 'deferred'
   /** The prompt crossed the durable handoff boundary before a Codex turn RPC. */
   deliveryStarted?: boolean
   /** Delivery cannot be ruled out; hold until accepted input is found or the user resolves it. */
