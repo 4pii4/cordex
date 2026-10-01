@@ -338,6 +338,12 @@ function parseSessions(value: unknown): CordexState['sessions'] {
     const abortIntent = parseSessionAbortIntent(raw.abortIntent)
     if (abortIntent) session.abortIntent = abortIntent
     else delete session.abortIntent
+    const activeAttachmentPaths = typeof raw.activeTurnId === 'string' &&
+      Array.isArray(raw.activeAttachmentPaths)
+      ? [...new Set(stringList(raw.activeAttachmentPaths).map((entry) => path.resolve(entry)))]
+      : []
+    if (activeAttachmentPaths.length > 0) session.activeAttachmentPaths = activeAttachmentPaths
+    else delete session.activeAttachmentPaths
     if (!isContextTokenCount(raw.contextTokens)) {
       delete session.contextTokens
       delete session.contextWindow

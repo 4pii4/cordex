@@ -1193,11 +1193,30 @@ export class CordexDiscordBot {
 
   private async pruneAttachmentCache(): Promise<void> {
     await this.attachmentCacheQueue.run('attachments', async () => {
-      const protectedPaths = Object.values(this.state.queues).flatMap((queue) =>
-        queue.flatMap((prompt) => prompt.input.flatMap((item) =>
-          item.type === 'localImage' || item.type === 'localFile' ? [item.path] : [])))
+      const protectedPaths = [
+        ...Object.values(this.state.queues).flatMap((queue) =>
+          queue.flatMap((prompt) => prompt.input.flatMap((item) =>
+            item.type === 'localImage' || item.type === 'localFile' ? [item.path] : []))),
+        ...Object.values(this.state.sessions).flatMap((session) =>
+          session.activeAttachmentPaths || []),
+      ]
       await pruneDiscordAttachmentCache({ protectedPaths })
     })
+  }
+
+  private retainActiveAttachmentPaths(session: SessionState, input: UserInput[]): void {
+    if (!session.activeTurnId) return
+    const paths = input.flatMap((item) =>
+      item.type === 'localImage' || item.type === 'localFile' ? [path.resolve(item.path)] : [])
+    if (paths.length === 0) return
+    session.activeAttachmentPaths = [...new Set([
+      ...(session.activeAttachmentPaths || []),
+      ...paths,
+    ])]
+  }
+
+  private clearActiveAttachmentPaths(session: SessionState): void {
+    delete session.activeAttachmentPaths
   }
 
   private async pruneOutgoingMediaCache(): Promise<void> {
@@ -1258,6 +1277,7 @@ export class CordexDiscordBot {
       for (const session of sessions) {
         if (session.activeTurnId) this.restartAffectedChannels.add(session.discordThreadId)
         delete session.activeTurnId
+        this.clearActiveAttachmentPaths(session)
         session.updatedAt = new Date().toISOString()
         await this.dismissPendingControlsForChannel(
           session.discordThreadId,
@@ -1372,6 +1392,7 @@ export class CordexDiscordBot {
     const previous = structuredClone(session)
     delete session.abortIntent
     delete session.activeTurnId
+    this.clearActiveAttachmentPaths(session)
     session.updatedAt = new Date().toISOString()
     try {
       await saveState(this.state)
@@ -6400,6 +6421,7 @@ export class CordexDiscordBot {
       delivery: 'inline',
     })
     session.activeTurnId = review.turnId
+    this.clearActiveAttachmentPaths(session)
     session.updatedAt = new Date().toISOString()
     this.startRun(session, channel)
     await saveState(this.state)
@@ -9847,6 +9869,7 @@ export class CordexDiscordBot {
         }
         if (this.runtimeHasClientMessage(runtime, clientUserMessageId)) {
           await this.reconcileDeliveredInput(session, channel, runtime)
+          this.retainActiveAttachmentPaths(session, input)
           return
         }
         const activeTurnId = await this.reconcileActiveTurn(session, channel, runtime)
@@ -9885,6 +9908,7 @@ export class CordexDiscordBot {
     }
     if (!turnId) throw startError || new Error('Codex turn did not start')
     session.activeTurnId = turnId
+    this.retainActiveAttachmentPaths(session, input)
     session.updatedAt = new Date().toISOString()
     this.startRun(session, channel)
     await saveState(this.state)
@@ -9975,6 +9999,7 @@ export class CordexDiscordBot {
     }
     const hadActiveTurn = session.activeTurnId !== undefined
     delete session.activeTurnId
+    this.clearActiveAttachmentPaths(session)
     if (!staleRun && !hadActiveTurn) return
     session.updatedAt = new Date().toISOString()
     await this.dismissPendingControlsForChannel(channel.id, '_Turn already ended._')
@@ -10013,6 +10038,7 @@ export class CordexDiscordBot {
     try {
       await steer(expectedTurnId)
       this.assertCodexSessionLinked(session)
+      this.retainActiveAttachmentPaths(session, input)
       return true
     } catch (steerError) {
       let runtime: CodexThreadRuntimeState
@@ -10024,6 +10050,7 @@ export class CordexDiscordBot {
 
       if (this.runtimeHasClientMessage(runtime, clientUserMessageId)) {
         await this.reconcileDeliveredInput(session, channel, runtime)
+        this.retainActiveAttachmentPaths(session, input)
         return true
       }
 
@@ -11603,6 +11630,7 @@ export class CordexDiscordBot {
       }
     }
     delete run.session.activeTurnId
+    this.clearActiveAttachmentPaths(run.session)
     run.session.updatedAt = new Date().toISOString()
     this.runs.delete(run.session.codexThreadId)
     try {

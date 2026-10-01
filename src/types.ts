@@ -76,6 +76,7 @@ export type SessionState = {
   lifecycleIntent?: SessionLifecycleIntent
   abortIntent?: SessionAbortIntent
   activeTurnId?: string
+  activeAttachmentPaths?: string[]
   contextTokens?: number
   contextWindow?: number
   updatedAt: string

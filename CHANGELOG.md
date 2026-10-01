@@ -13,6 +13,9 @@ All notable changes to Cordex are documented here. The project follows
 
 ### Fixed
 
+- Kept cached image and audio inputs protected for the full active-turn
+  lifetime, including process recovery, so unrelated cache pruning cannot
+  remove an attachment after its persisted queue record is consumed.
 - Kept saved queued work running when Discord typing delivery fails, and caught
   up missed project/thread messages after gateway reconnects that cannot resume
   their prior session. Catch-up preserves chronological ingress, deduplicates
