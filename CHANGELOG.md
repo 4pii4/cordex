@@ -7,6 +7,10 @@ All notable changes to Cordex are documented here. The project follows
 
 ### Fixed
 
+- Kept saved queued work running when Discord typing delivery fails, and caught
+  up missed project/thread messages after gateway reconnects that cannot resume
+  their prior session. Catch-up preserves chronological ingress, deduplicates
+  gateway replay, retains normal access checks, and retries transient REST reads.
 - Paused active persistent goals during full-process crash recovery and posted
   explicit Discord resume guidance instead of leaving goals active but idle.
 - Scoped Codex runtime restart/recovery notice identities to each Cordex process

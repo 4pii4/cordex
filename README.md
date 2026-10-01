@@ -468,6 +468,13 @@ source ID. Retrying may duplicate side effects if Codex accepted the prompt
 without persisting it yet; inspect the thread and files before choosing.
 Completed Discord output and run footers use a separate durable outbox, so a partial
 send or bot restart resumes only missing chunks and does not block the next queued turn.
+During a Discord connection outage, saved Codex work continues and its output
+waits in the outbox. When the gateway reconnects, Cordex also catches up missed
+messages in configured project channels and their session threads, even if
+Discord cannot resume the old gateway session. Catch-up retains message order,
+deduplicates gateway replay, and uses the same access checks as live messages.
+This catch-up applies to reconnects within the running process; restart recovery
+continues to use already-saved prompts.
 Active turns also surface account-verification requirements, visible safety
 buffering, model reroutes, slow lifecycle hooks, and retry warnings without
 exposing internal classifier labels or hook source paths. A staged message

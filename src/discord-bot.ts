@@ -448,6 +448,11 @@ export class CordexDiscordBot {
   private readonly codexEventQueue = new KeyedSerialQueue()
   private readonly codexLifecycleQueue = new KeyedSerialQueue()
   private readonly discordIngressQueue = new KeyedSerialQueue()
+  private readonly discordMessagesSeen = new Set<string>()
+  private readonly lastDiscordMessages = new Map<string, string>()
+  private readonly discordReconnectFloors = new Map<string, { afterId?: string; since: number }>()
+  private readonly discordReconnectJobs = new Set<string>()
+  private discordReconnectRetryTimer?: NodeJS.Timeout
   private readonly promptQueue = new KeyedSerialQueue()
   private readonly attachmentCacheQueue = new KeyedSerialQueue()
   private readonly outgoingMediaQueue = new KeyedSerialQueue()
@@ -572,6 +577,7 @@ export class CordexDiscordBot {
       this.logger.warn('discord_warning', { message })
     })
     this.client.on(Events.ShardDisconnect, (event, shardId) => {
+      this.captureDiscordReconnectFloors()
       this.logger.warn('shard_disconnected', {
         shardId,
         code: event.code,
@@ -583,6 +589,7 @@ export class CordexDiscordBot {
       this.logger.error('shard_error', error, { shardId })
     })
     this.client.on(Events.ShardReconnecting, (shardId) => {
+      this.captureDiscordReconnectFloors()
       this.logger.info('shard_reconnecting', { shardId })
     })
     this.client.on(Events.ShardReady, (shardId, unavailableGuilds) => {
@@ -591,19 +598,27 @@ export class CordexDiscordBot {
         unavailableGuildCount: unavailableGuilds?.size || 0,
       })
       this.scheduleDiscordOutboxRetry(true)
+      this.recoverDiscordReconnectMessages()
     })
     this.client.on(Events.ShardResume, (shardId, replayedEvents) => {
       this.logger.info('shard_resumed', { shardId, replayedEvents })
       this.scheduleDiscordOutboxRetry(true)
+      this.recoverDiscordReconnectMessages()
     })
     this.client.on(Events.Invalidated, () => {
       this.logger.error('discord_invalidated', new Error('Discord session was invalidated'))
     })
     this.client.on(Events.MessageCreate, (message) => {
+      if (!this.rememberDiscordMessage(message)) return
       this.acceptDiscordIngress('Discord message', () =>
         this.discordIngressQueue.run(message.channel.id, async () => {
           await this.waitForIngressReady()
-          await this.handleMessage(message)
+          try {
+            await this.handleMessage(message)
+          } catch (error) {
+            this.discordMessagesSeen.delete(message.id)
+            throw error
+          }
         }))
     })
     this.client.on(Events.MessageUpdate, (_oldMessage, message) => {
@@ -896,6 +911,145 @@ export class CordexDiscordBot {
       work = Promise.reject(error)
     }
     this.trackPendingWork(this.pendingDiscordIngress, work, label)
+  }
+
+  private rememberDiscordMessage(message: DiscordMessage): boolean {
+    if (message.guildId !== this.config.guildId || message.author.bot) return true
+    const parentId = message.channel.isThread() ? message.channel.parentId : message.channel.id
+    if (!parentId || !this.config.projects[parentId] || !/^\d+$/.test(message.id)) return true
+    if (this.discordMessagesSeen.has(message.id)) return false
+    this.discordMessagesSeen.add(message.id)
+    // Retain every ID during catch-up, including gateway events queued behind
+    // the REST scan, so a successful gateway resume cannot deliver it twice.
+    if (this.discordReconnectFloors.size === 0 && this.discordMessagesSeen.size > 10_000) {
+      this.discordMessagesSeen.delete(this.discordMessagesSeen.values().next().value!)
+    }
+    const previous = this.lastDiscordMessages.get(message.channel.id)
+    if (!previous || BigInt(message.id) > BigInt(previous)) {
+      this.lastDiscordMessages.set(message.channel.id, message.id)
+    }
+    return true
+  }
+
+  private captureDiscordReconnectFloors(): void {
+    if (this.stopping) return
+    const channelIds = new Set([
+      ...Object.keys(this.config.projects),
+      ...Object.keys(this.state.sessions),
+      ...Object.keys(this.state.pendingInitialSessions || {}),
+    ])
+    const since = Date.now() - 2_000
+    for (const channelId of channelIds) {
+      const pending = this.discordReconnectFloors.get(channelId)
+      if (pending) {
+        // A new disconnect during a scan must survive that scan's completion.
+        if (this.discordReconnectJobs.has(channelId)) {
+          this.discordReconnectFloors.set(channelId, { ...pending })
+        }
+        continue
+      }
+      const afterId = this.lastDiscordMessages.get(channelId)
+      this.discordReconnectFloors.set(channelId, { ...(afterId ? { afterId } : {}), since })
+    }
+  }
+
+  private recoverDiscordReconnectMessages(): void {
+    if (this.stopping || this.discordReconnectFloors.size === 0) return
+    if (this.discordReconnectRetryTimer) clearTimeout(this.discordReconnectRetryTimer)
+    delete this.discordReconnectRetryTimer
+    for (const [channelId, floor] of this.discordReconnectFloors) {
+      if (this.discordReconnectJobs.has(channelId)) continue
+      this.discordReconnectJobs.add(channelId)
+      this.acceptDiscordIngress('Discord reconnect message recovery', async () => {
+        try {
+          await this.discordIngressQueue.run(channelId, async () => {
+            await this.waitForIngressReady()
+            this.assertNotStopping()
+            let channel
+            try {
+              channel = await this.client.channels.fetch(channelId)
+            } catch (error) {
+              if (!isUnknownDiscordChannelError(error)) throw error
+              this.discordReconnectFloors.delete(channelId)
+              return
+            }
+            if (!channel) throw new Error('Discord message recovery channel is unavailable')
+            if ((!channel.isThread() && channel.type !== ChannelType.GuildText) ||
+              channel.guildId !== this.config.guildId) {
+              this.discordReconnectFloors.delete(channelId)
+              return
+            }
+            const parentId = channel.isThread() ? channel.parentId : channel.id
+            if (!parentId || !this.config.projects[parentId] || this.removingProjects.has(parentId) ||
+              this.deletedDiscordThreads.has(channelId) || this.state.sessions[channelId]?.archived ||
+              (channel.isThread() && channel.archived)) {
+              this.discordReconnectFloors.delete(channelId)
+              return
+            }
+
+            const recovered: DiscordMessage[] = []
+            const pageCursors = new Set<string>()
+            let before: string | undefined
+            let complete = false
+            // Fetch backward to the fixed disconnect anchor, then replay
+            // chronologically. New gateway messages wait behind this scan.
+            for (let pageIndex = 0; pageIndex < 50; pageIndex++) {
+              this.assertNotStopping()
+              const page = await channel.messages.fetch({
+                limit: 100, cache: false, ...(before ? { before } : {}),
+              })
+              const messages = [...page.values()].sort((a, b) =>
+                BigInt(a.id) < BigInt(b.id) ? -1 : BigInt(a.id) > BigInt(b.id) ? 1 : 0)
+              if (messages.length === 0) {
+                complete = true
+                break
+              }
+              const afterFloor = (message: DiscordMessage): boolean => floor.afterId
+                ? BigInt(message.id) > BigInt(floor.afterId)
+                : message.createdTimestamp >= floor.since
+              recovered.push(...messages.filter(afterFloor))
+              const oldest = messages[0]!
+              if (!afterFloor(oldest) || messages.length < 100) {
+                complete = true
+                break
+              }
+              if (pageCursors.has(oldest.id)) throw new Error('Discord message recovery repeated a page')
+              pageCursors.add(oldest.id)
+              before = oldest.id
+            }
+            if (!complete) throw new Error('Discord message recovery exceeded its history limit')
+            recovered.sort((a, b) =>
+              BigInt(a.id) < BigInt(b.id) ? -1 : BigInt(a.id) > BigInt(b.id) ? 1 : 0)
+            for (const message of recovered) {
+              this.assertNotStopping()
+              if (message.author.bot || !this.rememberDiscordMessage(message)) continue
+              try {
+                await this.handleMessage(message)
+              } catch (error) {
+                this.discordMessagesSeen.delete(message.id)
+                throw error
+              }
+            }
+            if (this.discordReconnectFloors.get(channelId) === floor) {
+              this.discordReconnectFloors.delete(channelId)
+            }
+          })
+        } catch (error) {
+          if (!(error instanceof CordexStoppingError)) {
+            this.logger.warn('discord_message_recovery_deferred', { channelId, error: errorText(error) })
+          }
+        } finally {
+          this.discordReconnectJobs.delete(channelId)
+          if (!this.stopping && this.discordReconnectFloors.size > 0 && !this.discordReconnectRetryTimer) {
+            this.discordReconnectRetryTimer = setTimeout(() => {
+              delete this.discordReconnectRetryTimer
+              this.recoverDiscordReconnectMessages()
+            }, 5_000)
+            this.discordReconnectRetryTimer.unref()
+          }
+        }
+      })
+    }
   }
 
   private assertNotStopping(): void {
@@ -2935,6 +3089,8 @@ export class CordexDiscordBot {
     this.eventLoopDelay.disable()
     if (this.discordOutboxRetryTimer) clearTimeout(this.discordOutboxRetryTimer)
     delete this.discordOutboxRetryTimer
+    if (this.discordReconnectRetryTimer) clearTimeout(this.discordReconnectRetryTimer)
+    delete this.discordReconnectRetryTimer
     for (const timer of this.titleVerificationRetryTimers.values()) clearTimeout(timer)
     this.titleVerificationRetryTimers.clear()
     this.titleVerificationRetryAttempts.clear()
@@ -9608,7 +9764,13 @@ export class CordexDiscordBot {
 
     if (await this.steerActiveTurn(session, channel, input, clientUserMessageId)) return
     this.assertDiscordThreadAvailable(channel.id)
-    await channel.sendTyping()
+    await channel.sendTyping().catch((error: unknown) => {
+      if (isUnknownDiscordChannelError(error)) throw error
+      this.logVerbose('typing notice deferred before turn start', {
+        channelId: channel.id,
+        error: errorText(error),
+      })
+    })
     this.assertDiscordThreadAvailable(channel.id)
     const runtimeRoots = this.runtimeWorkspaceRoots(session)
     const serviceTier = await this.serviceTierForFastMode(
